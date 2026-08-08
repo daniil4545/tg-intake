@@ -49,7 +49,14 @@ services:
       DATABASE_URL: postgres://intake:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/intake?sslmode=disable
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
       TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS:?TELEGRAM_ALLOWED_IDS must be set}
+      # Пусто - идём напрямую через закреплённый DC. Заполняется адресом
+      # SOCKS-туннеля хоста, как у соседних сервисов.
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set}
+      # Прямой путь к OpenRouter с этого хоста закрыт: запрос возвращает 403 от
+      # фильтра по дороге, а не ответ API. Адрес прокси - секрет контура, в
+      # репозиторий не попадает. Telegram и GitHub идут напрямую, их не трогаем.
+      OPENROUTER_PROXY: ${OPENROUTER_PROXY:?OPENROUTER_PROXY must be set}
       GITHUB_TOKEN: ${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
       # Дефолты модели и лимитов лежат в config.go: пустая переменная означает
       # дефолт, а не пустое значение. Копия значений здесь молча разъехалась бы

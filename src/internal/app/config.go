@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +18,8 @@ type Config struct {
 	LogLevel        slog.Level
 	Env             string
 	OpenRouterKey   string
+	OpenRouterProxy string
+	TelegramProxy   string
 	ModelMedia      string
 	ModelDialog     string
 	GitHubToken     string
@@ -37,6 +40,13 @@ func LoadConfig() (Config, error) {
 		BotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
 		Env:           valueOr(os.Getenv("ENV"), "dev"),
 		OpenRouterKey: os.Getenv("OPENROUTER_API_KEY"),
+		// Пусто - идём напрямую. Нужен там, где хосту закрыт прямой путь к
+		// OpenRouter: без прокси запрос возвращает 403 от фильтра по дороге, а
+		// не ответ API.
+		OpenRouterProxy: os.Getenv("OPENROUTER_PROXY"),
+		// Прокси Telegram отдельный и другой схемы: у соседних сервисов это
+		// socks5, тогда как OpenRouter ходит через HTTP-прокси.
+		TelegramProxy: os.Getenv("TELEGRAM_PROXY"),
 		ModelMedia:    valueOr(os.Getenv("OPENROUTER_MODEL_MEDIA"), "google/gemini-3.1-flash-lite"),
 		ModelDialog:   valueOr(os.Getenv("OPENROUTER_MODEL_DIALOG"), "deepseek/deepseek-v4-flash-0731"),
 		GitHubToken:   os.Getenv("GITHUB_TOKEN"),
@@ -87,6 +97,17 @@ func LoadConfig() (Config, error) {
 		problems = append(problems, err.Error())
 	}
 	cfg.AudioConvert = audioConvert
+
+	// Разбираем при старте: битый адрес прокси иначе всплыл бы первым вызовом
+	// наружу, то есть в середине живого разговора.
+	for name, value := range map[string]string{
+		"OPENROUTER_PROXY": cfg.OpenRouterProxy,
+		"TELEGRAM_PROXY":   cfg.TelegramProxy,
+	} {
+		if err := checkProxy(name, value); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
 
 	if len(problems) > 0 {
 		return Config{}, errors.New("config: " + strings.Join(problems, "; "))
@@ -140,6 +161,19 @@ func parsePositive(name, raw string) (int, error) {
 		return 0, fmt.Errorf("%s %q is not a positive integer", name, raw)
 	}
 	return n, nil
+}
+
+// checkProxy проверяет адрес прокси. Пустой означает прямой путь и ошибкой не
+// является: локально и на хостах без блокировок прокси не нужен.
+func checkProxy(name, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.Scheme == "" {
+		return fmt.Errorf("%s %q is not a proxy url like http://host:port", name, raw)
+	}
+	return nil
 }
 
 func parseAudioConvert(raw string) (string, error) {

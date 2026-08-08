@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +27,9 @@ const (
 	// Попыток поднять бота. Егресс к Telegram с этого VPS нестабилен, и один
 	// неудачный getMe не должен ронять процесс; пятый подряд остаётся падением.
 	startAttempts = 5
+	// Бюджет запроса к Bot API при работе через прокси: больше цикла опроса и с
+	// запасом на скачивание вложения.
+	botTimeout = 2 * time.Minute
 	// Потолок Bot API - 4096 символов. Протокол с разбором скриншотов его
 	// перебирает, а отказ Telegram отправил бы работу notify в повторы, и автор
 	// не увидел бы результат вовсе.
@@ -70,6 +75,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, l
 	tb, err := startBot(ctx, tele.Settings{
 		Token:       cfg.BotToken,
 		Poller:      &tele.LongPoller{Timeout: 10 * time.Second},
+		Client:      proxyClient(cfg.TelegramProxy),
 		Verbose:     false,
 		Synchronous: true,
 		OnError: func(err error, c tele.Context) {
@@ -109,6 +115,25 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, l
 
 	b.bot = tb
 	return b, nil
+}
+
+// proxyClient - клиент Bot API. Пустой адрес прокси даёт nil: telebot возьмёт
+// свой клиент, и прямой путь останется как был.
+//
+// net/http понимает и http, и socks5 в адресе прокси, поэтому SOCKS-туннель
+// соседних сервисов работает без пятой зависимости. Таймаут с запасом над
+// циклом опроса: long polling держит соединение открытым по десять секунд, а
+// скачивание вложения через туннель бывает и дольше.
+func proxyClient(proxy string) *http.Client {
+	if proxy == "" {
+		return nil
+	}
+	// Адрес разобран и проверен при загрузке конфига.
+	parsed, _ := url.Parse(proxy)
+	return &http.Client{
+		Timeout:   botTimeout,
+		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+	}
 }
 
 // startBot повторяет getMe с отсрочкой: егресс к Telegram нестабилен даже с
