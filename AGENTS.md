@@ -72,8 +72,9 @@ intake/
 
 ## Команды
 
-Появляются с первым срезом кода, целевой набор по канону Galera: `make migrate-up`,
-`make run`, `make test`, `make ci-check`, `docker compose up -d postgres`.
+Всё из `src`: `docker compose up -d postgres`, `make migrate-up`, `make run`,
+`make test`, `make vet`, `make ci-check`, `make migrate-reset`.
+`migrate-*` отказываются работать с не-localhost базой без `ALLOW_REMOTE=1`.
 
 ## Workflow
 
