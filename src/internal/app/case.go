@@ -24,6 +24,7 @@ const (
 	JobSummarize       = "summarize"
 	JobPublish         = "publish"
 	JobNotify          = "notify"
+	JobCancelIssue     = "cancel_issue"
 )
 
 // caseJobKinds - работы, которые принадлежат разговору и гасятся вместе с ним.
@@ -929,6 +930,14 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				return fmt.Errorf("return case %s to summary: %w", p.CaseID, err)
 			}
 			if err := putNotify(ctx, tx, p.CaseID, job.ID, publishFailedText(cause)); err != nil {
+				return err
+			}
+		case JobCancelIssue:
+			// Автору уже ответили «отменяю», и молчание оставило бы его в
+			// уверенности, что тикет закрыт: метка могла успеть встать, а
+			// закрытие - нет. Повтор за человеком, кнопка на месте.
+			if err := putNotify(ctx, tx, p.CaseID, job.ID,
+				"Отменить тикет не получилось. Откройте его в списке и попробуйте ещё раз."); err != nil {
 				return err
 			}
 		}

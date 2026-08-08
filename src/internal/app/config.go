@@ -1,11 +1,13 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -27,7 +29,24 @@ type Config struct {
 	MaxItems        int
 	InterviewRounds int
 	AudioConvert    string
+	Projects        []ProjectConfig
 }
+
+// ProjectConfig - проект из переменной окружения. Список живёт в конфиге
+// контура, а не в git: репозиторий публичный, и адреса внутренних сервисов туда
+// попадать не должны.
+type ProjectConfig struct {
+	Slug    string `json:"slug"`
+	Title   string `json:"title"`
+	Owner   string `json:"owner"`
+	Repo    string `json:"repo"`
+	Context string `json:"context"`
+	// Указатель, чтобы отличить «не указано» от «выключен»: по умолчанию проект
+	// активен, и отсутствие поля не должно прятать его из меню.
+	Active *bool `json:"active"`
+}
+
+func (p ProjectConfig) IsActive() bool { return p.Active == nil || *p.Active }
 
 // LoadConfig собирает конфиг из окружения. Ошибка перечисляет все проблемы
 // разом: иначе поднятие контура идёт циклом «запустил, узнал про одну
@@ -98,6 +117,12 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.AudioConvert = audioConvert
 
+	projects, err := ParseProjects(os.Getenv("PROJECTS"))
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.Projects = projects
+
 	// Разбираем при старте: битый адрес прокси иначе всплыл бы первым вызовом
 	// наружу, то есть в середине живого разговора.
 	for name, value := range map[string]string{
@@ -134,6 +159,41 @@ func parseIDs(raw string) ([]int64, error) {
 		return nil, errors.New("TELEGRAM_ALLOWED_IDS is empty")
 	}
 	return ids, nil
+}
+
+// projectSlug повторяет CHECK из схемы: slug уезжает в callback_data, где всего
+// 64 байта, и должен переживать разбор кнопки.
+var projectSlug = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// ParseProjects разбирает список проектов. Пустая строка - не ошибка: локальный
+// запуск живёт на seed, и пустое значение не должно опустошать таблицу.
+func ParseProjects(raw string) ([]ProjectConfig, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+
+	var list []ProjectConfig
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, fmt.Errorf("PROJECTS is not a json array of projects: %v", err)
+	}
+
+	seen := make(map[string]bool, len(list))
+	for _, p := range list {
+		switch {
+		case !projectSlug.MatchString(p.Slug):
+			return nil, fmt.Errorf("PROJECTS has slug %q outside of [a-z0-9-]{1,32}", p.Slug)
+		case seen[p.Slug]:
+			return nil, fmt.Errorf("PROJECTS has duplicate slug %q", p.Slug)
+		case p.Title == "" || p.Owner == "" || p.Repo == "":
+			return nil, fmt.Errorf("PROJECTS entry %q needs title, owner and repo", p.Slug)
+		// Пустой контекст оставил бы интервью без представления о проекте: вопросы
+		// станут общими, а тикет - бесполезным.
+		case strings.TrimSpace(p.Context) == "":
+			return nil, fmt.Errorf("PROJECTS entry %q has no context", p.Slug)
+		}
+		seen[p.Slug] = true
+	}
+	return list, nil
 }
 
 func parseLevel(raw string) (slog.Level, error) {

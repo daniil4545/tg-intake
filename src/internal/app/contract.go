@@ -12,7 +12,7 @@ import (
 // строки Go и без миграции. JSON, а не YAML: разбор есть в стандартной
 // библиотеке, а пятая зависимость ради одного файла правил не окупается.
 //
-//go:embed rules/contract.json
+//go:embed rules/*.json
 var ruleFiles embed.FS
 
 // caseKinds - типы обращения, которые принимает CHECK в cases.kind. Новый тип

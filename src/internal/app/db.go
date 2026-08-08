@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -94,6 +95,43 @@ func scanProject(row pgx.Row, p *Project) error {
 	if err := row.Scan(&p.ID, &p.Slug, &p.Title, &p.Owner, &p.Repo, &p.Context, &p.LabelsReady); err != nil {
 		return fmt.Errorf("scan project: %w", err)
 	}
+	return nil
+}
+
+// SyncProjects приводит таблицу проектов к списку из конфига. Проекты, которых
+// в списке нет, не трогаются: убрать проект из меню - это active: false, а не
+// забытая строка, иначе опечатка в переменной гасила бы живой проект.
+//
+// labels_ready не трогаем: PrepareProject на старте отрабатывает по всем
+// активным проектам независимо от флага, и метки в новом репозитории заведутся
+// сами.
+func SyncProjects(ctx context.Context, pool *pgxpool.Pool, list []ProjectConfig, log *slog.Logger) error {
+	if len(list) == 0 {
+		return nil
+	}
+
+	for _, p := range list {
+		// xmax = 0 отличает вставку от обновления: другого способа узнать это у
+		// одиночного upsert нет, а появление проекта в меню должно быть в логе.
+		var inserted bool
+		err := pool.QueryRow(ctx, `
+			INSERT INTO projects (slug, title, github_owner, github_repo, context, active)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (slug) DO UPDATE SET
+				title = excluded.title, github_owner = excluded.github_owner,
+				github_repo = excluded.github_repo, context = excluded.context,
+				active = excluded.active, updated_at = now()
+			RETURNING (xmax = 0)`,
+			p.Slug, p.Title, p.Owner, p.Repo, p.Context, p.IsActive()).Scan(&inserted)
+		if err != nil {
+			return fmt.Errorf("sync project %s: %w", p.Slug, err)
+		}
+		if inserted {
+			log.Info("project_added", "project", p.Slug)
+		}
+	}
+
+	log.Info("projects_synced", "count", len(list))
 	return nil
 }
 
