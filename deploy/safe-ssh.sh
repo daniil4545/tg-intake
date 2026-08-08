@@ -19,6 +19,7 @@ Read-only actions:
   db-logs [N]      логи PostgreSQL, по умолчанию 200 строк, максимум 1000
   app-env          переменные окружения приложения, значения скрыты
   db-counts        число строк по таблицам, без содержимого
+  deploy-config    имена переменных сервиса в Coolify и версия его compose
 
 INTAKE_SSH_HOST переопределяет root@203.0.113.10.
 INTAKE_RESOURCE переопределяет контур intake-dev.
@@ -68,6 +69,13 @@ case "$action" in
         # Только счётчики: строки таблиц содержат ФИО автора и текст обращения,
         # им место в базе, а не в терминале.
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select 'projects='||(select count(*) from projects)||' users='||(select count(*) from users)||' cases='||(select count(*) from cases)||' case_items='||(select count(*) from case_items)||' jobs='||(select count(*) from jobs)\""
+        ;;
+    deploy-config)
+        # Окружение контейнера отвечает на вопрос «что получил работающий
+        # процесс», а не «что заведено в контуре»: до выката нового compose
+        # свежая переменная в контейнер не попадает и выглядит отсутствующей.
+        # Значения скрыты: там токен бота и ключ OpenRouter.
+        remote="name=\$(docker ps -a $filter --filter 'label=com.docker.compose.service=app' --format '{{.Names}}' | head -1); test -n \"\$name\" || { echo 'app=not_found'; exit 1; }; uuid=\${name#app-}; dir=/data/coolify/services/\$uuid; test -d \"\$dir\" || { echo \"service_dir=not_found uuid=\$uuid\"; exit 1; }; echo \"service_uuid=\$uuid\"; echo '--- env keys ---'; sed 's/=.*/=<set>/' \"\$dir/.env\" 2>/dev/null | grep -v '^#' | grep -v '^\$' | sort || echo 'env=absent'; echo '--- compose ---'; grep -cE 'OPENROUTER_API_KEY|MEDIA_DIR' \"\$dir/docker-compose.yml\" 2>/dev/null | sed 's/^/m1_markers=/'"
         ;;
     app-env)
         # Значения скрыты намеренно: в окружении лежат токен бота и пароль базы.
