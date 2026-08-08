@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -39,6 +40,10 @@ var (
 	createBtn   = &tele.Btn{Unique: "create"}
 	continueBtn = &tele.Btn{Unique: "continue"}
 	restartBtn  = &tele.Btn{Unique: "restart"}
+	allTrueBtn  = &tele.Btn{Unique: "all_true"}
+	publishBtn  = &tele.Btn{Unique: "publish"}
+	fixBtn      = &tele.Btn{Unique: "fix"}
+	dropBtn     = &tele.Btn{Unique: "drop"}
 	doneBtn     = &tele.Btn{Text: "Готово"}
 	cancelBtn   = &tele.Btn{Text: "Отмена"}
 )
@@ -84,6 +89,10 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, l
 	tb.Handle(createBtn, b.onCreate)
 	tb.Handle(continueBtn, b.onContinue)
 	tb.Handle(restartBtn, b.onRestart)
+	tb.Handle(allTrueBtn, b.onAllTrue)
+	tb.Handle(publishBtn, b.onPublish)
+	tb.Handle(fixBtn, b.onFix)
+	tb.Handle(dropBtn, b.onCancel)
 	tb.Handle(doneBtn, b.onDone)
 	tb.Handle(cancelBtn, b.onCancel)
 
@@ -149,11 +158,16 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 		return fmt.Errorf("notify: case %s not found", p.CaseID)
 	}
 
+	var opts []any
+	switch {
 	// Провал нормализации возвращает обращение в сбор, а кнопки сбора сняты
 	// нажатием «Готово»: без них автор не поймёт, чем закончить второй заход.
-	var opts []any
-	if cs.Status == statusCollecting {
+	case cs.Status == statusCollecting:
 		opts = append(opts, collectKeyboard())
+	case p.Buttons == keysRound:
+		opts = append(opts, roundKeyboard(cs.Round))
+	case p.Buttons == keysSummary:
+		opts = append(opts, summaryKeyboard())
 	}
 	return b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...)
 }
@@ -382,6 +396,9 @@ func (b *Bot) onRestart(c tele.Context) error {
 	}
 	if cs != nil {
 		if err := b.cases.CancelCase(ctx, cs, "restart"); err != nil {
+			if errors.Is(err, ErrPublishing) {
+				return c.Send("Прошлое обращение уже уходит в GitHub. Заведём новое, как только придёт номер.")
+			}
 			return err
 		}
 	}
@@ -391,11 +408,13 @@ func (b *Bot) onRestart(c tele.Context) error {
 	return c.Send("Начали заново. Присылайте материал и нажмите «Готово».", collectKeyboard())
 }
 
-// onItem принимает любое сырьё. Активного обращения нет - оно заводится тут же,
-// сырьё не теряется: человек начинает с материала, а не с репозитория.
+// onItem принимает любое сообщение автора. Куда оно пойдёт, решает состояние
+// обращения, а не то, какой экран автор видел последним: сырьё в сборе, ответ в
+// разговоре. Без этой развилки ответ на вопрос интервью упирался бы в «сбор
+// закрыт» и диалог не работал бы вовсе.
 //
-// Принятый элемент остаётся без ответа: бот не перебивает, кроме кнопок нового
-// обращения и единственного вопроса о проекте.
+// Активного обращения нет - оно заводится тут же, сырьё не теряется: человек
+// начинает с материала, а не с репозитория.
 func (b *Bot) onItem(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -403,6 +422,14 @@ func (b *Bot) onItem(c tele.Context) error {
 	cs, err := b.cases.Active(ctx, senderID(c))
 	if err != nil {
 		return err
+	}
+	if cs != nil {
+		switch cs.Status {
+		case statusInterview, statusSummary:
+			return b.onAnswer(ctx, c, cs)
+		case statusNormalizing, statusPublishing:
+			return c.Send("Разбираю обращение, минуту. Отвечу, как закончу.")
+		}
 	}
 	if cs == nil {
 		cs, _, err = b.cases.StartCase(ctx, author(c), "")
@@ -459,6 +486,112 @@ func itemReply(err error, maxItems int) (text string, internal bool) {
 	return "Не получилось принять сообщение. Пришлите его иначе.", true
 }
 
+// onAnswer - ответ автора в разговоре. Голосовое уходит на расшифровку работой,
+// текст записывается сразу: синхронный вызов модели остановил бы бота для всех
+// авторов, апдейты обрабатываются последовательно.
+func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
+	msg := c.Message()
+	switch {
+	case msg.Voice != nil:
+		if err := b.cases.AddVoiceAnswer(ctx, b.bot, cs, msg); err != nil {
+			if errors.Is(err, ErrFileTooBig) {
+				return c.Send("Запись тяжелее 20 МБ, Telegram не отдаёт её боту. Ответьте текстом или короче.")
+			}
+			if sendErr := c.Send("Не получилось принять запись. Ответьте, пожалуйста, ещё раз."); sendErr != nil {
+				return sendErr
+			}
+			return err
+		}
+		return c.Send("Расшифровываю ответ.")
+	case strings.TrimSpace(msg.Text) != "":
+		if err := b.cases.AddAnswer(ctx, cs, msg.Text); err != nil {
+			if errors.Is(err, ErrNotInterview) {
+				return c.Send("Обращение уже ушло дальше. Отправьте /start, чтобы завести новое.")
+			}
+			return err
+		}
+		return nil
+	}
+	return c.Send("Ответьте текстом или голосовым. Скриншоты принимаются только до кнопки «Готово».")
+}
+
+// onAllTrue - «Всё так»: предположения модели становятся ответом целиком.
+func (b *Bot) onAllTrue(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
+	}
+
+	round, err := strconv.Atoi(c.Data())
+	if err != nil {
+		return c.Send("Кнопка устарела. Ответьте, пожалуйста, текстом.")
+	}
+
+	switch err := b.cases.AcceptRound(ctx, cs, round); {
+	case errors.Is(err, ErrStaleRound):
+		// Кнопка прошлого раунда осталась в чате: закрывать ею текущие вопросы
+		// нельзя, автор подтвердил бы не то, что видит.
+		return c.Send("Это кнопка от прошлого вопроса. Ответьте на последний - текстом или голосовым.")
+	case errors.Is(err, ErrNotInterview):
+		return c.Send("Обращение уже ушло дальше.")
+	case err != nil:
+		return err
+	}
+	return nil
+}
+
+// onPublish - «Публикую»: подтверждение саммари, после которого тикет уходит в
+// GitHub, а файлы обращения удаляются.
+func (b *Bot) onPublish(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
+	}
+
+	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
+		if errors.Is(err, ErrNoSummary) {
+			// Кнопка осталась в чате, а обращение ушло дальше: либо публикация
+			// уже идёт, либо автор прислал правку и саммари переписывается.
+			if cs.Status == statusInterview {
+				return c.Send("Переписываю саммари с вашей правкой. Покажу заново - тогда и опубликуем.")
+			}
+			return c.Send("Уже публикую. Пришлю номер, как только тикет заведётся.")
+		}
+		return err
+	}
+	return c.Send("Публикую. Пришлю номер и ссылку.")
+}
+
+// onFix - «Поправить». Состояние не меняет: правкой становится следующее
+// сообщение автора, и обрабатывает его тот же onAnswer. Отдельное состояние
+// «ждём замечание» дало бы восьмой статус ради одной подсказки.
+func (b *Bot) onFix(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+	return c.Send("Что поправить? Напишите или наговорите - перепишу и покажу снова.")
+}
+
 func (b *Bot) onDone(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -485,7 +618,17 @@ func (b *Bot) onDone(c tele.Context) error {
 	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", hideKeyboard())
 }
 
+// onCancel - «Отмена» из клавиатуры сбора, кнопка под саммари и /cancel: один
+// путь на все три входа.
 func (b *Bot) onCancel(c tele.Context) error {
+	// Отмена приходит и кнопкой под саммари: без Respond она крутится до
+	// таймаута Telegram.
+	if c.Callback() != nil {
+		if err := c.Respond(); err != nil {
+			return err
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -497,6 +640,11 @@ func (b *Bot) onCancel(c tele.Context) error {
 		return c.Send("Отменять нечего.", hideKeyboard())
 	}
 	if err := b.cases.CancelCase(ctx, cs, "user"); err != nil {
+		if errors.Is(err, ErrPublishing) {
+			// Работа publish уже в очереди: погасив обращение здесь, мы получили
+			// бы issue по отменённому.
+			return c.Send("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
+		}
 		return err
 	}
 	return c.Send("Обращение отменено, файлы удалены.", hideKeyboard())
@@ -514,4 +662,23 @@ func collectKeyboard() *tele.ReplyMarkup {
 // больше не по чему.
 func hideKeyboard() *tele.ReplyMarkup {
 	return &tele.ReplyMarkup{RemoveKeyboard: true}
+}
+
+// roundKeyboard - «Всё так» под раундом вопросов. Номер раунда уезжает в
+// callback_data: кнопки прошлых раундов остаются в переписке, и по нажатию надо
+// понять, к каким вопросам оно относится.
+func roundKeyboard(round int) *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("Всё так", allTrueBtn.Unique, strconv.Itoa(round))))
+	return markup
+}
+
+func summaryKeyboard() *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(
+		markup.Data("Публикую", publishBtn.Unique),
+		markup.Data("Поправить", fixBtn.Unique),
+		markup.Data("Отмена", dropBtn.Unique),
+	))
+	return markup
 }
