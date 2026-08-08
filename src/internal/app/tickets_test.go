@@ -178,9 +178,14 @@ func newTestTickets(t *testing.T, cases *Cases, api string) *Tickets {
 // только с ними.
 func publishCase(t *testing.T, cases *Cases, userID int64, issue int) *Case {
 	t.Helper()
+	return publishCaseIn(t, cases, userID, issue, "tg-intake")
+}
+
+func publishCaseIn(t *testing.T, cases *Cases, userID int64, issue int, slug string) *Case {
+	t.Helper()
 	ctx := context.Background()
 
-	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, slug)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -197,14 +202,18 @@ func publishCase(t *testing.T, cases *Cases, userID int64, issue int) *Case {
 
 func testProject(t *testing.T, pool *pgxpool.Pool) Project {
 	t.Helper()
+
 	projects, err := ListProjects(context.Background(), pool)
 	if err != nil {
 		t.Fatalf("list projects: %v", err)
 	}
-	if len(projects) == 0 {
-		t.Fatal("в базе нет проектов: миграция seed не применена")
+	for _, p := range projects {
+		if p.Slug == "tg-intake" {
+			return p
+		}
 	}
-	return projects[0]
+	t.Fatal("в базе нет проекта tg-intake: миграция seed не применена")
+	return Project{}
 }
 
 func cancelJSON(caseID string, userID int64) []byte {
@@ -251,4 +260,165 @@ func recordingStub(t *testing.T, seen *requestLog, routes map[string]string) *ht
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// TestListByProject: список показывает тикеты своего проекта и только
+// опубликованные. Чужой тикет в списке означал бы утечку между проектами, а
+// черновик - тикет, которого в GitHub нет.
+func TestListByProject(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	other := addProject(t, pool, "zz-other")
+
+	publishCase(t, cases, 7006, 60)
+	publishCaseIn(t, cases, 7007, 61, other.Slug)
+	// Черновик без issue_number: собран, но до тикета не дошёл.
+	if _, _, err := cases.StartCase(context.Background(), User{ID: 7008, First: "Тест"}, "tg-intake"); err != nil {
+		t.Fatalf("start draft: %v", err)
+	}
+
+	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
+	list, err := tickets.List(context.Background(), testProject(t, pool))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Number != 60 {
+		t.Fatalf("список чужого проекта или с черновиком: %+v", list)
+	}
+}
+
+// TestCancelResumesAfterPartialFailure: работа упала между простановкой своей
+// метки и закрытием issue. Повтор обязан довести отмену до конца, а не решить
+// по собственной метке, что тикет уже закрыт.
+func TestCancelResumesAfterPartialFailure(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := publishCase(t, cases, 7009, 70)
+
+	seen := &requestLog{}
+	labelled := false
+	failDelete := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, _, _ := strings.Cut(r.URL.RequestURI(), "?")
+		seen.add(r.Method, path)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodGet:
+			// После успешного POST на issue висят обе метки: своя и прежняя.
+			if labelled {
+				fmt.Fprint(w, `{"number": 70, "labels": [
+					{"name": "status:cancelled"}, {"name": "status:in-progress"}]}`)
+				return
+			}
+			fmt.Fprint(w, `{"number": 70, "labels": [{"name": "status:in-progress"}]}`)
+		case r.Method == http.MethodPost:
+			labelled = true
+			fmt.Fprint(w, "[]")
+		case r.Method == http.MethodDelete && failDelete:
+			// 4xx, а не 5xx: клиент не тратит на него три повтора с отсрочкой, и
+			// тест не растягивается на семь секунд ради того же исхода.
+			w.WriteHeader(http.StatusBadRequest)
+		default:
+			fmt.Fprint(w, "[]")
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tickets := newTestTickets(t, cases, server.URL)
+	job := Job{ID: 1, Kind: JobCancelIssue, Payload: cancelJSON(cs.ID, 7009)}
+
+	if err := tickets.RunCancel(context.Background(), job); err == nil {
+		t.Fatal("первый заход обязан вернуть ошибку: снятие метки не прошло")
+	}
+
+	failDelete = false
+	if err := tickets.RunCancel(context.Background(), job); err != nil {
+		t.Fatalf("повтор: %v", err)
+	}
+	if !seen.has("PATCH /repos/daniil4545/tg-intake/issues/70") {
+		t.Errorf("повтор не закрыл issue; запросы: %v", seen.list())
+	}
+	if !seen.has("DELETE /repos/daniil4545/tg-intake/issues/70/labels/status:in-progress") {
+		t.Errorf("повтор не снял прежнюю метку; запросы: %v", seen.list())
+	}
+}
+
+// addProject заводит проект и убирает его за собой: testPool чистит обращения,
+// но не проекты, и мусор утёк бы в соседние тесты.
+func addProject(t *testing.T, pool *pgxpool.Pool, slug string) ProjectConfig {
+	t.Helper()
+	ctx := context.Background()
+
+	p := ProjectConfig{Slug: slug, Title: "Другой " + slug, Owner: "acme", Repo: slug, Context: "тест"}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := SyncProjects(ctx, pool, []ProjectConfig{p}, log); err != nil {
+		t.Fatalf("sync projects: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, `DELETE FROM projects WHERE slug = $1`, slug); err != nil {
+			t.Logf("cleanup project %s: %v", slug, err)
+		}
+	})
+	return p
+}
+
+// TestSyncProjects: список проектов приходит из конфига контура и приводит
+// таблицу к себе. Неперечисленный проект не трогается: опечатка в переменной не
+// должна гасить живой проект вместе с его тикетами.
+func TestSyncProjects(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	off := false
+
+	addProject(t, pool, "zz-sync")
+	updated := ProjectConfig{Slug: "zz-sync", Title: "Переименован", Owner: "acme",
+		Repo: "other-repo", Context: "новый контекст"}
+	if err := SyncProjects(ctx, pool, []ProjectConfig{updated}, log); err != nil {
+		t.Fatalf("sync update: %v", err)
+	}
+
+	var title, repo string
+	err := pool.QueryRow(ctx, `SELECT title, github_repo FROM projects WHERE slug = 'zz-sync'`).
+		Scan(&title, &repo)
+	if err != nil {
+		t.Fatalf("read project: %v", err)
+	}
+	if title != "Переименован" || repo != "other-repo" {
+		t.Errorf("проект не обновлён: %q %q", title, repo)
+	}
+
+	// Проект seed в списке не перечислен и остаться должен как был.
+	if p := testProject(t, pool); p.Slug != "tg-intake" {
+		t.Errorf("неперечисленный проект пропал: %+v", p)
+	}
+
+	updated.Active = &off
+	if err := SyncProjects(ctx, pool, []ProjectConfig{updated}, log); err != nil {
+		t.Fatalf("sync deactivate: %v", err)
+	}
+	projects, err := ListProjects(ctx, pool)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	for _, p := range projects {
+		if p.Slug == "zz-sync" {
+			t.Error("выключенный проект остался в меню")
+		}
+	}
+}
+
+// TestLoadStatuses: правила из образа обязаны проходить собственную валидацию.
+// Иначе опечатка в файле обнаружится падением старта в контуре, а не в CI.
+func TestLoadStatuses(t *testing.T) {
+	statuses, err := LoadStatuses()
+	if err != nil {
+		t.Fatalf("встроенные правила статусов не проходят валидацию: %v", err)
+	}
+	for _, label := range []string{labelNew, labelCancelled} {
+		if _, ok := statuses.Pick([]string{label}); !ok {
+			t.Errorf("в правилах нет метки %q", label)
+		}
+	}
 }
