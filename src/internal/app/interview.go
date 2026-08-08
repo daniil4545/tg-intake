@@ -157,17 +157,44 @@ var summarySchema = json.RawMessage(`{
 	"additionalProperties": false
 }`)
 
-type interviewPayload struct {
-	CaseID string `json:"case_id"`
-	// Fix - ход после правки саммари. Предел раундов на него не действует:
-	// иначе автор, заметивший ошибку на последнем раунде, не может её исправить.
-	Fix bool `json:"fix,omitempty"`
+// turnsCount - версия разговора: сколько ответов автора он уже вобрал. Ход
+// читает её перед вызовом модели и требует неизменности при записи. Пока модель
+// думает, автор может дописать - тогда работа хода уже заменена новой, и
+// устаревший результат не имеет права лечь в базу поверх свежего.
+func (c *Cases) turnsCount(ctx context.Context, db txRunner, caseID string) (int, error) {
+	var n int
+	err := db.QueryRow(ctx, `
+		SELECT count(*) FROM case_events
+		WHERE case_id = $1 AND kind = 'answer_given'`, caseID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count answers of case %s: %w", caseID, err)
+	}
+	return n, nil
+}
+
+// isFix - ход идёт после показанного саммари, то есть автор прислал правку.
+// Признак выводится из журнала, а не переносится в payload работы: работу
+// заменяет каждое следующее сообщение автора, и признак в ней терялся бы на
+// втором сообщении подряд.
+func (c *Cases) isFix(ctx context.Context, caseID string) (bool, error) {
+	var kind string
+	err := c.pool.QueryRow(ctx, `
+		SELECT kind FROM case_events
+		WHERE case_id = $1 AND kind IN ('round_asked', 'summary_ready')
+		ORDER BY id DESC LIMIT 1`, caseID).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check fix of case %s: %w", caseID, err)
+	}
+	return kind == "summary_ready", nil
 }
 
 // Run - один ход интервью: спросить модель, что уже собрано и чего не хватает,
 // и либо задать раунд вопросов, либо перейти к саммари.
 func (i *Interview) Run(ctx context.Context, job Job) error {
-	var p interviewPayload
+	var p casePayload
 	if err := json.Unmarshal(job.Payload, &p); err != nil {
 		return fmt.Errorf("payload of %s: %w", job.Kind, err)
 	}
@@ -184,6 +211,15 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return fmt.Errorf("case %s has no project", cs.ID)
 	}
 
+	version, err := i.cases.turnsCount(ctx, i.cases.pool, cs.ID)
+	if err != nil {
+		return err
+	}
+	fix, err := i.cases.isFix(ctx, cs.ID)
+	if err != nil {
+		return err
+	}
+
 	messages, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		return err
@@ -198,7 +234,7 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	// ничего, а собирает саммари с тем, что есть. Правка саммари предел не
 	// проверяет - иначе автор, заметивший ошибку на последнем раунде, не может
 	// её исправить.
-	toSummary := turn.Ready || (!p.Fix && cs.Round >= i.rounds)
+	toSummary := turn.Ready || (!fix && cs.Round >= i.rounds)
 	round := cs.Round
 	if !toSummary {
 		round++
@@ -208,8 +244,15 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		filled[kv.Key] = strings.TrimSpace(kv.Value)
 	}
 
-	if err := i.saveTurn(ctx, cs, turn, filled, round, toSummary); err != nil {
+	saved, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
+	if err != nil {
 		return err
+	}
+	if !saved {
+		// Автор дописал, пока модель думала: его ответ уже поставил свежий ход,
+		// и этот результат устарел целиком.
+		i.log.Info("interview_turn_stale", "case_id", cs.ID, "round", cs.Round)
+		return nil
 	}
 
 	i.log.Info("interview_round", "case_id", cs.ID, "round", round, "kind", turn.Kind,
@@ -220,8 +263,22 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 // saveTurn кладёт ход разговора: состояние контракта, событие раунда и то, что
 // уходит автору либо в следующую работу. Одной транзакцией - иначе вопрос
 // уходит автору, а раунд в базе не сохранён.
-func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool) error {
-	return i.cases.inTx(ctx, func(tx pgx.Tx) error {
+// Второе значение - лёг ли результат в базу. Ложь означает, что ход устарел:
+// обращение отменили или автор дописал, пока модель думала.
+func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool, version int) (bool, error) {
+	saved := false
+	err := i.cases.inTx(ctx, func(tx pgx.Tx) error {
+		// Версия разговора сверяется внутри той же транзакции: между её чтением
+		// и записью автор мог прислать ещё один ответ, и тогда писать этот ход
+		// поверх свежего нельзя.
+		current, err := i.cases.turnsCount(ctx, tx, cs.ID)
+		if err != nil {
+			return err
+		}
+		if current != version {
+			return nil
+		}
+
 		contract, err := json.Marshal(filled)
 		if err != nil {
 			return fmt.Errorf("encode contract of case %s: %w", cs.ID, err)
@@ -241,6 +298,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		if tag.RowsAffected() == 0 {
 			return nil
 		}
+		saved = true
 
 		if toSummary {
 			if err := addEvent(ctx, tx, cs.ID, "interview_done", map[string]any{
@@ -248,7 +306,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 			}); err != nil {
 				return err
 			}
-			return putCaseJob(ctx, tx, JobSummarize, cs.ID, casePayload{CaseID: cs.ID})
+			return replaceJob(ctx, tx, JobSummarize, cs.ID, casePayload{CaseID: cs.ID})
 		}
 
 		if err := addEvent(ctx, tx, cs.ID, "round_asked", map[string]any{
@@ -259,6 +317,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		return putNotifyKey(ctx, tx, cs.ID, fmt.Sprintf("round-%d", round),
 			roundMessage(turn.Questions), keysRound)
 	})
+	return saved, err
 }
 
 // askTurn спрашивает модель и проверяет её ответ. Невалидный ответ - один
@@ -362,6 +421,11 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		return fmt.Errorf("case %s has no project", cs.ID)
 	}
 
+	version, err := i.cases.turnsCount(ctx, i.cases.pool, cs.ID)
+	if err != nil {
+		return err
+	}
+
 	messages, err := i.dialog(ctx, cs, i.sumPrefix)
 	if err != nil {
 		return err
@@ -378,6 +442,16 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 
 	moved := false
 	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
+		// Автор дописал, пока собиралось саммари: его ответ уже поставил новый
+		// ход интервью, и показывать саммари без этой правки нельзя.
+		current, err := i.cases.turnsCount(ctx, tx, cs.ID)
+		if err != nil {
+			return err
+		}
+		if current != version {
+			return nil
+		}
+
 		tag, err := tx.Exec(ctx, `
 			UPDATE cases SET status = 'summary', title = $2, summary = $3, incomplete = $4,
 			                 updated_at = now()
@@ -432,7 +506,7 @@ func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message
 		var out summaryOut
 		if err := json.Unmarshal(raw, &out); err != nil {
 			lastErr = fmt.Errorf("decode summary: %w", err)
-		} else if err := i.checkSummary(cs.Kind, out); err != nil {
+		} else if err := i.checkSummary(cs, out); err != nil {
 			lastErr = err
 		} else {
 			return out, nil
@@ -443,7 +517,7 @@ func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message
 	return summaryOut{}, fmt.Errorf("summary of case %s: %w", cs.ID, lastErr)
 }
 
-func (i *Interview) checkSummary(kind string, out summaryOut) error {
+func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 	title := strings.TrimSpace(out.Title)
 	if title == "" {
 		return errors.New("summary has no title")
@@ -454,12 +528,27 @@ func (i *Interview) checkSummary(kind string, out summaryOut) error {
 	if len(out.Sections) == 0 {
 		return errors.New("summary has no sections")
 	}
+
+	written := make(map[string]bool, len(out.Sections))
 	for _, s := range out.Sections {
-		if i.rules.Title(kind, s.Key) == "" {
+		if i.rules.Title(cs.Kind, s.Key) == "" {
 			return fmt.Errorf("section key %q is not in contract", s.Key)
 		}
 		if strings.TrimSpace(s.Text) == "" {
 			return fmt.Errorf("section %q is empty", s.Key)
+		}
+		written[s.Key] = true
+	}
+
+	// Пункт, который интервью закрыло, обязан дойти до тикета. Молча выпавший
+	// раздел не отличить от «этого автор не рассказывал»: пробелов у обращения
+	// нет, метки incomplete не будет, и потеря пройдёт незамеченной.
+	for key := range cs.Filled {
+		if slices.Contains(cs.Gaps, key) || i.rules.Title(cs.Kind, key) == "" {
+			continue
+		}
+		if !written[key] {
+			return fmt.Errorf("closed key %q has no section", key)
 		}
 	}
 	return nil
@@ -578,7 +667,6 @@ func (c *Cases) AddAnswer(ctx context.Context, cs *Case, text string) error {
 	if cs.Status != statusInterview && cs.Status != statusSummary {
 		return ErrNotInterview
 	}
-	fix := cs.Status == statusSummary
 
 	moved := false
 	err := c.inTx(ctx, func(tx pgx.Tx) error {
@@ -594,21 +682,16 @@ func (c *Cases) AddAnswer(ctx context.Context, cs *Case, text string) error {
 		moved = true
 
 		if err := addEvent(ctx, tx, cs.ID, "answer_given", map[string]any{
-			"round": cs.Round, "text": text, "fix": fix,
+			"round": cs.Round, "text": text,
 		}); err != nil {
 			return err
 		}
 
-		// Ещё не начатый ход снимается: человек дописывает вторым сообщением, и
-		// дважды нажатая кнопка «Всё так» - тоже обычное дело. Отвечать надо
-		// один раз и на всё сразу, а не задавать два раунда вопросов подряд.
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM jobs
-			WHERE kind = $2 AND status = 'pending' AND payload->>'case_id' = $1`,
-			cs.ID, JobInterview); err != nil {
-			return fmt.Errorf("clear interview jobs of case %s: %w", cs.ID, err)
-		}
-		return putCaseJob(ctx, tx, JobInterview, cs.ID, interviewPayload{CaseID: cs.ID, Fix: fix})
+		// Человек дописывает вторым сообщением: замена снимает ещё не начатый
+		// ход, и модель отвечает один раз на всё сразу. Правка это или обычный
+		// ответ, решает сам ход по журналу - в работе этот признак терялся бы
+		// при замене.
+		return replaceJob(ctx, tx, JobInterview, cs.ID, casePayload{CaseID: cs.ID})
 	})
 	if err != nil {
 		return err
@@ -618,7 +701,7 @@ func (c *Cases) AddAnswer(ctx context.Context, cs *Case, text string) error {
 	}
 
 	cs.Status = statusInterview
-	c.log.Info("answer_given", "case_id", cs.ID, "round", cs.Round, "fix", fix,
+	c.log.Info("answer_given", "case_id", cs.ID, "round", cs.Round,
 		"chars", utf8.RuneCountInString(text))
 	return nil
 }
@@ -631,6 +714,17 @@ func (c *Cases) AcceptRound(ctx context.Context, cs *Case, round int) error {
 		return ErrNotInterview
 	}
 	if round != cs.Round {
+		return ErrStaleRound
+	}
+
+	// На раунд уже отвечали: кнопка нажата второй раз, пока первый ход ещё
+	// думает. Номер раунда этого не ловит - он меняется только следующим ходом,
+	// поэтому смотрим, что было последним событием разговора.
+	answered, err := c.roundAnswered(ctx, cs.ID)
+	if err != nil {
+		return err
+	}
+	if answered {
 		return ErrStaleRound
 	}
 
@@ -647,6 +741,23 @@ func (c *Cases) AcceptRound(ctx context.Context, cs *Case, round int) error {
 		fmt.Fprintf(&b, "%s: %s\n", q.Text, q.Suggested)
 	}
 	return c.AddAnswer(ctx, cs, b.String())
+}
+
+// roundAnswered - последним событием разговора идёт ответ, а не вопрос. Значит
+// текущий раунд закрыт и подтверждать в нём нечего.
+func (c *Cases) roundAnswered(ctx context.Context, caseID string) (bool, error) {
+	var kind string
+	err := c.pool.QueryRow(ctx, `
+		SELECT kind FROM case_events
+		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given')
+		ORDER BY id DESC LIMIT 1`, caseID).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check last event of case %s: %w", caseID, err)
+	}
+	return kind == "answer_given", nil
 }
 
 func (c *Cases) lastQuestions(ctx context.Context, caseID string) ([]Question, error) {
@@ -694,7 +805,10 @@ func (c *Cases) ConfirmSummary(ctx context.Context, cs *Case) error {
 		if err := addEvent(ctx, tx, cs.ID, "summary_confirmed", nil); err != nil {
 			return err
 		}
-		return PutJob(ctx, tx, JobPublish, JobPublish+":"+cs.ID, casePayload{CaseID: cs.ID})
+
+		// Прошлая попытка могла исчерпать повторы и остаться в очереди
+		// погашенной: замена возвращает публикацию в работу.
+		return replaceJob(ctx, tx, JobPublish, cs.ID, casePayload{CaseID: cs.ID})
 	})
 	if err != nil {
 		return err

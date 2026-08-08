@@ -626,7 +626,25 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 	case err != nil:
 		return err
 	}
+
+	// Кнопка снимается сразу, тем же ответом: следующий ход идёт секунды, и без
+	// видимой реакции человек жмёт её ещё раз. Каждое лишнее нажатие - ещё один
+	// ответ в истории и ещё один ход модели поверх незаконченного.
+	if err := c.Edit(acceptedText(c)); err != nil {
+		b.log.Warn("round_edit_failed", "user_id", senderID(c), "error", err)
+		return c.Send("Принял. Уточняю дальше.")
+	}
 	return nil
+}
+
+// acceptedText помечает раунд принятым прямо в исходном сообщении: история
+// переписки остаётся читаемой, а кнопки под ним больше нет.
+func acceptedText(c tele.Context) string {
+	text := "Раунд вопросов"
+	if msg := c.Message(); msg != nil && msg.Text != "" {
+		text = msg.Text
+	}
+	return text + "\n\n---\nПринято: всё так. Уточняю дальше."
 }
 
 // onPublish - «Публикую»: подтверждение саммари, после которого тикет уходит в

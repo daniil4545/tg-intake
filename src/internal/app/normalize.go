@@ -326,7 +326,7 @@ func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol
 		// Разговор начинает работа, а не этот шаг: нормализация не знает, чем
 		// кончится обращение, и это то, что делает второй режим бота
 		// наслаиванием, а не переписью.
-		return putCaseJob(ctx, tx, JobInterview, cs.ID, interviewPayload{CaseID: cs.ID})
+		return replaceJob(ctx, tx, JobInterview, cs.ID, casePayload{CaseID: cs.ID})
 	})
 	if err != nil {
 		return err
