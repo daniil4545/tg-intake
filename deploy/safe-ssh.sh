@@ -81,7 +81,7 @@ case "$action" in
         # процесс», а не «что заведено в контуре»: до выката нового compose
         # свежая переменная в контейнер не попадает и выглядит отсутствующей.
         # Значения скрыты: там токен бота и ключ OpenRouter.
-        remote="name=\$(docker ps -a $filter --filter 'label=com.docker.compose.service=app' --format '{{.Names}}' | head -1); test -n \"\$name\" || { echo 'app=not_found'; exit 1; }; uuid=\${name#app-}; dir=/data/coolify/services/\$uuid; test -d \"\$dir\" || { echo \"service_dir=not_found uuid=\$uuid\"; exit 1; }; echo \"service_uuid=\$uuid\"; echo '--- env keys ---'; sed 's/=.*/=<set>/' \"\$dir/.env\" 2>/dev/null | grep -v '^#' | grep -v '^\$' | sort || echo 'env=absent'; echo '--- compose ---'; grep -cE 'OPENROUTER_API_KEY|MEDIA_DIR' \"\$dir/docker-compose.yml\" 2>/dev/null | sed 's/^/m1_markers=/'"
+        remote="name=\$(docker ps -a $filter --filter 'label=com.docker.compose.service=app' --format '{{.Names}}' | head -1); test -n \"\$name\" || { echo 'app=not_found'; exit 1; }; uuid=\${name#app-}; dir=/data/coolify/services/\$uuid; test -d \"\$dir\" || { echo \"service_dir=not_found uuid=\$uuid\"; exit 1; }; echo \"service_uuid=\$uuid\"; echo '--- env keys ---'; sed 's/=.*/=<set>/' \"\$dir/.env\" 2>/dev/null | grep -v '^#' | grep -v '^\$' | sort || echo 'env=absent'; echo '--- APP_IMAGE ---'; grep '^APP_IMAGE=' \"\$dir/.env\" 2>/dev/null || echo 'APP_IMAGE=absent'; echo '--- compose ---'; grep -cE 'OPENROUTER_API_KEY|MEDIA_DIR' \"\$dir/docker-compose.yml\" 2>/dev/null | sed 's/^/m1_markers=/'"
         ;;
     app-env)
         # Значения скрыты намеренно: в окружении лежат токен бота и пароль базы.
