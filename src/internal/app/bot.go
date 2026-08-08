@@ -207,7 +207,10 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 			return nil
 		}
 		if chat := c.Chat(); chat == nil || chat.Type != tele.ChatPrivate {
-			// Скриншоты и саммари обращения групповому чату не место.
+			// Скриншоты и саммари обращения групповому чату не место. Лог
+			// обязателен: без него этот отказ - единственный, которого не видно
+			// в контуре, и разбор жалобы «бот меня не пустил» упирается в пустоту.
+			b.log.Warn("access_denied", "user_id", sender.ID, "reason", "not_private")
 			return refuse(c, "Бот работает только в личной переписке.")
 		}
 		if !slices.Contains(b.allowed, sender.ID) {
