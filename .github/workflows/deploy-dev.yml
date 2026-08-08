@@ -9,6 +9,10 @@ on:
   push:
     branches:
       - dev
+  # Ручной запуск: Coolify отвечает «принято» сразу, и выкат может не
+  # состояться уже после зелёного workflow. Без этого триггера повторить
+  # деплой можно было только пустым коммитом в dev.
+  workflow_dispatch:
 
 permissions:
   contents: read
