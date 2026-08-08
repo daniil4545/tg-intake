@@ -49,6 +49,9 @@ var (
 	publishBtn  = &tele.Btn{Unique: "publish"}
 	fixBtn      = &tele.Btn{Unique: "fix"}
 	dropBtn     = &tele.Btn{Unique: "drop"}
+	ticketsBtn  = &tele.Btn{Unique: "tickets"}
+	cardBtn     = &tele.Btn{Unique: "card"}
+	killBtn     = &tele.Btn{Unique: "kill"}
 	doneBtn     = &tele.Btn{Text: "Готово"}
 	cancelBtn   = &tele.Btn{Text: "Отмена"}
 )
@@ -57,13 +60,14 @@ type Bot struct {
 	bot      *tele.Bot
 	pool     *pgxpool.Pool
 	cases    *Cases
+	tickets  *Tickets
 	log      *slog.Logger
 	allowed  []int64
 	maxItems int
 }
 
-func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, log *slog.Logger) (*Bot, error) {
-	b := &Bot{pool: pool, cases: cases, log: log, allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems}
+func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, log *slog.Logger) (*Bot, error) {
+	b := &Bot{pool: pool, cases: cases, tickets: tickets, log: log, allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems}
 
 	// Verbose дампит сырые payload Bot API вместе с текстами сообщений, а
 	// стандартный OnError пишет через stdlib log мимо JSON.
@@ -90,8 +94,12 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, l
 	tb.Handle("/start", b.onStart)
 	tb.Handle("/done", b.onDone)
 	tb.Handle("/cancel", b.onCancel)
+	tb.Handle("/tickets", b.onTicketList)
 
 	tb.Handle(projectBtn, b.onProject)
+	tb.Handle(ticketsBtn, b.onTickets)
+	tb.Handle(cardBtn, b.onCard)
+	tb.Handle(killBtn, b.onKill)
 	tb.Handle(createBtn, b.onCreate)
 	tb.Handle(continueBtn, b.onContinue)
 	tb.Handle(restartBtn, b.onRestart)
@@ -216,7 +224,9 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) error {
 				cut--
 			}
 		}
-		if _, err := b.bot.Send(to, strings.TrimRight(text[:cut], "\n"), opts...); err != nil {
+		// opts только на последнем куске: иначе кнопки дублируются под каждым, и
+		// автор жмёт устаревшую копию выше по переписке.
+		if _, err := b.bot.Send(to, strings.TrimRight(text[:cut], "\n")); err != nil {
 			return fmt.Errorf("send message part: %w", err)
 		}
 		text = strings.TrimLeft(text[cut:], "\n")
@@ -298,6 +308,12 @@ func (b *Bot) onStart(c tele.Context) error {
 // обращение (признак приходит из CollectItem) и повторяется на «Готово» без
 // проекта: тикет некуда заводить.
 func (b *Bot) askProject(ctx context.Context, c tele.Context, text string) error {
+	return b.askProjectFor(ctx, c, text, projectBtn)
+}
+
+// askProjectFor - тот же список проектов под другую кнопку: выбор проекта нужен
+// и сбору обращения, и просмотру тикетов.
+func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, btn *tele.Btn) error {
 	projects, err := ListProjects(ctx, b.pool)
 	if err != nil {
 		return err
@@ -310,7 +326,7 @@ func (b *Bot) askProject(ctx context.Context, c tele.Context, text string) error
 	markup := &tele.ReplyMarkup{}
 	rows := make([]tele.Row, 0, len(projects))
 	for _, p := range projects {
-		rows = append(rows, markup.Row(markup.Data(p.Title, projectBtn.Unique, p.Slug)))
+		rows = append(rows, markup.Row(markup.Data(p.Title, btn.Unique, p.Slug)))
 	}
 	markup.Inline(rows...)
 	return c.Send(text, markup)
@@ -349,7 +365,10 @@ func (b *Bot) onProject(c tele.Context) error {
 
 	if cs == nil {
 		markup := &tele.ReplyMarkup{}
-		markup.Inline(markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)))
+		markup.Inline(
+			markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
+			markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
+		)
 		return c.Send("Проект «"+title+"» выбран.", markup)
 	}
 
@@ -778,4 +797,184 @@ func summaryKeyboard() *tele.ReplyMarkup {
 		markup.Data("Отмена", dropBtn.Unique),
 	))
 	return markup
+}
+
+// onTicketList - вход в просмотр командой. Нужен отдельно от кнопки меню: меню
+// действий рисуется только автору без активного обращения, а вспоминает про
+// старый тикет человек как раз посреди интервью.
+func (b *Bot) onTicketList(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+	return b.askProjectFor(ctx, c, "Тикеты какого проекта показать?", ticketsBtn)
+}
+
+// onTickets - список тикетов проекта.
+func (b *Bot) onTickets(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
+	project, ok, err := b.project(ctx, c.Data())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+	}
+
+	tickets, err := b.tickets.List(ctx, project)
+	if err != nil {
+		return err
+	}
+	if len(tickets) == 0 {
+		return c.Send("По проекту «" + project.Title + "» тикетов ещё нет.")
+	}
+	b.log.Info("tickets_listed", "user_id", senderID(c), "project", project.Slug, "count", len(tickets))
+
+	markup := &tele.ReplyMarkup{}
+	rows := make([]tele.Row, 0, len(tickets))
+	var text strings.Builder
+	text.WriteString("Тикеты проекта «" + project.Title + "»:\n\n")
+	for _, t := range tickets {
+		text.WriteString(ticketLine(t) + "\n")
+		rows = append(rows, markup.Row(markup.Data(
+			fmt.Sprintf("#%d %s", t.Number, statusTitle(t.Status)),
+			cardBtn.Unique, cardData(project.Slug, t.Number))))
+	}
+	markup.Inline(rows...)
+	return b.sendLong(c.Recipient(), text.String(), markup)
+}
+
+// onCard - карточка тикета. Кнопка отмены только автору: просмотр общий, отмена
+// нет.
+func (b *Bot) onCard(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
+	project, number, ok, err := b.cardTarget(ctx, c)
+	if err != nil || !ok {
+		return err
+	}
+
+	ticket, err := b.tickets.Load(ctx, project, number)
+	switch {
+	case errors.Is(err, ErrIssueGone):
+		return c.Send(fmt.Sprintf("Тикета #%d больше нет в GitHub.", number))
+	case err != nil:
+		return err
+	case ticket == nil:
+		return c.Send("Тикет не найден. Откройте список заново.")
+	}
+	b.log.Info("ticket_opened", "user_id", senderID(c), "case_id", ticket.CaseID, "issue", number)
+
+	markup := &tele.ReplyMarkup{}
+	var rows []tele.Row
+	if ticket.UserID == senderID(c) && !ticket.Status.Final {
+		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
+			cardData(project.Slug, number))))
+	}
+	rows = append(rows, markup.Row(markup.Data("К списку", ticketsBtn.Unique, project.Slug)))
+	markup.Inline(rows...)
+	return b.sendLong(c.Recipient(), cardText(ticket), markup)
+}
+
+// onKill ставит работу отмены. Ответ автору синхронный, сама отмена идёт
+// очередью: это мутация в GitHub, она обязана пережить рестарт.
+func (b *Bot) onKill(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	project, number, ok, err := b.cardTarget(ctx, c)
+	if err != nil || !ok {
+		return err
+	}
+
+	err = b.tickets.Cancel(ctx, project, number, senderID(c))
+	switch {
+	case errors.Is(err, ErrNotAuthor):
+		b.log.Warn("cancel_denied", "user_id", senderID(c), "project", project.Slug, "issue", number)
+		return c.Send("Отменить тикет может только его автор.")
+	case errors.Is(err, ErrIssueGone):
+		return c.Send("Тикет не найден. Откройте список заново.")
+	case err != nil:
+		return err
+	}
+	return c.Send(fmt.Sprintf("Отменяю тикет #%d, сообщу когда закроется.", number))
+}
+
+// cardTarget разбирает кнопку карточки. Второе значение false означает, что
+// автору уже ответили отказом.
+func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, bool, error) {
+	slug, raw, found := strings.Cut(c.Data(), ":")
+	number, err := strconv.Atoi(raw)
+	if !found || err != nil {
+		b.log.Warn("bad_card_data", "user_id", senderID(c), "data", c.Data())
+		return Project{}, 0, false, c.Send("Кнопка устарела. Откройте список заново.")
+	}
+
+	project, ok, err := b.project(ctx, slug)
+	if err != nil {
+		return Project{}, 0, false, err
+	}
+	if !ok {
+		return Project{}, 0, false, c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+	}
+	return project, number, true, nil
+}
+
+// project резолвит slug кнопки. Фильтр active тот же, что у меню: проект,
+// выключенный между открытием списка и нажатием, отвечает отказом.
+func (b *Bot) project(ctx context.Context, slug string) (Project, bool, error) {
+	projects, err := ListProjects(ctx, b.pool)
+	if err != nil {
+		return Project{}, false, err
+	}
+	index := slices.IndexFunc(projects, func(p Project) bool { return p.Slug == slug })
+	if index < 0 {
+		return Project{}, false, nil
+	}
+	return projects[index], true, nil
+}
+
+func cardData(slug string, number int) string {
+	return slug + ":" + strconv.Itoa(number)
+}
+
+func ticketLine(t Ticket) string {
+	return fmt.Sprintf("#%d - %s - %s", t.Number, statusTitle(t.Status), t.Title)
+}
+
+// statusTitle - что показать вместо статуса, когда GitHub не ответил. Пустая
+// строка выглядела бы как «статус неизвестен сервису», а он просто недоступен.
+func statusTitle(s Status) string {
+	if s.Title == "" {
+		return "статус недоступен"
+	}
+	return s.Title
+}
+
+func cardText(t *Ticket) string {
+	var text strings.Builder
+	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
+	if t.Body != "" {
+		text.WriteString("\n" + t.Body + "\n")
+	}
+	if t.Comment != "" {
+		text.WriteString("\nПоследний комментарий:\n" + t.Comment + "\n")
+	}
+	if t.URL != "" {
+		text.WriteString("\n" + t.URL)
+	}
+	return text.String()
 }

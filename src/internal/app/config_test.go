@@ -43,6 +43,7 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	t.Setenv("MAX_ITEMS", "")
 	t.Setenv("INTERVIEW_ROUNDS", "")
 	t.Setenv("AUDIO_CONVERT", "")
+	t.Setenv("PROJECTS", "")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -71,5 +72,41 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	}
 	if cfg.AudioConvert != "auto" {
 		t.Errorf("audio convert fallback: got %q", cfg.AudioConvert)
+	}
+}
+
+// TestParseProjects: список проектов приходит из конфига контура, и битая
+// строка обязана всплыть в логе выката, а не пустым меню у автора.
+func TestParseProjects(t *testing.T) {
+	valid := `[{"slug":"crm-bot","title":"CRM","owner":"acme","repo":"crm","context":"про crm"}]`
+
+	cases := []struct {
+		name string
+		raw  string
+		ok   bool
+	}{
+		{"пусто - не ошибка", "", true},
+		{"валидный список", valid, true},
+		{"битый json", `[{"slug":`, false},
+		{"slug не по маске", `[{"slug":"CRM Bot","title":"CRM","owner":"a","repo":"r","context":"c"}]`, false},
+		{"дубль slug", `[{"slug":"crm","title":"CRM","owner":"a","repo":"r","context":"c"},
+			{"slug":"crm","title":"CRM 2","owner":"a","repo":"r2","context":"c"}]`, false},
+		{"без контекста", `[{"slug":"crm","title":"CRM","owner":"a","repo":"r","context":"  "}]`, false},
+		{"без репозитория", `[{"slug":"crm","title":"CRM","owner":"a","repo":"","context":"c"}]`, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := ParseProjects(c.raw)
+			if c.ok && err != nil {
+				t.Fatalf("want no error, got: %v", err)
+			}
+			if !c.ok && err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if c.raw == valid && (len(got) != 1 || !got[0].IsActive()) {
+				t.Errorf("проект по умолчанию активен: %+v", got)
+			}
+		})
 	}
 }

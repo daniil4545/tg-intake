@@ -1,0 +1,10 @@
+{
+  "statuses": [
+    {"label": "status:rejected",    "title": "Отклонён", "color": "b60205", "final": true},
+    {"label": "status:cancelled",   "title": "Отменён",  "color": "cfd3d7", "final": true},
+    {"label": "status:prod",        "title": "В проде",  "color": "0e8a16", "final": true},
+    {"label": "status:dev",         "title": "В dev",    "color": "1d76db", "final": false},
+    {"label": "status:in-progress", "title": "В работе", "color": "fbca04", "final": false},
+    {"label": "status:new",         "title": "Заведён",  "color": "ededed", "final": false}
+  ]
+}

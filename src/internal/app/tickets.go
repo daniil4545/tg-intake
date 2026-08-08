@@ -1,0 +1,304 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// ticketsLimit - сколько последних тикетов проекта показывает список. Листать
+// в Telegram неудобно, а тикет старше десятого ищется в GitHub тем, у кого есть
+// доступ.
+const ticketsLimit = 10
+
+// issueScan - окно, в котором ищутся метки своих тикетов. Больше сотни GitHub
+// за один запрос не отдаёт.
+const issueScan = 100
+
+// labelCancelled - метка, которую ставит отмена. Наличие её в правилах
+// проверяется при старте: без неё отменять нечем.
+const labelCancelled = "status:cancelled"
+
+var (
+	// ErrNotAuthor - отменять чужой тикет нельзя. Просмотр общий, отмена нет.
+	ErrNotAuthor = errors.New("ticket belongs to another author")
+	// ErrIssueGone - тикета в GitHub больше нет: удалён или перенесён.
+	ErrIssueGone = errors.New("issue does not exist")
+)
+
+// Ticket - тикет для показа автору. Author, Body и Comment заполняет только
+// карточка: в списке они пусты, и второй тип ради трёх пустых строк не стоит
+// пересечения в шести полях.
+type Ticket struct {
+	CaseID  string
+	Number  int
+	URL     string
+	Title   string
+	UserID  int64
+	Status  Status
+	Author  string
+	Body    string
+	Comment string
+}
+
+// Tickets - просмотр тикетов и отмена. Владелец состояния обращения по-прежнему
+// Cases: здесь только то, что требует GitHub.
+type Tickets struct {
+	cases    *Cases
+	gh       *GitHub
+	statuses Statuses
+	log      *slog.Logger
+}
+
+func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger) *Tickets {
+	return &Tickets{cases: cases, gh: gh, statuses: statuses, log: log}
+}
+
+// List - последние тикеты проекта. Номера и заголовки из своей базы, статусы
+// одним запросом к GitHub.
+//
+// Отказ GitHub не прячет список: тикеты видны без статусов. Просмотр не должен
+// умирать вместе с чужим сервисом.
+func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
+	rows, err := t.cases.pool.Query(ctx, `
+		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''), user_id
+		FROM cases
+		WHERE project_id = $1 AND issue_number IS NOT NULL
+		ORDER BY issue_number DESC LIMIT $2`, project.ID, ticketsLimit)
+	if err != nil {
+		return nil, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
+	}
+	defer rows.Close()
+
+	var tickets []Ticket
+	for rows.Next() {
+		var t Ticket
+		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID); err != nil {
+			return nil, fmt.Errorf("scan ticket: %w", err)
+		}
+		tickets = append(tickets, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read tickets: %w", err)
+	}
+	if len(tickets) == 0 {
+		return nil, nil
+	}
+
+	issues, err := t.gh.ListIssues(ctx, project, issueScan)
+	if err != nil {
+		t.log.Warn("issues_unavailable", "project", project.Slug, "error", err)
+		return tickets, nil
+	}
+
+	labels := make(map[int][]string, len(issues))
+	for _, issue := range issues {
+		labels[issue.Number] = issue.LabelNames()
+	}
+	for i := range tickets {
+		names, ok := labels[tickets[i].Number]
+		if !ok {
+			continue
+		}
+		t.noteUnknown(project, tickets[i].Number, names)
+		if status, ok := t.statuses.Pick(names); ok {
+			tickets[i].Status = status
+		}
+	}
+	return tickets, nil
+}
+
+// Load - карточка тикета. Тело берётся из своей базы, а не из issue.body: в
+// теле тикета живут шапка авторства и служебный маркер обращения, которым
+// незачем уезжать в чат.
+func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticket, error) {
+	var ticket Ticket
+	var summary string
+	row := t.cases.pool.QueryRow(ctx, `
+		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''),
+		       user_id, COALESCE(summary, '')
+		FROM cases WHERE project_id = $1 AND issue_number = $2`, project.ID, number)
+	if err := row.Scan(&ticket.CaseID, &ticket.Number, &ticket.URL, &ticket.Title,
+		&ticket.UserID, &summary); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load ticket %d of project %d: %w", number, project.ID, err)
+	}
+	ticket.Body = plainSections(summary)
+
+	author, err := LoadUser(ctx, t.cases.pool, ticket.UserID)
+	if err != nil {
+		return nil, err
+	}
+	ticket.Author = authorName(author)
+
+	issue, err := t.gh.GetIssue(ctx, project, number, true)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ErrIssueGone
+		}
+		// Карточка переживает отказ так же, как список: без статуса, но с телом.
+		t.log.Warn("issue_unavailable", "project", project.Slug, "issue", number, "error", err)
+		return &ticket, nil
+	}
+
+	names := issue.LabelNames()
+	t.noteUnknown(project, number, names)
+	status, ok := t.statuses.Pick(names)
+	if !ok {
+		return &ticket, nil
+	}
+	ticket.Status = status
+
+	// Комментарий нужен там, где тикет доигран: автор пришёл узнать, почему.
+	if status.Final {
+		comment, err := t.gh.LastComment(ctx, project, number)
+		if err != nil {
+			t.log.Warn("comments_unavailable", "project", project.Slug, "issue", number, "error", err)
+			return &ticket, nil
+		}
+		if comment == "" {
+			t.log.Warn("comment_missing", "project", project.Slug, "issue", number)
+		}
+		ticket.Comment = comment
+	}
+	return &ticket, nil
+}
+
+// Cancel ставит работу отмены. Через replaceJob: повторная отмена после
+// исчерпанных повторов первой снова уходит в очередь, а не упирается в ключ
+// погашенной работы.
+func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64) error {
+	var caseID string
+	var owner int64
+	row := t.cases.pool.QueryRow(ctx,
+		`SELECT id, user_id FROM cases WHERE project_id = $1 AND issue_number = $2`,
+		project.ID, number)
+	if err := row.Scan(&caseID, &owner); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrIssueGone
+		}
+		return fmt.Errorf("load case of issue %d: %w", number, err)
+	}
+	if owner != userID {
+		return ErrNotAuthor
+	}
+	return replaceJob(ctx, t.cases.pool, JobCancelIssue, caseID,
+		cancelPayload{CaseID: caseID, UserID: userID})
+}
+
+// RunCancel закрывает тикет в GitHub. Порядок вызовов важен: метка ставится до
+// закрытия, иначе падение между ними оставит закрытый issue без объяснения.
+func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
+	var p cancelPayload
+	if err := json.Unmarshal(job.Payload, &p); err != nil {
+		return fmt.Errorf("payload of %s: %w", job.Kind, err)
+	}
+
+	cs, err := t.cases.Load(ctx, p.CaseID)
+	if err != nil {
+		return err
+	}
+	if cs == nil || cs.IssueNumber == 0 || cs.ProjectID == nil {
+		return nil
+	}
+	// Право проверяется второй раз: кнопка живёт в чужом сообщении дольше, чем
+	// экран, с которого её нажали.
+	if cs.UserID != p.UserID {
+		t.log.Warn("cancel_denied", "case_id", cs.ID, "user_id", p.UserID)
+		return nil
+	}
+
+	project, err := LoadProject(ctx, t.cases.pool, *cs.ProjectID)
+	if err != nil {
+		return err
+	}
+
+	issue, err := t.gh.GetIssue(ctx, project, cs.IssueNumber, false)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	// Финальность проверяется один раз, до собственных мутаций: после них на
+	// issue уже висит status:cancelled, и повторная проверка оборвала бы работу
+	// до снятия старой метки.
+	names := issue.LabelNames()
+	if status, ok := t.statuses.Pick(names); ok && status.Final {
+		return t.cases.inTx(ctx, func(tx pgx.Tx) error {
+			return putNotifyKey(ctx, tx, cs.ID, "cancel-late",
+				fmt.Sprintf("Тикет #%d уже закрыт со статусом «%s», отменять нечего.",
+					cs.IssueNumber, status.Title), "")
+		})
+	}
+
+	if err := t.gh.AddLabel(ctx, project, cs.IssueNumber, labelCancelled); err != nil {
+		return err
+	}
+	// Снимаются все прочие метки статуса, а не одна: падение между добавлением и
+	// снятием оставляет на issue две.
+	for _, name := range names {
+		if !strings.HasPrefix(name, statusPrefix) || name == labelCancelled {
+			continue
+		}
+		if err := t.gh.RemoveLabel(ctx, project, cs.IssueNumber, name); err != nil {
+			return err
+		}
+	}
+	if err := t.gh.CloseIssue(ctx, project, cs.IssueNumber); err != nil {
+		return err
+	}
+
+	err = t.cases.inTx(ctx, func(tx pgx.Tx) error {
+		// Условие обязательно: повтор работы после падения между закрытием issue
+		// и гашением работы записал бы второе событие в журнал.
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO case_events (case_id, kind, payload)
+			SELECT $1, 'cancelled_by_author', $2::jsonb
+			WHERE NOT EXISTS (
+			    SELECT 1 FROM case_events WHERE case_id = $1 AND kind = 'cancelled_by_author')`,
+			cs.ID, fmt.Sprintf(`{"issue": %d}`, cs.IssueNumber))
+		if err != nil {
+			return fmt.Errorf("record cancel of case %s: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		return putNotifyKey(ctx, tx, cs.ID, "cancelled",
+			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), "")
+	})
+	if err != nil {
+		return err
+	}
+
+	t.log.Info("issue_cancelled", "case_id", cs.ID, "user_id", cs.UserID,
+		"project", project.Slug, "issue", cs.IssueNumber)
+	return nil
+}
+
+// noteUnknown логирует метки статуса, которых нет в правилах: владелец завёл
+// свою, и выдумывать её смысл сервис не станет.
+func (t *Tickets) noteUnknown(project Project, number int, labels []string) {
+	for _, label := range t.statuses.Unknown(labels) {
+		t.log.Warn("status_unknown", "project", project.Slug, "issue", number, "label", label)
+	}
+}
+
+func isNotFound(err error) bool {
+	var apiErr *githubError
+	return errors.As(err, &apiErr) && apiErr.status == http.StatusNotFound
+}
+
+type cancelPayload struct {
+	CaseID string `json:"case_id"`
+	UserID int64  `json:"user_id"`
+}
