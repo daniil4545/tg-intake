@@ -135,15 +135,18 @@ jobs:
             --header "Content-Type: application/json" \
             --data "{\"key\":\"APP_IMAGE\",\"value\":\"${image}\"}" \
             --output /dev/null
-          # Ответ /deploy печатаем: HTTP 200 приходит и тогда, когда Coolify
-          # выкат не начал, а причина лежит в теле. Выброшенный ответ стоил
-          # двух зелёных workflow подряд при контуре на прежней ревизии.
+          # force=true обязателен для Compose-сервиса: без него Coolify отвечает
+          # «Service started», видит сервис уже запущенным и контейнеры не
+          # пересоздаёт - контур остаётся на прежнем образе при зелёном workflow.
+          #
+          # Ответ печатаем по той же причине: HTTP 200 приходит и тогда, когда
+          # выкат не начат, а причина лежит в теле.
           response=$(curl --fail --silent --show-error --request GET \
-            "${COOLIFY_API_BASE}/deploy?uuid=${COOLIFY_DEV_SERVICE_UUID}" \
+            "${COOLIFY_API_BASE}/deploy?uuid=${COOLIFY_DEV_SERVICE_UUID}&force=true" \
             --header "Authorization: Bearer ${COOLIFY_TOKEN}")
           echo "coolify response: ${response}"
-          echo "${response}" | grep -q "deployment_uuid" || {
-            echo "Coolify не принял выкат: в ответе нет deployment_uuid" >&2
+          echo "${response}" | grep -q "deployments" || {
+            echo "Coolify не принял выкат" >&2
             exit 1
           }
           echo "intake-dev deploy queued for sha-${GITHUB_SHA}"
