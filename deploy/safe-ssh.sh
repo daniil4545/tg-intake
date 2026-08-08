@@ -20,6 +20,7 @@ Read-only actions:
   app-env          переменные окружения приложения, значения скрыты
   db-counts        число строк по таблицам, без содержимого
   deploy-config    имена переменных сервиса в Coolify и версия его compose
+  deploy-state     образ кандидата на хосте и незавершённые деплои Coolify
 
 INTAKE_SSH_HOST переопределяет root@203.0.113.10.
 INTAKE_RESOURCE переопределяет контур intake-dev.
@@ -69,6 +70,11 @@ case "$action" in
         # Только счётчики: строки таблиц содержат ФИО автора и текст обращения,
         # им место в базе, а не в терминале.
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select 'projects='||(select count(*) from projects)||' users='||(select count(*) from users)||' cases='||(select count(*) from cases)||' case_items='||(select count(*) from case_items)||' jobs='||(select count(*) from jobs)\""
+        ;;
+    deploy-state)
+        # Зелёный workflow означает «Coolify принял запрос». Выкат мог не
+        # начаться: образ не стянут, помощник деплоя висит, очередь стоит.
+        remote="echo '--- образы кандидата ---'; docker images ghcr.io/daniil4545/tg-intake --format '{{.Tag}} {{.CreatedSince}}' | head -5; echo '--- сам coolify ---'; docker ps -a --format '{{.Names}} {{.Status}}' | grep -i coolify | head -8; echo '--- ошибки coolify ---'; docker logs coolify --since 30m 2>&1 | grep -iE 'error|exception|failed|intake' | tail -12 || echo 'logs=empty'"
         ;;
     deploy-config)
         # Окружение контейнера отвечает на вопрос «что получил работающий
