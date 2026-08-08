@@ -60,14 +60,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ENV: dev
     # Файлы обращения живут минуты и стираются после нормализации: диску их
-    # переживать незачем. mode 1777 нужен образу distroless:nonroot, иначе
-    # каталог не создать.
+    # переживать незачем. Режим не задаём: tmpfs монтируется с 1777, чего
+    # хватает образу distroless:nonroot, а `mode: 01777` ломает разбор Compose -
+    # ведущий ноль делает значение строкой, Docker ждёт число.
     volumes:
       - type: tmpfs
         target: /tmp/intake
         tmpfs:
           size: 268435456
-          mode: 01777
     depends_on:
       migrate:
         condition: service_completed_successfully
