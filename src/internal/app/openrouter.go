@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -30,11 +31,21 @@ type OpenRouter struct {
 	log   *slog.Logger
 }
 
-func NewOpenRouter(key, model string, log *slog.Logger) *OpenRouter {
+// NewOpenRouter: proxy - адрес HTTP-прокси или пусто. Прокси задаётся только
+// этому клиенту, а не через окружение процесса: на хосте прямой путь к
+// OpenRouter закрыт, а Telegram и GitHub с него доступны напрямую, и уводить их
+// в тот же туннель значит менять то, что работает.
+func NewOpenRouter(key, model, proxy string, log *slog.Logger) *OpenRouter {
 	// Таймаут на попытку, а не на вызов целиком: общий предел задаёт ctx
 	// вызывающего, иначе три повтора незаметно растянулись бы на четыре минуты
 	// внутри одного дедлайна.
-	return &OpenRouter{key: key, model: model, http: &http.Client{Timeout: llmTimeout}, log: log}
+	client := &http.Client{Timeout: llmTimeout}
+	if proxy != "" {
+		// Адрес разобран и проверен при загрузке конфига.
+		parsed, _ := url.Parse(proxy)
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(parsed)}
+	}
+	return &OpenRouter{key: key, model: model, http: client, log: log}
 }
 
 // Request - один вызов модели.
@@ -223,6 +234,11 @@ func (c *OpenRouter) send(ctx context.Context, body []byte) (llmResult, bool, er
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+c.key)
 	httpReq.Header.Set("Content-Type", "application/json")
+	// Идентификация приложения: OpenRouter ждёт эти два заголовка, а дефолтный
+	// User-Agent Go-клиента отличает нас от браузера для edge-защиты.
+	httpReq.Header.Set("HTTP-Referer", "https://github.com/daniil4545/tg-intake")
+	httpReq.Header.Set("X-Title", "tg-intake")
+	httpReq.Header.Set("User-Agent", "tg-intake/1.0")
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
@@ -269,7 +285,10 @@ func errorMessage(raw []byte) string {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return "non-json body"
+		// Не-JSON отвечает не API, а что-то по дороге: шлюз, фильтр, блокировка.
+		// Голое «non-json body» такой ответ не отличает, поэтому показываем его
+		// начало - нашего запроса в нём нет.
+		return "non-json body: " + cut(oneLine(string(raw)))
 	}
 	return cut(out.Error.Message)
 }

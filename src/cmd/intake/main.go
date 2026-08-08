@@ -63,7 +63,8 @@ func main() {
 	}
 
 	cases := app.NewCases(pool, media, log, cfg.MaxItems)
-	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, log)
+	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, cfg.OpenRouterProxy, log)
+	log.Info("openrouter_ready", "proxy", cfg.OpenRouterProxy != "")
 	normalizer := app.NewNormalizer(cases, llm, log, cfg.AudioConvert)
 	interview := app.NewInterview(cases, llm, log, rules, cfg.ModelDialog, cfg.InterviewRounds)
 	github := app.NewGitHub(cfg.GitHubToken, log)

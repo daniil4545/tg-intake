@@ -13,12 +13,15 @@ func TestLoadConfigReportsEveryProblem(t *testing.T) {
 	t.Setenv("OPENROUTER_API_KEY", "")
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("AUDIO_CONVERT", "sometimes")
+	// Битый адрес прокси обязан всплыть при старте, а не первым вызовом модели
+	// в середине живого разговора.
+	t.Setenv("OPENROUTER_PROXY", "::not a url::")
 
 	_, err := LoadConfig()
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
-	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "AUDIO_CONVERT"} {
+	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "AUDIO_CONVERT", "OPENROUTER_PROXY"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error must name %s, got: %v", want, err)
 		}
@@ -32,6 +35,7 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("ENV", "")
 	t.Setenv("OPENROUTER_API_KEY", "key")
+	t.Setenv("OPENROUTER_PROXY", "")
 	t.Setenv("OPENROUTER_MODEL_MEDIA", "")
 	t.Setenv("OPENROUTER_MODEL_DIALOG", "")
 	t.Setenv("GITHUB_TOKEN", "token")
