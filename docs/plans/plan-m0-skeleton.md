@@ -43,7 +43,8 @@ src/
 │   └── bot.go                  # telebot, белый список, хендлеры
 ├── migrations/0001_init.sql
 ├── Dockerfile
-├── docker-compose.yml          # локальный postgres, креды захардкожены
+├── .dockerignore               # .env не должен попасть даже в слой сборки
+├── docker-compose.yml          # локальная цепочка postgres, migrate, app
 ├── Makefile
 ├── .env.example                # только плейсхолдеры
 └── go.mod
@@ -56,9 +57,15 @@ deploy/dev/docker-compose.coolify.yml
 
 `.env.example` лежит рядом с Makefile, потому что тот читает `.env` из своего
 каталога. В примере только плейсхолдеры: ни одного настоящего Telegram ID, ни
-одного токена. Локальный `docker-compose.yml` поднимает только postgres с
-кредами `intake/intake` прямо в файле - это локальная база на ноутбуке, секрета
-в ней нет, зато нет и зависимости от `.env`.
+одного токена. `.gitignore` закрывает `.env` от git, но не от docker-контекста,
+поэтому рядом с Dockerfile лежит `.dockerignore`: иначе токен уезжает в слой
+builder-стадии и остаётся в кэше сборки.
+
+Локальный `docker-compose.yml` повторяет цепочку dev-контура: `postgres ->
+migrate -> app`. `docker compose up -d postgres` поднимает только базу для
+`make run`, `docker compose up` - всю цепочку. Иначе `deploy/dev` уехал бы в
+первый выкат непроверенным, а срез задуман ровно для того, чтобы этого не
+случилось. Креды базы прямо в файле: это postgres на ноутбуке.
 
 ## 3. Конфиг
 
@@ -222,9 +229,12 @@ SIGINT и SIGTERM; по сигналу `bot.Stop()` и `pool.Close()`. Верс�
 ## 6. Логи
 
 `slog` JSON в stdout. Постоянные поля через `With`: `service=intake`, `env`.
-События среза: `starting` (version, env), `db_connected`, `bot_started`,
-`access_denied` (user_id), `start` (user_id, projects), `project_selected`
-(user_id, slug), `shutdown`.
+События среза, имена буквально: `starting` (version, env), `db_connected`,
+`bot_started`, `access_denied` (user_id), `start` (user_id, projects),
+`project_selected` (user_id, slug), `shutdown`. Плюс аномалии:
+`update_without_sender`, `start_no_projects`, `unknown_project`,
+`handler_failed`. Имя события - ключ фильтрации в journald, поэтому оно
+snake_case и совпадает с кодом дословно.
 
 Ни одной строки с именем, username или текстом сообщения: человек в логе - это
 `user_id`.
@@ -249,7 +259,11 @@ directory». Каталога данных нет: у сервиса нет со
   не-healthy и приёмка не проходит при полностью рабочем коде;
 - `app` зависит от `migrate` через `service_completed_successfully`,
   healthcheck `["CMD", "/app", "healthcheck"]`, `restart: unless-stopped`;
-- логи в journald с тегом `intake-dev-{{.Name}}`.
+- логи в journald с тегом `intake-dev-{{.Name}}`;
+- пароль базы задаётся один раз переменной `POSTGRES_PASSWORD`, а `DATABASE_URL`
+  и `GOOSE_DBSTRING` собираются из него в самом Compose. Две независимые
+  переменные с одним паролем рано или поздно разъезжаются, и стек не поднимется
+  при внешне корректном конфиге.
 
 Шага `backup` из соседнего сервиса здесь нет: в dev-контуре нет данных, потерю
 которых стоит переживать, а лишний one-shot контейнер удлиняет каждый выкат.
@@ -264,7 +278,10 @@ Dockerfile, а ошибка многостадийной сборки под dis
 Автодеплой (`deploy-dev.yml`) на push в `dev`: те же проверки, сборка и push
 образа `ghcr.io/daniil4545/tg-intake:sha-<commit>`, синхронизация Compose в
 Coolify через `PATCH /api/v1/services/{uuid}`, установка `APP_IMAGE`, запуск
-деплоя.
+деплоя. Плавающего тега `:dev` рядом нет: он был бы вторым, неотслеживаемым
+способом выката. `cancel-in-progress` выключен - отмена между сменой
+`APP_IMAGE` и запуском выката оставила бы контур числящимся на коммите,
+который не крутится.
 
 **Отличие от канона соседних сервисов, обязательное для публичного
 репозитория.** Адрес Coolify и UUID сервиса не пишутся в workflow открытым
@@ -308,11 +325,17 @@ Coolify через `PATCH /api/v1/services/{uuid}`, установка `APP_IMAG
 | `TestAuthorSlug` | «Иван Петров» без username, username с заглавными, имя из одних эмодзи | метка из `[a-z0-9-]`, непустая, короче 33 символов; в третьем случае `user-<id>` |
 | `TestMigrations` | `goose up`, затем `down-to 0` и снова `up` на чистой базе | обе стороны применяются, схема воспроизводится |
 
-`TestMigrations` берёт DSN из `DATABASE_URL` и пропускается (`t.Skip`), если
-переменная пуста: `go test ./...` без базы должен проходить. Он единственный
-трогает базу, поэтому гонки с параллельными пакетами нет. `down-to 0`, а не
-`down`: `down` откатывает ровно одну миграцию, то есть только seed, и схема
-осталась бы непроверенной.
+`TestMigrations` берёт DSN из `TEST_DATABASE_URL`, а не из `DATABASE_URL`, и
+пропускается (`t.Skip`), если переменная пуста. Причина серьёзнее удобства:
+тест дропает всю схему, а `DATABASE_URL` молча подхватывается Makefile из
+`.env`. Guard `check-db` висит только на `migrate-*`, поэтому один `make test`
+с `.env`, смотрящим в dev-контур, стёр бы dev-базу без единого вопроса.
+Отдельная переменная - единственное, что отделяет тест от чужой базы.
+
+`down-to 0`, а не `down`: `down` откатывает ровно одну миграцию, то есть только
+seed, и схема осталась бы непроверенной. Обратный шаг seed-миграции удаляет
+проект только при отсутствии обращений на него: FK стоит на `ON DELETE
+RESTRICT`, и безусловный `DELETE` ронял бы откат на обжитой базе.
 
 Проверка белого списка тестом не покрывается: это несколько строк в middleware,
 и она проверяется пунктом 4 приёмки живьём. Тест на неё был бы тестом на

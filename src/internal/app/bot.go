@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"slices"
 	"time"
@@ -34,11 +35,11 @@ func NewBot(cfg Config, pool *pgxpool.Pool, log *slog.Logger) (*Bot, error) {
 		Poller:  &tele.LongPoller{Timeout: 10 * time.Second},
 		Verbose: false,
 		OnError: func(err error, c tele.Context) {
-			log.Error("handler failed", "error", err)
+			log.Error("handler_failed", "error", err, "user_id", senderID(c))
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create bot: %w", err)
 	}
 
 	tb.Use(b.allow)
@@ -58,19 +59,38 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 	return func(c tele.Context) error {
 		sender := c.Sender()
 		if sender == nil {
+			b.log.Warn("update_without_sender")
 			return nil
 		}
 		if chat := c.Chat(); chat == nil || chat.Type != tele.ChatPrivate {
 			// В M1 сюда придут скриншоты и саммари обращения: групповой чат
 			// для них не место.
-			return c.Send("Бот работает только в личной переписке.")
+			return refuse(c, "Бот работает только в личной переписке.")
 		}
 		if !slices.Contains(b.allowed, sender.ID) {
-			b.log.Warn("access denied", "user_id", sender.ID)
-			return c.Send("Доступ к боту закрыт. Напишите владельцу сервиса.")
+			b.log.Warn("access_denied", "user_id", sender.ID)
+			return refuse(c, "Доступ к боту закрыт. Напишите владельцу сервиса.")
 		}
 		return next(c)
 	}
+}
+
+// refuse отвечает отказом и гасит спиннер, если отказ пришёл на нажатие
+// кнопки: без Respond кнопка крутится до таймаута Telegram.
+func refuse(c tele.Context, text string) error {
+	if c.Callback() != nil {
+		if err := c.Respond(); err != nil {
+			return err
+		}
+	}
+	return c.Send(text)
+}
+
+func senderID(c tele.Context) int64 {
+	if c == nil || c.Sender() == nil {
+		return 0
+	}
+	return c.Sender().ID
 }
 
 func (b *Bot) onStart(c tele.Context) error {
@@ -88,7 +108,7 @@ func (b *Bot) onStart(c tele.Context) error {
 		return err
 	}
 	if len(projects) == 0 {
-		b.log.Warn("start with no projects", "user_id", sender.ID)
+		b.log.Warn("start_no_projects", "user_id", sender.ID)
 		return c.Send("Проекты ещё не заведены. Напишите владельцу сервиса.")
 	}
 
@@ -120,10 +140,10 @@ func (b *Bot) onProject(c tele.Context) error {
 	slug := c.Data()
 	index := slices.IndexFunc(projects, func(p Project) bool { return p.Slug == slug })
 	if index < 0 {
-		b.log.Warn("unknown project", "user_id", c.Sender().ID, "slug", slug)
+		b.log.Warn("unknown_project", "user_id", c.Sender().ID, "slug", slug)
 		return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
 	}
 
-	b.log.Info("project selected", "user_id", c.Sender().ID, "slug", slug)
+	b.log.Info("project_selected", "user_id", c.Sender().ID, "slug", slug)
 	return c.Send("Проект «" + projects[index].Title + "» выбран. Приём обращений появится в следующем срезе.")
 }

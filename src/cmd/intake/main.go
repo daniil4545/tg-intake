@@ -18,7 +18,7 @@ var version = "dev"
 func main() {
 	cfg, err := app.LoadConfig()
 	if err != nil {
-		slog.Error("config failed", "error", err)
+		slog.Error("config_failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -36,15 +36,15 @@ func main() {
 
 	pool, err := app.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Error("database failed", "error", err)
+		log.Error("database_failed", "error", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
-	log.Info("db connected")
+	log.Info("db_connected")
 
 	bot, err := app.NewBot(cfg, pool, log)
 	if err != nil {
-		log.Error("bot failed", "error", err)
+		log.Error("bot_failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -54,7 +54,7 @@ func main() {
 		bot.Stop()
 	}()
 
-	log.Info("bot started")
+	log.Info("bot_started")
 	bot.Start()
 }
 

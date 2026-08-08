@@ -1,5 +1,9 @@
-# Локальная база для разработки. Креды прямо здесь: это postgres на ноутбуке,
-# наружу он не смотрит, секрета в нём нет. Боевой стек - deploy/dev.
+# Локальный контур: та же цепочка postgres -> migrate -> app, что в dev.
+# Креды базы прямо здесь: это postgres на ноутбуке, наружу он не смотрит.
+# Токен и белый список берутся из .env, в репозиторий он не попадает.
+#
+# docker compose up -d postgres - только база, дальше make run
+# docker compose up             - вся цепочка, как в dev-контуре
 services:
   postgres:
     image: postgres:16
@@ -16,6 +20,33 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  migrate:
+    build: .
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: postgres://intake:intake@postgres:5432/intake?sslmode=disable
+    command: ["/goose", "-dir", "/migrations", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://intake:intake@postgres:5432/intake?sslmode=disable
+      ENV: local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/app", "healthcheck"]
+      interval: 15s
+      timeout: 7s
+      retries: 3
+      start_period: 15s
 
 volumes:
   postgres_data:

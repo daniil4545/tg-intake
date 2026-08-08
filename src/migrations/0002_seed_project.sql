@@ -15,4 +15,9 @@ ON CONFLICT (slug) DO NOTHING;
 
 -- +goose Down
 
-DELETE FROM projects WHERE slug = 'tg-intake';
+-- Условие обязательно: FK cases.project_id стоит на ON DELETE RESTRICT, и на
+-- базе, где сервисом уже пользовались, безусловный DELETE ронял бы откат.
+-- Строка в этом случае уезжает вместе с таблицей на откате 0001.
+DELETE FROM projects p
+WHERE p.slug = 'tg-intake'
+  AND NOT EXISTS (SELECT 1 FROM cases c WHERE c.project_id = p.id);

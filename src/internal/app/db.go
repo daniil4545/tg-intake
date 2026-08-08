@@ -106,25 +106,24 @@ func authorSlug(u User) string {
 	return slug
 }
 
-// clean оставляет только то, что GitHub примет в имени метки.
+// clean оставляет только то, что GitHub примет в имени метки, схлопывая
+// подряд идущие разделители в один дефис.
 func clean(value string) string {
 	var b strings.Builder
+	dash := false
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
+			dash = false
 		case r == ' ' || r == '-' || r == '_' || r == '.':
-			b.WriteRune('-')
+			if !dash && b.Len() > 0 {
+				b.WriteRune('-')
+				dash = true
+			}
 		}
 	}
-	return strings.Trim(collapse(b.String()), "-")
-}
-
-func collapse(value string) string {
-	for strings.Contains(value, "--") {
-		value = strings.ReplaceAll(value, "--", "-")
-	}
-	return value
+	return strings.Trim(b.String(), "-")
 }
 
 var cyrillic = map[rune]string{

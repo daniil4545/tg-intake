@@ -27,7 +27,7 @@ services:
     exclude_from_hc: true
     environment:
       GOOSE_DRIVER: postgres
-      GOOSE_DBSTRING: ${DATABASE_URL:?DATABASE_URL must be set}
+      GOOSE_DBSTRING: postgres://intake:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/intake?sslmode=disable
     command: ["/goose", "-dir", "/migrations", "up"]
     depends_on:
       postgres:
@@ -41,7 +41,7 @@ services:
   app:
     image: ${APP_IMAGE:?APP_IMAGE must be set}
     environment:
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      DATABASE_URL: postgres://intake:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/intake?sslmode=disable
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
       TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS:?TELEGRAM_ALLOWED_IDS must be set}
       LOG_LEVEL: ${LOG_LEVEL:-info}

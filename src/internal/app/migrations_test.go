@@ -11,10 +11,15 @@ import (
 
 // Обе стороны миграции применяются: down-to 0, а не down, потому что down
 // откатывает ровно одну миграцию и схема осталась бы непроверенной.
+//
+// DSN берётся из TEST_DATABASE_URL, а не из DATABASE_URL: тест дропает все
+// таблицы, а DATABASE_URL молча подхватывается из .env и может смотреть в
+// dev-контур. Отдельная переменная - единственное, что отделяет `make test` от
+// стирания чужой базы.
 func TestMigrations(t *testing.T) {
-	url := os.Getenv("DATABASE_URL")
+	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("DATABASE_URL is not set")
+		t.Skip("TEST_DATABASE_URL is not set")
 	}
 
 	db, err := sql.Open("pgx", url)

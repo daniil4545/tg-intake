@@ -9,7 +9,7 @@ endif
 GOOSE := go run -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.27.3
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: run build test vet ci-check check-db migrate-up migrate-down migrate-reset docker-up docker-logs docker-down
+.PHONY: run build test vet ci-check check-db migrate-up migrate-down migrate-reset
 
 run:
 	go run ./cmd/intake
@@ -18,6 +18,8 @@ build:
 	go build ./...
 
 # RUN фильтрует тесты при разборе: make test RUN=TestAuthorSlug.
+# TestMigrations дропает схему и потому смотрит в TEST_DATABASE_URL, а не в
+# DATABASE_URL: иначе make test на .env с dev-контуром стёр бы dev-базу.
 test:
 	go test ./... $(if $(RUN),-run $(RUN) -count=1,)
 
@@ -55,12 +57,3 @@ migrate-down: check-db
 
 migrate-reset: check-db
 	@$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(DATABASE_URL)" down-to 0
-
-docker-up:
-	docker compose up -d postgres
-
-docker-logs:
-	docker compose logs -f --tail=200 postgres
-
-docker-down:
-	docker compose down
