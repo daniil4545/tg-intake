@@ -279,6 +279,17 @@ func (b *Bot) onStart(c tele.Context) error {
 		return err
 	}
 
+	// Активное обращение вне сбора занимает единственный слот автора, и меню
+	// проектов из него ведёт в тупик: выбор проекта упрётся в «сбор закрыт», а
+	// человек читает это как зависший бот. Говорим прямо, где он находится.
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs != nil && cs.Status != statusCollecting {
+		return b.sendState(c, cs)
+	}
+
 	b.log.Info("start", "user_id", senderID(c))
 	return b.askProject(ctx, c, "Выберите проект.")
 }
@@ -344,7 +355,7 @@ func (b *Bot) onProject(c tele.Context) error {
 
 	if err := b.cases.SetProject(ctx, cs, slug); err != nil {
 		if errors.Is(err, ErrNotCollecting) {
-			return c.Send("Сбор по текущему обращению уже закрыт, разбираю материал.")
+			return b.sendState(c, cs)
 		}
 		if errors.Is(err, ErrUnknownProject) {
 			return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
@@ -366,11 +377,16 @@ func (b *Bot) onCreate(c tele.Context) error {
 	defer cancel()
 
 	slug := c.Data()
-	_, existed, err := b.cases.StartCase(ctx, author(c), slug)
+	cs, existed, err := b.cases.StartCase(ctx, author(c), slug)
 	if err != nil {
 		return err
 	}
 	if existed {
+		// Выбор «продолжить или заново» уместен только в сборе: из разбора
+		// продолжать нечего, там обращение двигает ответ автора.
+		if cs.Status != statusCollecting {
+			return b.sendState(c, cs)
+		}
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(markup.Row(
 			markup.Data("Продолжить", continueBtn.Unique, slug),
@@ -397,7 +413,7 @@ func (b *Bot) onContinue(c tele.Context) error {
 		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
 	}
 	if cs.Status != statusCollecting {
-		return c.Send("Сбор по этому обращению закрыт, разбираю материал.")
+		return b.sendState(c, cs)
 	}
 
 	// Автор пришёл из меню конкретного проекта, значит продолжать надо в нём:
@@ -456,7 +472,7 @@ func (b *Bot) onItem(c tele.Context) error {
 		case statusInterview, statusSummary:
 			return b.onAnswer(ctx, c, cs)
 		case statusNormalizing, statusPublishing:
-			return c.Send("Разбираю обращение, минуту. Отвечу, как закончу.")
+			return b.sendState(c, cs)
 		}
 	}
 	if cs == nil {
@@ -512,6 +528,41 @@ func itemReply(err error, maxItems int) (text string, internal bool) {
 	// Скачивание не удалось либо отказала база: элемент уже помечен failed,
 	// обращение живо, и молчать нельзя - автор считает, что отправил.
 	return "Не получилось принять сообщение. Пришлите его иначе.", true
+}
+
+// sendState объясняет автору, где стоит его обращение и чем оно двигается
+// дальше. Один ответ на все входы, где человек упирается в занятый слот:
+// активное обращение у автора одно, и без объяснения тупик читается как
+// зависший бот.
+//
+// Кнопка сброса идёт тем же сообщением: команду /cancel в переписке ещё надо
+// вспомнить, а выход нужен ровно в тот момент, когда человек уткнулся.
+func (b *Bot) sendState(c tele.Context, cs *Case) error {
+	// Из публикации выхода нет: работа уже в очереди, и отмена разошлась бы с
+	// ответом GitHub.
+	if cs.Status == statusPublishing {
+		return c.Send(stateReply(cs.Status))
+	}
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("Отменить обращение", dropBtn.Unique)))
+	return c.Send(stateReply(cs.Status), markup)
+}
+
+func stateReply(status string) string {
+	switch status {
+	case statusInterview:
+		return "У вас идёт разбор обращения. Ответьте на последний вопрос - текстом " +
+			"или голосовым. Если вопросов не видно, напишите, что хотели добавить, " +
+			"и я спрошу заново."
+	case statusSummary:
+		return "Обращение ждёт вашего решения по саммари: «Публикую» или «Поправить» " +
+			"под последним сообщением."
+	case statusPublishing:
+		return "Публикую тикет. Пришлю номер и ссылку, как только он заведётся."
+	default:
+		return "Разбираю обращение, минуту. Отвечу, как закончу."
+	}
 }
 
 // onAnswer - ответ автора в разговоре. Голосовое уходит на расшифровку работой,
