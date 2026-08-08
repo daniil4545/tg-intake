@@ -1,0 +1,835 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	tele "gopkg.in/telebot.v4"
+)
+
+// Виды работ очереди, которые ставит и разбирает этот срез.
+const (
+	JobNormalizeVoice  = "normalize_voice"
+	JobNormalizeImages = "normalize_images"
+	JobNotify          = "notify"
+)
+
+const (
+	statusCollecting  = "collecting"
+	statusNormalizing = "normalizing"
+	statusCancelled   = "cancelled"
+	statusPublished   = "published"
+)
+
+// draftTTL - после этого срока черновик считается брошенным и теряет файлы.
+// Статус при этом не меняется: текст автору сохраняем, медиа не переживает
+// обращение.
+const draftTTL = 24 * time.Hour
+
+// Исходы, о которых автору отвечает bot.go. Тексты Telegram живут там же, здесь
+// только причина: case.go не знает ни про кнопки, ни про формулировки.
+var (
+	ErrNotCollecting   = errors.New("case is not collecting")
+	ErrUnknownProject  = errors.New("project is unknown or inactive")
+	ErrNoProject       = errors.New("case has no project")
+	ErrNoItems         = errors.New("case has no items")
+	ErrTooManyItems    = errors.New("case reached item limit")
+	ErrUnsupportedItem = errors.New("message kind is not supported")
+
+	// errLimitReported - лимит исчерпан, и автору об этом уже сказали: дальше
+	// сообщения гасятся молча, иначе отказ приходит на каждое следующее.
+	errLimitReported = errors.New("item limit is already reported")
+)
+
+// Case - обращение. ProjectID необязателен: обращение рождается раньше, чем
+// автор выбрал проект, и пустой проект допустим только в collecting.
+type Case struct {
+	ID        string
+	UserID    int64
+	ProjectID *int64
+	Status    string
+	Protocol  string
+}
+
+// Item - элемент сырья. Forwarded помечает пересылку: модель должна знать, что
+// это не слова автора, и уточнять деталь, а не считать её сказанной лично.
+type Item struct {
+	ID         int64
+	Kind       string
+	SourceText string
+	Normalized string
+	FilePath   string
+	Mime       string
+	TgFileID   string
+	Status     string
+	Error      string
+	Forwarded  bool
+}
+
+// Cases - жизненный цикл обращения: состояние в БД, файлы и постановка работ.
+type Cases struct {
+	pool     *pgxpool.Pool
+	media    *Media
+	log      *slog.Logger
+	maxItems int
+}
+
+func NewCases(pool *pgxpool.Pool, media *Media, log *slog.Logger, maxItems int) *Cases {
+	return &Cases{pool: pool, media: media, log: log, maxItems: maxItems}
+}
+
+// txRunner - пул и транзакция разом. Постановка работы обязана идти в той же
+// транзакции, что и смена статуса, а счётчик голосовых - читаться там же.
+type txRunner interface {
+	Runner
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+const caseColumns = `id, user_id, project_id, status, protocol`
+
+// Load читает обращение по идентификатору: шаги нормализации получают из
+// payload только id.
+func (c *Cases) Load(ctx context.Context, caseID string) (*Case, error) {
+	row := c.pool.QueryRow(ctx, `SELECT `+caseColumns+` FROM cases WHERE id = $1`, caseID)
+	return scanCase(row)
+}
+
+// Active возвращает активное обращение автора либо nil. Активное одно: этого
+// требует частичный уникальный индекс, и на нём же держится маршрутизация
+// каждого входящего сообщения.
+func (c *Cases) Active(ctx context.Context, userID int64) (*Case, error) {
+	row := c.pool.QueryRow(ctx, `
+		SELECT `+caseColumns+` FROM cases
+		WHERE user_id = $1 AND status NOT IN ('published', 'cancelled')`, userID)
+	return scanCase(row)
+}
+
+func scanCase(row pgx.Row) (*Case, error) {
+	var cs Case
+	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Protocol)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan case: %w", err)
+	}
+	return &cs, nil
+}
+
+// StartCase заводит обращение либо возвращает уже живое. Второе значение - оно
+// уже было: автору предлагают продолжить или начать заново, и решать это боту.
+//
+// Неизвестный slug не отменяет старт: обращение заводится без проекта, и вопрос
+// о проекте задаётся заново. Терять первое сообщение из-за устаревшей кнопки
+// нельзя.
+func (c *Cases) StartCase(ctx context.Context, u User, projectSlug string) (*Case, bool, error) {
+	if err := UpsertUser(ctx, c.pool, u); err != nil {
+		return nil, false, err
+	}
+
+	existing, err := c.Active(ctx, u.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return existing, true, nil
+	}
+
+	var projectID *int64
+	if projectSlug != "" {
+		id, err := c.projectID(ctx, projectSlug)
+		switch {
+		case errors.Is(err, ErrUnknownProject):
+			c.log.Warn("unknown_project", "user_id", u.ID, "slug", projectSlug)
+		case err != nil:
+			return nil, false, err
+		default:
+			projectID = &id
+		}
+	}
+
+	cs := &Case{UserID: u.ID, ProjectID: projectID, Status: statusCollecting}
+	err = c.inTx(ctx, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+			INSERT INTO cases (user_id, project_id, status)
+			VALUES ($1, $2, 'collecting') RETURNING id`, u.ID, projectID).Scan(&cs.ID)
+		if err != nil {
+			return fmt.Errorf("insert case: %w", err)
+		}
+		return addEvent(ctx, tx, cs.ID, "case_started", map[string]any{"project": projectSlug})
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	c.log.Info("case_started", "user_id", u.ID, "case_id", cs.ID, "project", projectSlug)
+	return cs, false, nil
+}
+
+// SetProject доводит выбор проекта до обращения. Выбор может опоздать
+// относительно нескольких сообщений пачки, поэтому единственный источник истины
+// по проекту - строка в cases, а не последний показанный экран.
+func (c *Cases) SetProject(ctx context.Context, cs *Case, projectSlug string) error {
+	if cs.Status != statusCollecting {
+		return ErrNotCollecting
+	}
+
+	id, err := c.projectID(ctx, projectSlug)
+	if err != nil {
+		if errors.Is(err, ErrUnknownProject) {
+			c.log.Warn("unknown_project", "user_id", cs.UserID, "slug", projectSlug)
+		}
+		return err
+	}
+
+	err = c.inTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET project_id = $2, updated_at = now()
+			WHERE id = $1 AND status = 'collecting'`, cs.ID, id)
+		if err != nil {
+			return fmt.Errorf("set project of case %s: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotCollecting
+		}
+		return addEvent(ctx, tx, cs.ID, "project_set", map[string]any{"project": projectSlug})
+	})
+	if err != nil {
+		return err
+	}
+
+	cs.ProjectID = &id
+	c.log.Info("project_set", "user_id", cs.UserID, "case_id", cs.ID, "project", projectSlug)
+	return nil
+}
+
+func (c *Cases) projectID(ctx context.Context, slug string) (int64, error) {
+	var id int64
+	err := c.pool.QueryRow(ctx, `SELECT id FROM projects WHERE slug = $1 AND active`, slug).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrUnknownProject
+	}
+	if err != nil {
+		return 0, fmt.Errorf("find project %s: %w", slug, err)
+	}
+	return id, nil
+}
+
+// CollectItem принимает одно сообщение в сырьё. Первое значение - надо спросить
+// проект: вопрос задаётся ровно один раз, признак - счётчик элементов, а не
+// флаг в памяти, иначе пачка из десяти сообщений даст десять вопросов, а
+// рестарт между ними - одиннадцатый.
+//
+// Ответа автору на принятый элемент нет: бот не перебивает.
+func (c *Cases) CollectItem(ctx context.Context, bot *tele.Bot, cs *Case, msg *tele.Message) (bool, error) {
+	if cs.Status != statusCollecting {
+		return false, ErrNotCollecting
+	}
+
+	kind, file, mime, ok := classify(msg)
+	if !ok {
+		c.log.Info("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "unsupported")
+		return false, ErrUnsupportedItem
+	}
+
+	count, err := c.countItems(ctx, cs.ID)
+	if err != nil {
+		return false, err
+	}
+	if count >= c.maxItems {
+		c.log.Info("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "limit")
+		return false, c.noteLimit(ctx, cs.ID)
+	}
+	// Размер известен из апдейта, поэтому отказ не стоит ни запроса к Bot API,
+	// ни строки в case_items: непринятый элемент не должен потом всплыть в
+	// протоколе как «не удалось разобрать».
+	if file != nil && file.FileSize > maxFileSize {
+		c.log.Info("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "too_big")
+		return false, ErrFileTooBig
+	}
+
+	text := msg.Text
+	var tgFileID any
+	if file != nil {
+		text = msg.Caption
+		tgFileID = file.FileID
+	}
+
+	// Вопрос о проекте решаем до вставки: строка элемента появится и при
+	// провалившемся скачивании, а признак вопроса - счётчик, и второго шанса
+	// спросить уже не будет.
+	askProject := cs.ProjectID == nil && count == 0
+
+	var itemID int64
+	err = c.pool.QueryRow(ctx, `
+		INSERT INTO case_items (case_id, kind, tg_message_id, tg_file_id, tg_group_id,
+		                        source_text, mime, forwarded)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+		cs.ID, kind, msg.ID, tgFileID, nullable(msg.AlbumID), text, nullable(mime),
+		msg.Origin != nil).Scan(&itemID)
+	if err != nil {
+		return false, fmt.Errorf("insert item of case %s: %w", cs.ID, err)
+	}
+
+	if file != nil {
+		if err := c.download(ctx, bot, cs, itemID, *file); err != nil {
+			return askProject, err
+		}
+	}
+
+	c.log.Info("item_collected", "user_id", cs.UserID, "case_id", cs.ID,
+		"kind", kind, "forwarded", msg.Origin != nil, "chars", utf8.RuneCountInString(text))
+
+	// Первый элемент обращения без проекта - единственный момент, когда бот
+	// перебивает автора вопросом.
+	return askProject, nil
+}
+
+// noteLimit решает, говорить ли автору про исчерпанный лимит: событие в
+// case_events - признак, что уже сказали. Счётчик элементов для этого не
+// годится, он на отказе не растёт.
+func (c *Cases) noteLimit(ctx context.Context, caseID string) error {
+	tag, err := c.pool.Exec(ctx, `
+		INSERT INTO case_events (case_id, kind)
+		SELECT $1, 'limit_reached'
+		WHERE NOT EXISTS (
+			SELECT 1 FROM case_events WHERE case_id = $1 AND kind = 'limit_reached')`, caseID)
+	if err != nil {
+		return fmt.Errorf("note limit of case %s: %w", caseID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errLimitReported
+	}
+	return ErrTooManyItems
+}
+
+// download кладёт вложение рядом с уже созданным элементом: имя файла - id
+// элемента, а он известен только после вставки.
+func (c *Cases) download(ctx context.Context, bot *tele.Bot, cs *Case, itemID int64, file tele.File) error {
+	path, err := c.media.Download(bot, cs.ID, strconv.FormatInt(itemID, 10), file)
+	if err != nil {
+		c.log.Warn("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "download_failed", "error", err)
+		if failErr := failItem(ctx, c.pool, itemID, "файл не скачался"); failErr != nil {
+			c.log.Error("item_fail_failed", "case_id", cs.ID, "item_id", itemID, "error", failErr)
+		}
+		return fmt.Errorf("download item %d: %w", itemID, err)
+	}
+
+	_, err = c.pool.Exec(ctx, `
+		UPDATE case_items SET file_path = $2, updated_at = now() WHERE id = $1`, itemID, path)
+	if err != nil {
+		return fmt.Errorf("set file path of item %d: %w", itemID, err)
+	}
+	return nil
+}
+
+// classify определяет вид элемента по содержимому сообщения. Скриншот,
+// отправленный документом, - обычный случай, и терять его из-за способа
+// отправки нельзя.
+func classify(msg *tele.Message) (kind string, file *tele.File, mime string, ok bool) {
+	switch {
+	case msg.Voice != nil:
+		return "voice", &msg.Voice.File, valueOr(msg.Voice.MIME, "audio/ogg"), true
+	case msg.Photo != nil:
+		// У Photo нет mime_type: Telegram отдаёт фото только как JPEG.
+		return "photo", &msg.Photo.File, "image/jpeg", true
+	case msg.Document != nil && strings.HasPrefix(msg.Document.MIME, "image/"):
+		return "photo", &msg.Document.File, msg.Document.MIME, true
+	case msg.Text != "":
+		if hasURL(msg.Entities) {
+			return "link", nil, "", true
+		}
+		return "text", nil, "", true
+	}
+	return "", nil, "", false
+}
+
+func hasURL(entities tele.Entities) bool {
+	for _, e := range entities {
+		if e.Type == tele.EntityURL || e.Type == tele.EntityTextLink {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Cases) countItems(ctx context.Context, caseID string) (int, error) {
+	var count int
+	err := c.pool.QueryRow(ctx, `SELECT count(*) FROM case_items WHERE case_id = $1`, caseID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count items of case %s: %w", caseID, err)
+	}
+	return count, nil
+}
+
+// Items отдаёт элементы обращения в порядке создания: этот порядок и есть
+// порядок протокола.
+func (c *Cases) Items(ctx context.Context, caseID string) ([]Item, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT id, kind, source_text, normalized, COALESCE(file_path, ''),
+		       COALESCE(mime, ''), COALESCE(tg_file_id, ''), status,
+		       COALESCE(error, ''), forwarded
+		FROM case_items WHERE case_id = $1 ORDER BY id`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("query items of case %s: %w", caseID, err)
+	}
+	defer rows.Close()
+
+	var items []Item
+	for rows.Next() {
+		var it Item
+		if err := rows.Scan(&it.ID, &it.Kind, &it.SourceText, &it.Normalized, &it.FilePath,
+			&it.Mime, &it.TgFileID, &it.Status, &it.Error, &it.Forwarded); err != nil {
+			return nil, fmt.Errorf("scan item: %w", err)
+		}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// failItem гасит элемент с причиной. Причина видна автору в протоколе строкой
+// «не удалось разобрать»: пробел лучше правдоподобной выдумки. Принимает пул
+// либо транзакцию: исход провала работы гасит элемент вместе с самой работой.
+func failItem(ctx context.Context, db Runner, itemID int64, reason string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE case_items SET status = 'failed', error = $2, updated_at = now()
+		WHERE id = $1 AND status = 'pending'`, itemID, reason)
+	if err != nil {
+		return fmt.Errorf("fail item %d: %w", itemID, err)
+	}
+	return nil
+}
+
+// FinishCollect закрывает сбор и запускает цепочку нормализации.
+func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
+	if cs.Status != statusCollecting {
+		return ErrNotCollecting
+	}
+
+	count, err := c.countItems(ctx, cs.ID)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNoItems
+	}
+	if cs.ProjectID == nil {
+		return ErrNoProject
+	}
+
+	var voice int
+	err = c.inTx(ctx, func(tx pgx.Tx) error {
+		// Условие на статус в самом UPDATE: повторное «Готово» не должно
+		// поставить те же работы второй раз.
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET status = 'normalizing', updated_at = now()
+			WHERE id = $1 AND status = 'collecting'`, cs.ID)
+		if err != nil {
+			return fmt.Errorf("finish collect of case %s: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotCollecting
+		}
+
+		// Ключ работы детерминирован, поэтому работа прошлого захода молча съела
+		// бы новую через ON CONFLICT DO NOTHING, и возвращённое в сбор обращение
+		// больше не запустилось бы. Статус старой работы не важен: обращение
+		// вернулось в сбор и с провалом (HandleFailedJob), и с успехом самой
+		// работы (разбирать было нечего). Аудит остаётся в case_events.
+		_, err = tx.Exec(ctx, `
+			DELETE FROM jobs
+			WHERE kind IN ('normalize_voice', 'normalize_images')
+			  AND payload->>'case_id' = $1`, cs.ID)
+		if err != nil {
+			return fmt.Errorf("clear jobs of case %s: %w", cs.ID, err)
+		}
+
+		ids, err := pendingVoice(ctx, tx, cs.ID)
+		if err != nil {
+			return err
+		}
+		voice = len(ids)
+		for _, id := range ids {
+			key := fmt.Sprintf("%s:%s:%d", JobNormalizeVoice, cs.ID, id)
+			if err := PutJob(ctx, tx, JobNormalizeVoice, key, itemPayload{CaseID: cs.ID, ItemID: id}); err != nil {
+				return err
+			}
+		}
+		// Голосовых нет - разбор скриншотов стартует сразу: протокол строит
+		// именно он, и без него обращение осталось бы с пустым protocol.
+		if err := putImagesJob(ctx, tx, cs.ID); err != nil {
+			return err
+		}
+		return addEvent(ctx, tx, cs.ID, "collect_finished", map[string]any{"items": count})
+	})
+	if err != nil {
+		return err
+	}
+
+	cs.Status = statusNormalizing
+	c.log.Info("collect_finished", "user_id", cs.UserID, "case_id", cs.ID, "items", count, "voice", voice)
+	return nil
+}
+
+func pendingVoice(ctx context.Context, tx pgx.Tx, caseID string) ([]int64, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM case_items
+		WHERE case_id = $1 AND kind = 'voice' AND status = 'pending' ORDER BY id`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("query pending voice of case %s: %w", caseID, err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan pending voice: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// PutImagesJob двигает цепочку после голосового - и после успеха, и после
+// окончательного провала. Смотрит на статус элементов, а не на счётчик работ:
+// битое голосовое не имеет права держать обращение в normalizing навсегда.
+func (c *Cases) PutImagesJob(ctx context.Context, caseID string) error {
+	return putImagesJob(ctx, c.pool, caseID)
+}
+
+func putImagesJob(ctx context.Context, db txRunner, caseID string) error {
+	var left int
+	err := db.QueryRow(ctx, `
+		SELECT count(*) FROM case_items
+		WHERE case_id = $1 AND kind = 'voice' AND status = 'pending'`, caseID).Scan(&left)
+	if err != nil {
+		return fmt.Errorf("count pending voice of case %s: %w", caseID, err)
+	}
+	if left > 0 {
+		return nil
+	}
+	return PutJob(ctx, db, JobNormalizeImages, JobNormalizeImages+":"+caseID, casePayload{CaseID: caseID})
+}
+
+// CancelCase - один путь для «Отмены», /cancel и «начать заново»: слот
+// активного обращения свободен, медиа удалено, работы погашены.
+func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
+	if cs.Status == statusCancelled || cs.Status == statusPublished {
+		return nil
+	}
+
+	cancelled := false
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET status = 'cancelled', updated_at = now()
+			WHERE id = $1 AND status NOT IN ('published', 'cancelled')`, cs.ID)
+		if err != nil {
+			return fmt.Errorf("cancel case %s: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		cancelled = true
+
+		// Только работы нормализации: уведомление автору отменённое обращение
+		// не отменяет.
+		_, err = tx.Exec(ctx, `
+			UPDATE jobs SET status = 'failed', locked_at = NULL, last_error = $2, updated_at = now()
+			WHERE status = 'pending' AND kind IN ('normalize_voice', 'normalize_images')
+			  AND payload->>'case_id' = $1`, cs.ID, "case cancelled")
+		if err != nil {
+			return fmt.Errorf("drop jobs of case %s: %w", cs.ID, err)
+		}
+		return addEvent(ctx, tx, cs.ID, "case_cancelled", map[string]any{"reason": reason})
+	})
+	if err != nil {
+		return err
+	}
+	if !cancelled {
+		return nil
+	}
+
+	cs.Status = statusCancelled
+	c.log.Info("case_cancelled", "user_id", cs.UserID, "case_id", cs.ID, "reason", reason)
+	// Файлы отменённого обращения не ждут часового сборщика.
+	return c.DropFiles(ctx, cs.ID)
+}
+
+// BuildProtocol склеивает сырьё в один текст - вход медиа-модели на скриншотах
+// и диалоговой модели в M2.
+//
+// Неразобранный скриншот в протокол не попадает: его дописывает
+// RunNormalizeImages, который этот протокол и строит.
+func BuildProtocol(items []Item) string {
+	var b strings.Builder
+	n := 0
+	for _, it := range items {
+		line := itemLine(it)
+		if line == "" {
+			continue
+		}
+		n++
+		fmt.Fprintf(&b, "%d. %s\n", n, line)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+var itemLabel = map[string]string{
+	"text":  "текст",
+	"link":  "ссылка",
+	"voice": "голосовое",
+	"photo": "скриншот",
+}
+
+func itemLine(it Item) string {
+	label := itemLabel[it.Kind]
+	if label == "" {
+		label = it.Kind
+	}
+	if it.Forwarded {
+		label += ", переслано (не слова автора)"
+	}
+
+	if it.Status == "failed" {
+		reason := strings.TrimSpace(it.Error)
+		if reason == "" {
+			reason = "причина неизвестна"
+		}
+		// Провал виден строкой, а не пропуском: модель должна видеть пробел, а
+		// не достраивать его сама.
+		return label + ": не удалось разобрать: " + oneLine(reason)
+	}
+
+	body := it.Normalized
+	if body == "" {
+		body = it.SourceText
+	}
+	if strings.TrimSpace(body) == "" {
+		return ""
+	}
+	return label + ": " + body
+}
+
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
+// DropFiles стирает медиа обращения. Сначала обнуляется file_path: путь в БД,
+// указывающий на стёртый файл, - ловушка для следующего шага, который решит,
+// что файл ещё есть, а забытый файл живёт максимум до перезапуска tmpfs.
+func (c *Cases) DropFiles(ctx context.Context, caseID string) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE case_items SET file_path = NULL, updated_at = now()
+		WHERE case_id = $1 AND file_path IS NOT NULL`, caseID)
+	if err != nil {
+		return fmt.Errorf("clear file paths of case %s: %w", caseID, err)
+	}
+	if err := c.media.Drop(caseID); err != nil {
+		return fmt.Errorf("drop files of case %s: %w", caseID, err)
+	}
+	return nil
+}
+
+// SweepDrafts раз в час убирает файлы брошенных черновиков. Статус не трогаем:
+// автор вернётся к тексту, но не к файлам - это цена инварианта «медиа не
+// переживает обращение». Берём только collecting: нормализуемое обращение
+// держит файлы открытыми, и выдёргивать их из-под воркера нельзя.
+func (c *Cases) SweepDrafts(ctx context.Context) error {
+	rows, err := c.pool.Query(ctx, `
+		SELECT DISTINCT c.id FROM cases c
+		JOIN case_items i ON i.case_id = c.id
+		WHERE c.status = 'collecting'
+		  AND c.created_at < now() - $1::int * interval '1 second'
+		  AND i.file_path IS NOT NULL`, int(draftTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("query stale drafts: %w", err)
+	}
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan stale draft: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read stale drafts: %w", err)
+	}
+
+	for _, id := range ids {
+		// Одно неудачное обращение не отменяет уборку остальных.
+		if err := c.DropFiles(ctx, id); err != nil {
+			c.log.Error("sweep_failed", "case_id", id, "error", err)
+		}
+	}
+	return nil
+}
+
+type casePayload struct {
+	CaseID string `json:"case_id"`
+}
+
+type itemPayload struct {
+	CaseID string `json:"case_id"`
+	ItemID int64  `json:"item_id"`
+}
+
+type notifyPayload struct {
+	CaseID string `json:"case_id"`
+	Text   string `json:"text"`
+}
+
+// HandleFailedJob - исход работы, исчерпавшей повторы. Воркер зовёт её через
+// onFail: очередь не знает, что делать с обращением.
+//
+// Гашение работы и исход провала - одна транзакция. Порознь падение процесса
+// между коммитами оставило бы элемент pending, а обращение в normalizing
+// навсегда: погашенную работу уборщик локов уже не поднимет.
+//
+// Провал элемента не имеет права остановить цепочку: элемент переводится в
+// failed (иначе проверка «pending voice не осталось» не сработает никогда), а
+// проваленный разбор скриншотов возвращает обращение в сбор, иначе слот
+// активного обращения занят навсегда.
+func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
+	var p itemPayload
+	if err := json.Unmarshal(job.Payload, &p); err != nil || p.CaseID == "" {
+		c.log.Error("job_failed_unlinked", "kind", job.Kind, "job_id", job.ID, "error", err)
+		// Работу гасим всё равно: иначе она крутится в очереди вечно.
+		if _, err := FailJob(ctx, c.pool, job, cause); err != nil {
+			c.log.Error("job_fail_failed", "kind", job.Kind, "job_id", job.ID, "error", err)
+		}
+		return
+	}
+
+	reopened := false
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := FailJob(ctx, tx, job, cause); err != nil {
+			return err
+		}
+		if p.ItemID != 0 {
+			if err := failItem(ctx, tx, p.ItemID, oneLine(cause.Error())); err != nil {
+				return err
+			}
+		}
+
+		switch job.Kind {
+		case JobNormalizeVoice:
+			if err := putImagesJob(ctx, tx, p.CaseID); err != nil {
+				return err
+			}
+		case JobNormalizeImages:
+			var err error
+			reopened, err = reopenCase(ctx, tx, p.CaseID)
+			if err != nil {
+				return err
+			}
+			// Автору говорим только здесь: провал одного голосового виден ему
+			// строкой протокола, а вот вставшую цепочку заметить нечем.
+			if err := putNotify(ctx, tx, p.CaseID, job.ID,
+				"Не смог обработать обращение. Пришлите материал иначе и нажмите «Готово» ещё раз."); err != nil {
+				return err
+			}
+		}
+
+		return addEvent(ctx, tx, p.CaseID, "job_failed", map[string]any{
+			"kind": job.Kind, "error": oneLine(cause.Error()),
+		})
+	})
+	if err != nil {
+		c.log.Error("job_fail_outcome_failed", "kind", job.Kind, "case_id", p.CaseID, "error", err)
+		return
+	}
+	if reopened {
+		c.log.Warn("case_reopened", "case_id", p.CaseID)
+	}
+}
+
+// reopenCase возвращает обращение в сбор. Два пути возврата - «разобрать не
+// удалось ничего» и провал работы normalize_images - это один переход.
+func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE cases SET status = 'collecting', updated_at = now()
+		WHERE id = $1 AND status = 'normalizing'`, caseID)
+	if err != nil {
+		return false, fmt.Errorf("reopen case %s: %w", caseID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// putNotify ставит сообщение автору. Ключ по идентификатору работы: её повтор
+// не наплодит вторых уведомлений.
+func putNotify(ctx context.Context, db Runner, caseID string, jobID int64, text string) error {
+	key := fmt.Sprintf("%s:%s:%d", JobNotify, caseID, jobID)
+	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text})
+}
+
+// SaveNormalized и SaveProtocol - переходы, которые оставляет после себя шаг
+// нормализации. Живут здесь: единственный владелец состояния обращения - этот
+// файл, normalize.go зовёт его, а не пишет свой SQL.
+func (c *Cases) SaveNormalized(ctx context.Context, itemID int64, text string) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE case_items SET normalized = $2, status = 'done', updated_at = now()
+		WHERE id = $1 AND status = 'pending'`, itemID, text)
+	if err != nil {
+		return fmt.Errorf("save normalized item %d: %w", itemID, err)
+	}
+	return nil
+}
+
+func (c *Cases) SaveProtocol(ctx context.Context, caseID, protocol string) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE cases SET protocol = $2, updated_at = now() WHERE id = $1`, caseID, protocol)
+	if err != nil {
+		return fmt.Errorf("save protocol of case %s: %w", caseID, err)
+	}
+	return nil
+}
+
+func addEvent(ctx context.Context, db Runner, caseID, kind string, payload any) error {
+	raw := []byte("{}")
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal payload of event %s: %w", kind, err)
+		}
+		raw = encoded
+	}
+
+	_, err := db.Exec(ctx, `
+		INSERT INTO case_events (case_id, kind, payload) VALUES ($1, $2, $3)`, caseID, kind, raw)
+	if err != nil {
+		return fmt.Errorf("add event %s: %w", kind, err)
+	}
+	return nil
+}
+
+// inTx держит инвариант среза: переход статуса, событие и постановка работ
+// живут или не живут вместе.
+func (c *Cases) inTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
