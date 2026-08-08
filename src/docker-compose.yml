@@ -34,10 +34,22 @@ services:
 
   app:
     build: .
+    # Ключ OpenRouter, модель, MAX_ITEMS и AUDIO_CONVERT приезжают из .env
+    # вместе с токеном бота; MEDIA_DIR задаём здесь, чтобы он совпал с tmpfs.
     env_file: .env
     environment:
       DATABASE_URL: postgres://intake:intake@postgres:5432/intake?sslmode=disable
       ENV: local
+      MEDIA_DIR: /tmp/intake
+    # Файлы обращения живут минуты и стираются после нормализации: диску их
+    # переживать незачем. mode 1777 нужен образу distroless:nonroot, иначе
+    # каталог не создать.
+    volumes:
+      - type: tmpfs
+        target: /tmp/intake
+        tmpfs:
+          size: 268435456
+          mode: 01777
     depends_on:
       migrate:
         condition: service_completed_successfully
