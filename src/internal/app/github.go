@@ -245,6 +245,10 @@ func (g *GitHub) GetIssue(ctx context.Context, p Project, number int, fast bool)
 // означают, что что-то пошло не так, и это видно в логе.
 func (g *GitHub) LastComment(ctx context.Context, p Project, number int) (string, error) {
 	const perPage = 100
+	// Бюджет на всю операцию: страниц может быть пять, а ждёт её человек, и
+	// вместе с ним все остальные авторы.
+	ctx, cancel := context.WithTimeout(ctx, githubFastTimeout)
+	defer cancel()
 	last := ""
 	for page := 1; page <= githubCommentPages; page++ {
 		path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=%d&page=%d",
@@ -469,7 +473,7 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		}
 	}
 	if number == 0 {
-		labels := []string{"type:" + cs.Kind, "status:new", "author:" + author.Slug}
+		labels := []string{"type:" + cs.Kind, labelNew, "author:" + author.Slug}
 		if cs.Incomplete {
 			labels = append(labels, "incomplete")
 		}
