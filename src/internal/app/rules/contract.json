@@ -1,0 +1,19 @@
+{
+  "bug": [
+    { "key": "case", "title": "Конкретный случай", "required": true },
+    { "key": "expected", "title": "Что должно было произойти", "required": true },
+    { "key": "actual", "title": "Что произошло на самом деле", "required": true },
+    { "key": "where", "title": "Где это видно", "required": false },
+    { "key": "impact", "title": "Чем это мешает работе", "required": false }
+  ],
+  "feature": [
+    { "key": "problem", "title": "Какую задачу это решает", "required": true },
+    { "key": "today", "title": "Как справляются сейчас", "required": true },
+    { "key": "result", "title": "Каким должен быть результат", "required": true },
+    { "key": "who", "title": "Кого это касается", "required": false }
+  ],
+  "question": [
+    { "key": "question", "title": "Вопрос", "required": true },
+    { "key": "context", "title": "Что уже пробовали", "required": false }
+  ]
+}

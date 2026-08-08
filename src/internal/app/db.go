@@ -6,23 +6,36 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Project - строка меню. Мультипроектность с первого дня: добавление проекта
-// это INSERT, деплой не нужен.
+// Project - строка меню и адрес публикации разом. Мультипроектность с первого
+// дня: добавление проекта это INSERT, деплой не нужен.
+//
+// Context уходит в системный промт интервью, поэтому обязан быть стабильным:
+// правка строки в базе гасит кэш префикса у этого проекта.
 type Project struct {
-	Slug  string
-	Title string
+	ID          int64
+	Slug        string
+	Title       string
+	Owner       string
+	Repo        string
+	Context     string
+	LabelsReady bool
 }
 
 // User - профиль автора из Telegram. ФИО нужно для шапки issue: GitHub не даёт
 // создать тикет от чужого имени, поэтому авторство фиксируется телом и меткой.
+//
+// Slug заполняется только при чтении: на записи его считает authorSlug, и два
+// источника одного значения разошлись бы на первом переименовании.
 type User struct {
 	ID       int64
 	First    string
 	Last     string
 	Username string
+	Slug     string
 }
 
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
@@ -46,8 +59,10 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+const projectColumns = `id, slug, title, github_owner, github_repo, context, labels_ready`
+
 func ListProjects(ctx context.Context, pool *pgxpool.Pool) ([]Project, error) {
-	rows, err := pool.Query(ctx, `SELECT slug, title FROM projects WHERE active ORDER BY title`)
+	rows, err := pool.Query(ctx, `SELECT `+projectColumns+` FROM projects WHERE active ORDER BY title`)
 	if err != nil {
 		return nil, fmt.Errorf("query projects: %w", err)
 	}
@@ -56,12 +71,40 @@ func ListProjects(ctx context.Context, pool *pgxpool.Pool) ([]Project, error) {
 	var projects []Project
 	for rows.Next() {
 		var p Project
-		if err := rows.Scan(&p.Slug, &p.Title); err != nil {
-			return nil, fmt.Errorf("scan project: %w", err)
+		if err := scanProject(rows, &p); err != nil {
+			return nil, err
 		}
 		projects = append(projects, p)
 	}
 	return projects, rows.Err()
+}
+
+// LoadProject нужен шагам, идущим из очереди: у них на руках только id из
+// обращения.
+func LoadProject(ctx context.Context, pool *pgxpool.Pool, id int64) (Project, error) {
+	var p Project
+	row := pool.QueryRow(ctx, `SELECT `+projectColumns+` FROM projects WHERE id = $1`, id)
+	if err := scanProject(row, &p); err != nil {
+		return Project{}, err
+	}
+	return p, nil
+}
+
+func scanProject(row pgx.Row, p *Project) error {
+	if err := row.Scan(&p.ID, &p.Slug, &p.Title, &p.Owner, &p.Repo, &p.Context, &p.LabelsReady); err != nil {
+		return fmt.Errorf("scan project: %w", err)
+	}
+	return nil
+}
+
+// MarkLabelsReady снимает bootstrap меток с горячего пути: второй тикет того же
+// проекта уже не тратит запросы на создание существующих меток.
+func MarkLabelsReady(ctx context.Context, pool *pgxpool.Pool, id int64) error {
+	_, err := pool.Exec(ctx, `UPDATE projects SET labels_ready = true, updated_at = now() WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("mark labels ready of project %d: %w", id, err)
+	}
+	return nil
 }
 
 // UpsertUser перезаписывает профиль текущими данными: люди меняют имя и
@@ -81,6 +124,19 @@ func UpsertUser(ctx context.Context, pool *pgxpool.Pool, u User) error {
 		return fmt.Errorf("upsert user: %w", err)
 	}
 	return nil
+}
+
+// LoadUser нужен публикации: шапка issue и метка автора берутся из профиля,
+// сохранённого на последнем обращении.
+func LoadUser(ctx context.Context, pool *pgxpool.Pool, id int64) (User, error) {
+	u := User{ID: id}
+	err := pool.QueryRow(ctx, `
+		SELECT first_name, COALESCE(last_name, ''), COALESCE(username, ''), slug
+		FROM users WHERE telegram_id = $1`, id).Scan(&u.First, &u.Last, &u.Username, &u.Slug)
+	if err != nil {
+		return User{}, fmt.Errorf("load user %d: %w", id, err)
+	}
+	return u, nil
 }
 
 func nullable(value string) any {

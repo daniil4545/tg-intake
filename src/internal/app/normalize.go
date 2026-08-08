@@ -148,8 +148,9 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 		return err
 	}
 	// Следующий шаг ставит сам воркер: цепочка живёт в БД, а не в памяти.
-	// PutImagesJob смотрит, остались ли pending-голосовые.
-	return n.cases.PutImagesJob(ctx, p.CaseID)
+	// AfterVoice смотрит на состояние разговора - та же расшифровка идёт либо
+	// дальше по нормализации, либо ответом на вопрос интервью.
+	return n.cases.AfterVoice(ctx, p.CaseID, text)
 }
 
 // RunNormalizeImages строит протокол сырья, дописывает в него разбор скриншотов
@@ -319,7 +320,13 @@ func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol
 		}); err != nil {
 			return err
 		}
-		return putNotify(ctx, tx, cs.ID, jobID, protocolMessage(protocol))
+		if err := putNotify(ctx, tx, cs.ID, jobID, protocolMessage(protocol)); err != nil {
+			return err
+		}
+		// Разговор начинает работа, а не этот шаг: нормализация не знает, чем
+		// кончится обращение, и это то, что делает второй режим бота
+		// наслаиванием, а не переписью.
+		return putCaseJob(ctx, tx, JobInterview, cs.ID, interviewPayload{CaseID: cs.ID})
 	})
 	if err != nil {
 		return err
@@ -328,10 +335,11 @@ func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol
 		return nil
 	}
 
-	cs.Status = "interview"
+	cs.Status = statusInterview
 	n.log.Info("normalized", "case_id", cs.ID, "items", items, "chars", chars)
-	// Медиа не переживает обращение: в этом срезе файл дальше никому не нужен.
-	return n.cases.DropFiles(ctx, cs.ID)
+	// Файлы живут до публикации: саммари - последняя точка, где автор ловит
+	// неверно прочитанный скриншот, и стирать медиа раньше нельзя.
+	return nil
 }
 
 // reopen возвращает обращение в сбор, когда разобрать не удалось ничего: иначе
@@ -365,7 +373,7 @@ func (n *Normalizer) reopen(ctx context.Context, cs *Case, jobID int64) error {
 
 func protocolMessage(protocol string) string {
 	return "Разобрал материал. Вот что получилось:\n\n" + protocol +
-		"\n\nСледующий шаг, вопросы по обращению, появится позже."
+		"\n\nСейчас уточню недостающее."
 }
 
 // hasContent - осталось ли в сырье хоть что-то разобранное. Пустого протокола
@@ -465,7 +473,7 @@ func (n *Normalizer) failAndMoveOn(ctx context.Context, caseID string, itemID in
 	if err := failItem(ctx, n.cases.pool, itemID, reason); err != nil {
 		return err
 	}
-	return n.cases.PutImagesJob(ctx, caseID)
+	return n.cases.AfterVoiceFail(ctx, caseID, itemID)
 }
 
 func mustPrompt(name string) string {
