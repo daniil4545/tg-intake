@@ -21,13 +21,15 @@
   [plan-m0-skeleton.md](plans/plan-m0-skeleton.md).
 - M0 реализован: конфиг, схема БД, белый список, меню проектов, JSON-логи,
   healthcheck, Dockerfile, dev compose, CI и автодеплой.
+- Dev-контур заведён в Coolify через API, автодеплой из `dev` работает от push
+  до рантайма. Заведён read-only `deploy/safe-ssh.sh` для диагностики.
 
 ## В работе
 
-M0 на приёмке. Локально пройдены `ci-check`, сборка образа, healthcheck на
-живой и мёртвой базе, старт и остановка бота на боевом токене. Живой диалог и
-деплой ждут владельца: нужен Telegram ID для белого списка и сервис Coolify с
-тремя секретами. Паспорт - [acceptance/m0-skeleton.md](acceptance/m0-skeleton.md).
+M0 на приёмке, dev-контур живой. Закрыты все пункты паспорта, кроме живого
+диалога: он упирается в Telegram ID владельца, сейчас в белом списке заглушка.
+Автодеплой проверен от push до рантайма: `app_revision` в контуре равен HEAD
+ветки `dev`. Паспорт - [acceptance/m0-skeleton.md](acceptance/m0-skeleton.md).
 
 ## Дальше
 
