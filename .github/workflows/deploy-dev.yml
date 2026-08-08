@@ -135,8 +135,15 @@ jobs:
             --header "Content-Type: application/json" \
             --data "{\"key\":\"APP_IMAGE\",\"value\":\"${image}\"}" \
             --output /dev/null
-          curl --fail --silent --show-error --request GET \
+          # Ответ /deploy печатаем: HTTP 200 приходит и тогда, когда Coolify
+          # выкат не начал, а причина лежит в теле. Выброшенный ответ стоил
+          # двух зелёных workflow подряд при контуре на прежней ревизии.
+          response=$(curl --fail --silent --show-error --request GET \
             "${COOLIFY_API_BASE}/deploy?uuid=${COOLIFY_DEV_SERVICE_UUID}" \
-            --header "Authorization: Bearer ${COOLIFY_TOKEN}" \
-            --output /dev/null
+            --header "Authorization: Bearer ${COOLIFY_TOKEN}")
+          echo "coolify response: ${response}"
+          echo "${response}" | grep -q "deployment_uuid" || {
+            echo "Coolify не принял выкат: в ответе нет deployment_uuid" >&2
+            exit 1
+          }
           echo "intake-dev deploy queued for sha-${GITHUB_SHA}"
