@@ -11,11 +11,16 @@ import (
 
 // Config читается один раз при старте и дальше передаётся значением.
 type Config struct {
-	DatabaseURL string
-	BotToken    string
-	AllowedIDs  []int64
-	LogLevel    slog.Level
-	Env         string
+	DatabaseURL   string
+	BotToken      string
+	AllowedIDs    []int64
+	LogLevel      slog.Level
+	Env           string
+	OpenRouterKey string
+	ModelMedia    string
+	MediaDir      string
+	MaxItems      int
+	AudioConvert  string
 }
 
 // LoadConfig собирает конфиг из окружения. Ошибка перечисляет все проблемы
@@ -25,9 +30,12 @@ func LoadConfig() (Config, error) {
 	var problems []string
 
 	cfg := Config{
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		BotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
-		Env:         valueOr(os.Getenv("ENV"), "dev"),
+		DatabaseURL:   os.Getenv("DATABASE_URL"),
+		BotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
+		Env:           valueOr(os.Getenv("ENV"), "dev"),
+		OpenRouterKey: os.Getenv("OPENROUTER_API_KEY"),
+		ModelMedia:    valueOr(os.Getenv("OPENROUTER_MODEL_MEDIA"), "google/gemini-3.1-flash-lite"),
+		MediaDir:      valueOr(os.Getenv("MEDIA_DIR"), "/tmp/intake"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -35,6 +43,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.BotToken == "" {
 		problems = append(problems, "TELEGRAM_BOT_TOKEN is empty")
+	}
+	if cfg.OpenRouterKey == "" {
+		problems = append(problems, "OPENROUTER_API_KEY is empty")
 	}
 
 	ids, err := parseIDs(os.Getenv("TELEGRAM_ALLOWED_IDS"))
@@ -48,6 +59,18 @@ func LoadConfig() (Config, error) {
 		problems = append(problems, err.Error())
 	}
 	cfg.LogLevel = level
+
+	maxItems, err := parseMaxItems(valueOr(os.Getenv("MAX_ITEMS"), "30"))
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.MaxItems = maxItems
+
+	audioConvert, err := parseAudioConvert(valueOr(os.Getenv("AUDIO_CONVERT"), "auto"))
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.AudioConvert = audioConvert
 
 	if len(problems) > 0 {
 		return Config{}, errors.New("config: " + strings.Join(problems, "; "))
@@ -88,6 +111,27 @@ func parseLevel(raw string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return slog.LevelInfo, fmt.Errorf("LOG_LEVEL %q is not debug, info, warn or error", raw)
+	}
+}
+
+// parseMaxItems ограничивает пачку сырья числом элементов, а не байтами:
+// защита от пересылки переписки целиком, не от больших файлов.
+func parseMaxItems(raw string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("MAX_ITEMS %q is not a positive integer", raw)
+	}
+	return n, nil
+}
+
+func parseAudioConvert(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "auto":
+		return "auto", nil
+	case "always":
+		return "always", nil
+	default:
+		return "", fmt.Errorf("AUDIO_CONVERT %q is not auto or always", raw)
 	}
 }
 
