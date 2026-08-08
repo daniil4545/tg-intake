@@ -76,6 +76,10 @@ intake/
 `make test`, `make vet`, `make ci-check`, `make migrate-reset`.
 `migrate-*` отказываются работать с не-localhost базой без `ALLOW_REMOTE=1`.
 
+Диагностика dev-контура - только через `deploy/safe-ssh.sh` из корня:
+`inventory`, `health`, `app-logs [N]`, `db-logs [N]`, `app-env`. Все действия
+read-only, произвольный ssh к серверу не используем.
+
 ## Workflow
 
 Пайплайн задачи и инженерные дефолты платформы - внутренняя база знаний вне
