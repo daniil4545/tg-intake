@@ -9,6 +9,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/daniil4545/tg-intake/internal/app"
 )
 
@@ -52,9 +54,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Правила проверяются до первого обращения: битый контракт обнаружился бы на
+	// живом диалоге, а не в логе выката.
+	rules, err := app.LoadContract()
+	if err != nil {
+		log.Error("contract_failed", "error", err)
+		os.Exit(1)
+	}
+
 	cases := app.NewCases(pool, media, log, cfg.MaxItems)
 	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, log)
 	normalizer := app.NewNormalizer(cases, llm, log, cfg.AudioConvert)
+	interview := app.NewInterview(cases, llm, log, rules, cfg.ModelDialog, cfg.InterviewRounds)
+	github := app.NewGitHub(cfg.GitHubToken, log)
+	publisher := app.NewPublisher(cases, github, rules, log)
+
+	checkGitHub(ctx, pool, github, log)
 
 	bot, err := app.NewBot(ctx, cfg, pool, cases, log)
 	if err != nil {
@@ -65,6 +80,9 @@ func main() {
 	handlers := map[string]app.JobHandler{
 		app.JobNormalizeVoice:  normalizer.RunNormalizeVoice,
 		app.JobNormalizeImages: normalizer.RunNormalizeImages,
+		app.JobInterview:       interview.Run,
+		app.JobSummarize:       interview.Summarize,
+		app.JobPublish:         publisher.Run,
 		app.JobNotify:          bot.Notify,
 	}
 
@@ -91,8 +109,9 @@ func main() {
 	background.Wait()
 }
 
-// sweepDrafts раз в час стирает файлы черновиков старше суток: медиа не
-// переживает обращение, а автор, забывший про пачку, вернётся к тексту.
+// sweepDrafts раз в час стирает файлы черновиков старше суток и напоминает про
+// брошенные обращения: медиа не переживает обращение, а автор, забывший про
+// разговор, получает ровно одно напоминание.
 func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
 	ticker := time.NewTicker(sweepPeriod)
 	defer ticker.Stop()
@@ -102,10 +121,34 @@ func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Напоминание идёт до уборки: автору честнее узнать про удалённые
+			// вложения тем же сообщением, которым его зовут вернуться.
+			if err := cases.RemindDrafts(ctx); err != nil {
+				log.Error("remind_failed", "error", err)
+			}
 			if err := cases.SweepDrafts(ctx); err != nil {
 				log.Error("sweep_failed", "error", err)
 			}
 		}
+	}
+}
+
+// checkGitHub проверяет токен по каждому активному проекту: fine-grained PAT
+// выдаётся на конкретные репозитории, и право на второй проект не следует из
+// права на первый. Отказ по одному проекту не мешает остальным работать,
+// поэтому это предупреждение, а не падение старта.
+func checkGitHub(ctx context.Context, pool *pgxpool.Pool, github *app.GitHub, log *slog.Logger) {
+	projects, err := app.ListProjects(ctx, pool)
+	if err != nil {
+		log.Error("projects_failed", "error", err)
+		return
+	}
+	for _, p := range projects {
+		if err := github.CheckAccess(ctx, p); err != nil {
+			log.Warn("github_access_denied", "project", p.Slug, "error", err)
+			continue
+		}
+		log.Info("github_access_ok", "project", p.Slug)
 	}
 }
 

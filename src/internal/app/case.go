@@ -16,16 +16,27 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
-// Виды работ очереди, которые ставит и разбирает этот срез.
+// Виды работ очереди.
 const (
 	JobNormalizeVoice  = "normalize_voice"
 	JobNormalizeImages = "normalize_images"
+	JobInterview       = "interview"
+	JobSummarize       = "summarize"
+	JobPublish         = "publish"
 	JobNotify          = "notify"
 )
+
+// caseJobKinds - работы, которые принадлежат разговору и гасятся вместе с ним.
+// publish не входит: отмена из publishing запрещена, к этому моменту автор уже
+// подтвердил публикацию.
+var caseJobKinds = []string{JobNormalizeVoice, JobNormalizeImages, JobInterview, JobSummarize}
 
 const (
 	statusCollecting  = "collecting"
 	statusNormalizing = "normalizing"
+	statusInterview   = "interview"
+	statusSummary     = "summary"
+	statusPublishing  = "publishing"
 	statusCancelled   = "cancelled"
 	statusPublished   = "published"
 )
@@ -44,6 +55,7 @@ var (
 	ErrNoItems         = errors.New("case has no items")
 	ErrTooManyItems    = errors.New("case reached item limit")
 	ErrUnsupportedItem = errors.New("message kind is not supported")
+	ErrPublishing      = errors.New("case is already publishing")
 
 	// errLimitReported - лимит исчерпан, и автору об этом уже сказали: дальше
 	// сообщения гасятся молча, иначе отказ приходит на каждое следующее.
@@ -52,12 +64,24 @@ var (
 
 // Case - обращение. ProjectID необязателен: обращение рождается раньше, чем
 // автор выбрал проект, и пустой проект допустим только в collecting.
+//
+// Filled и Gaps - состояние контракта готовности: что интервью уже закрыло и
+// что осталось пробелом. Round - номер последнего заданного раунда вопросов.
 type Case struct {
-	ID        string
-	UserID    int64
-	ProjectID *int64
-	Status    string
-	Protocol  string
+	ID          string
+	UserID      int64
+	ProjectID   *int64
+	Status      string
+	Protocol    string
+	Kind        string
+	Filled      map[string]string
+	Gaps        []string
+	Round       int
+	Title       string
+	Summary     string
+	Incomplete  bool
+	IssueNumber int
+	IssueURL    string
 }
 
 // Item - элемент сырья. Forwarded помечает пересылку: модель должна знать, что
@@ -94,7 +118,9 @@ type txRunner interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-const caseColumns = `id, user_id, project_id, status, protocol`
+const caseColumns = `id, user_id, project_id, status, protocol, COALESCE(kind, ''),
+	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), incomplete,
+	COALESCE(issue_number, 0), COALESCE(issue_url, '')`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -115,12 +141,24 @@ func (c *Cases) Active(ctx context.Context, userID int64) (*Case, error) {
 
 func scanCase(row pgx.Row) (*Case, error) {
 	var cs Case
-	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Protocol)
+	var filled, gaps []byte
+	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Protocol, &cs.Kind,
+		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Incomplete,
+		&cs.IssueNumber, &cs.IssueURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scan case: %w", err)
+	}
+	if err := json.Unmarshal(filled, &cs.Filled); err != nil {
+		return nil, fmt.Errorf("decode contract of case %s: %w", cs.ID, err)
+	}
+	if err := json.Unmarshal(gaps, &cs.Gaps); err != nil {
+		return nil, fmt.Errorf("decode gaps of case %s: %w", cs.ID, err)
+	}
+	if cs.Filled == nil {
+		cs.Filled = map[string]string{}
 	}
 	return &cs, nil
 }
@@ -446,9 +484,8 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 		// вернулось в сбор и с провалом (HandleFailedJob), и с успехом самой
 		// работы (разбирать было нечего). Аудит остаётся в case_events.
 		_, err = tx.Exec(ctx, `
-			DELETE FROM jobs
-			WHERE kind IN ('normalize_voice', 'normalize_images')
-			  AND payload->>'case_id' = $1`, cs.ID)
+			DELETE FROM jobs WHERE kind = ANY($2) AND payload->>'case_id' = $1`,
+			cs.ID, caseJobKinds)
 		if err != nil {
 			return fmt.Errorf("clear jobs of case %s: %w", cs.ID, err)
 		}
@@ -523,16 +560,22 @@ func putImagesJob(ctx context.Context, db txRunner, caseID string) error {
 
 // CancelCase - один путь для «Отмены», /cancel и «начать заново»: слот
 // активного обращения свободен, медиа удалено, работы погашены.
+//
+// Отмена из publishing запрещена: работа publish уже в очереди, и её гашение
+// разошлось бы с ответом GitHub - issue создался бы по отменённому обращению.
 func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 	if cs.Status == statusCancelled || cs.Status == statusPublished {
 		return nil
+	}
+	if cs.Status == statusPublishing {
+		return ErrPublishing
 	}
 
 	cancelled := false
 	err := c.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE cases SET status = 'cancelled', updated_at = now()
-			WHERE id = $1 AND status NOT IN ('published', 'cancelled')`, cs.ID)
+			WHERE id = $1 AND status NOT IN ('published', 'cancelled', 'publishing')`, cs.ID)
 		if err != nil {
 			return fmt.Errorf("cancel case %s: %w", cs.ID, err)
 		}
@@ -541,12 +584,13 @@ func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 		}
 		cancelled = true
 
-		// Только работы нормализации: уведомление автору отменённое обращение
-		// не отменяет.
+		// Работы разговора: отменённое обращение не должно получить ни вопроса
+		// следующего раунда, ни саммари. Уведомление автору не гасим - оно и
+		// сообщает ему исход.
 		_, err = tx.Exec(ctx, `
-			UPDATE jobs SET status = 'failed', locked_at = NULL, last_error = $2, updated_at = now()
-			WHERE status = 'pending' AND kind IN ('normalize_voice', 'normalize_images')
-			  AND payload->>'case_id' = $1`, cs.ID, "case cancelled")
+			UPDATE jobs SET status = 'failed', locked_at = NULL, last_error = $3, updated_at = now()
+			WHERE status = 'pending' AND kind = ANY($2)
+			  AND payload->>'case_id' = $1`, cs.ID, caseJobKinds, "case cancelled")
 		if err != nil {
 			return fmt.Errorf("drop jobs of case %s: %w", cs.ID, err)
 		}
@@ -642,14 +686,19 @@ func (c *Cases) DropFiles(ctx context.Context, caseID string) error {
 
 // SweepDrafts раз в час убирает файлы брошенных черновиков. Статус не трогаем:
 // автор вернётся к тексту, но не к файлам - это цена инварианта «медиа не
-// переживает обращение». Берём только collecting: нормализуемое обращение
-// держит файлы открытыми, и выдёргивать их из-под воркера нельзя.
+// переживает обращение».
+//
+// Статусы разговора входят сюда с M2: удаление файлов переехало в публикацию, и
+// брошенное на саммари обращение иначе держало бы медиа бессрочно. Не входят
+// normalizing и publishing: там работа держит файлы открытыми, и выдёргивать их
+// из-под воркера нельзя. Срок считаем от последнего движения, а не от создания:
+// разговор идёт часами, и created_at перестал быть признаком заброшенности.
 func (c *Cases) SweepDrafts(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
 		SELECT DISTINCT c.id FROM cases c
 		JOIN case_items i ON i.case_id = c.id
-		WHERE c.status = 'collecting'
-		  AND c.created_at < now() - $1::int * interval '1 second'
+		WHERE c.status IN ('collecting', 'interview', 'summary')
+		  AND c.updated_at < now() - $1::int * interval '1 second'
 		  AND i.file_path IS NOT NULL`, int(draftTTL.Seconds()))
 	if err != nil {
 		return fmt.Errorf("query stale drafts: %w", err)
@@ -678,6 +727,57 @@ func (c *Cases) SweepDrafts(ctx context.Context) error {
 	return nil
 }
 
+// RemindDrafts напоминает про обращение, брошенное на сутки. Ровно один раз:
+// признак - отметка reminded_at, и второго напоминания не будет, потому что
+// бот, пишущий раз в сутки, из помощника становится спамом.
+func (c *Cases) RemindDrafts(ctx context.Context) error {
+	rows, err := c.pool.Query(ctx, `
+		UPDATE cases SET reminded_at = now()
+		WHERE status IN ('collecting', 'interview', 'summary')
+		  AND reminded_at IS NULL
+		  AND updated_at < now() - $1::int * interval '1 second'
+		RETURNING id, status`, int(draftTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("query abandoned cases: %w", err)
+	}
+
+	type draft struct{ id, status string }
+	var drafts []draft
+	for rows.Next() {
+		var d draft
+		if err := rows.Scan(&d.id, &d.status); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan abandoned case: %w", err)
+		}
+		drafts = append(drafts, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read abandoned cases: %w", err)
+	}
+
+	for _, d := range drafts {
+		// Отметка уже стоит: не поставив уведомление, мы теряем именно это
+		// напоминание, а не блокируем обращение. Ошибка одного не отменяет
+		// остальных.
+		if err := putNotifyKey(ctx, c.pool, d.id, "remind", remindText(d.status), ""); err != nil {
+			c.log.Error("remind_failed", "case_id", d.id, "error", err)
+			continue
+		}
+		c.log.Info("case_reminded", "case_id", d.id, "status", d.status)
+	}
+	return nil
+}
+
+func remindText(status string) string {
+	if status == statusCollecting {
+		return "Обращение ждёт вас сутки. Пришлите остальное и нажмите «Готово» " +
+			"либо отмените его командой /cancel. Вложения уже удалены, текст на месте."
+	}
+	return "Обращение ждёт вашего ответа сутки. Ответьте, и я доведу его до тикета, " +
+		"либо отмените командой /cancel. Вложения уже удалены, разбор на месте."
+}
+
 type casePayload struct {
 	CaseID string `json:"case_id"`
 }
@@ -687,10 +787,20 @@ type itemPayload struct {
 	ItemID int64  `json:"item_id"`
 }
 
+// notifyPayload - сообщение автору, порождённое фоновой работой. Buttons
+// называет набор кнопок, а не рисует их: разметку строит bot.go, и он же знает
+// текущий раунд.
 type notifyPayload struct {
-	CaseID string `json:"case_id"`
-	Text   string `json:"text"`
+	CaseID  string `json:"case_id"`
+	Text    string `json:"text"`
+	Buttons string `json:"buttons,omitempty"`
 }
+
+// Наборы кнопок под сообщением из очереди.
+const (
+	keysRound   = "round"   // «Всё так» на раунд вопросов
+	keysSummary = "summary" // «Публикую», «Поправить», «Отмена»
+)
 
 // HandleFailedJob - исход работы, исчерпавшей повторы. Воркер зовёт её через
 // onFail: очередь не знает, что делать с обращением.
@@ -742,6 +852,25 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				"Не смог обработать обращение. Пришлите материал иначе и нажмите «Готово» ещё раз."); err != nil {
 				return err
 			}
+		case JobInterview, JobSummarize:
+			// Обращение остаётся живым: следующий ответ автора поставит новую
+			// работу, и разговор продолжится с того же места.
+			if err := putNotify(ctx, tx, p.CaseID, job.ID,
+				"Не смог разобрать обращение. Напишите ещё раз своими словами - или отмените командой /cancel."); err != nil {
+				return err
+			}
+		case JobPublish:
+			// Возврат в summary возвращает и кнопку «Публикую»: тикет не создан,
+			// и повторить должен автор, а не бесконечные повторы очереди.
+			if _, err := tx.Exec(ctx, `
+				UPDATE cases SET status = 'summary', updated_at = now()
+				WHERE id = $1 AND status = 'publishing'`, p.CaseID); err != nil {
+				return fmt.Errorf("return case %s to summary: %w", p.CaseID, err)
+			}
+			if err := putNotify(ctx, tx, p.CaseID, job.ID,
+				"Не удалось создать тикет в GitHub. Нажмите «Публикую» ещё раз - материал на месте."); err != nil {
+				return err
+			}
 		}
 
 		return addEvent(ctx, tx, p.CaseID, "job_failed", map[string]any{
@@ -772,8 +901,29 @@ func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
 // putNotify ставит сообщение автору. Ключ по идентификатору работы: её повтор
 // не наплодит вторых уведомлений.
 func putNotify(ctx context.Context, db Runner, caseID string, jobID int64, text string) error {
-	key := fmt.Sprintf("%s:%s:%d", JobNotify, caseID, jobID)
-	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text})
+	return putNotifyKey(ctx, db, caseID, strconv.FormatInt(jobID, 10), text, "")
+}
+
+// putNotifyKey - то же с явным суффиксом ключа: у напоминания и у раунда
+// вопросов нет породившей работы, но повторяться они не должны.
+func putNotifyKey(ctx context.Context, db Runner, caseID, suffix, text, buttons string) error {
+	key := fmt.Sprintf("%s:%s:%s", JobNotify, caseID, suffix)
+	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons})
+}
+
+// putCaseJob ставит работу разговора. Ключ монотонен по числу ответов автора:
+// детерминированный ключ вида «interview:<case>» второй раунд молча съел бы
+// через ON CONFLICT DO NOTHING, а счётчик ответов растёт с каждым ходом и не
+// повторяется даже после правки саммари.
+func putCaseJob(ctx context.Context, db txRunner, kind, caseID string, payload any) error {
+	var answers int
+	err := db.QueryRow(ctx, `
+		SELECT count(*) FROM case_events
+		WHERE case_id = $1 AND kind = 'answer_given'`, caseID).Scan(&answers)
+	if err != nil {
+		return fmt.Errorf("count answers of case %s: %w", caseID, err)
+	}
+	return PutJob(ctx, db, kind, fmt.Sprintf("%s:%s:%d", kind, caseID, answers), payload)
 }
 
 // SaveNormalized и SaveProtocol - переходы, которые оставляет после себя шаг

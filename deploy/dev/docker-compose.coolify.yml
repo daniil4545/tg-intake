@@ -50,11 +50,14 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
       TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS:?TELEGRAM_ALLOWED_IDS must be set}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
       # Дефолты модели и лимитов лежат в config.go: пустая переменная означает
       # дефолт, а не пустое значение. Копия значений здесь молча разъехалась бы
       # с кодом.
       OPENROUTER_MODEL_MEDIA: ${OPENROUTER_MODEL_MEDIA:-}
+      OPENROUTER_MODEL_DIALOG: ${OPENROUTER_MODEL_DIALOG:-}
       MAX_ITEMS: ${MAX_ITEMS:-}
+      INTERVIEW_ROUNDS: ${INTERVIEW_ROUNDS:-}
       AUDIO_CONVERT: ${AUDIO_CONVERT:-}
       MEDIA_DIR: /tmp/intake
       LOG_LEVEL: ${LOG_LEVEL:-info}
