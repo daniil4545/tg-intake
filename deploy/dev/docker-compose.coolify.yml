@@ -40,6 +40,11 @@ services:
 
   app:
     image: ${APP_IMAGE:?APP_IMAGE must be set}
+    # С этого VPS дефолтный IP api.telegram.org (149.154.166.110) недоступен:
+    # getMe уходит в i/o timeout, приложение уходит в перезапуск. Пин на DC
+    # 149.154.167.220, как у соседнего Bot API сервиса. Проверено 2026-08-08.
+    extra_hosts:
+      - "api.telegram.org:149.154.167.220"
     environment:
       DATABASE_URL: postgres://intake:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/intake?sslmode=disable
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
