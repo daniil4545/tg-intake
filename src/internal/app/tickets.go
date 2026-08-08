@@ -21,9 +21,13 @@ const ticketsLimit = 10
 // за один запрос не отдаёт.
 const issueScan = 100
 
-// labelCancelled - метка, которую ставит отмена. Наличие её в правилах
-// проверяется при старте: без неё отменять нечем.
-const labelCancelled = "status:cancelled"
+// Метки, которые ставит код, а не человек: начальная при публикации и метка
+// отмены. Наличие обеих в правилах проверяется при старте, иначе набор
+// статусов снова раздвоится между Go и файлом.
+const (
+	labelNew       = "status:new"
+	labelCancelled = "status:cancelled"
+)
 
 var (
 	// ErrNotAuthor - отменять чужой тикет нельзя. Просмотр общий, отмена нет.
@@ -229,11 +233,12 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		return err
 	}
 
-	// Финальность проверяется один раз, до собственных мутаций: после них на
-	// issue уже висит status:cancelled, и повторная проверка оборвала бы работу
-	// до снятия старой метки.
+	// Своя метка при проверке не считается. Повтор после падения между
+	// AddLabel и CloseIssue видит собственный status:cancelled, и без этого
+	// исключения работа решила бы, что тикет уже закрыт, - issue остался бы
+	// открытым навсегда, а автор получил бы «уже закрыт».
 	names := issue.LabelNames()
-	if status, ok := t.statuses.Pick(names); ok && status.Final {
+	if status, ok := t.statuses.Pick(withoutLabel(names, labelCancelled)); ok && status.Final {
 		return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 			return putNotifyKey(ctx, tx, cs.ID, "cancel-late",
 				fmt.Sprintf("Тикет #%d уже закрыт со статусом «%s», отменять нечего.",
@@ -258,6 +263,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		return err
 	}
 
+	recorded := false
 	err = t.cases.inTx(ctx, func(tx pgx.Tx) error {
 		// Условие обязательно: повтор работы после падения между закрытием issue
 		// и гашением работы записал бы второе событие в журнал.
@@ -273,6 +279,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		if tag.RowsAffected() == 0 {
 			return nil
 		}
+		recorded = true
 		return putNotifyKey(ctx, tx, cs.ID, "cancelled",
 			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), "")
 	})
@@ -280,8 +287,10 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		return err
 	}
 
-	t.log.Info("issue_cancelled", "case_id", cs.ID, "user_id", cs.UserID,
-		"project", project.Slug, "issue", cs.IssueNumber)
+	if recorded {
+		t.log.Info("issue_cancelled", "case_id", cs.ID, "user_id", cs.UserID,
+			"project", project.Slug, "issue", cs.IssueNumber)
+	}
 	return nil
 }
 
@@ -291,6 +300,18 @@ func (t *Tickets) noteUnknown(project Project, number int, labels []string) {
 	for _, label := range t.statuses.Unknown(labels) {
 		t.log.Warn("status_unknown", "project", project.Slug, "issue", number, "label", label)
 	}
+}
+
+// withoutLabel - набор меток без одной. Нужен там, где своя метка не должна
+// влиять на решение.
+func withoutLabel(labels []string, skip string) []string {
+	kept := make([]string, 0, len(labels))
+	for _, label := range labels {
+		if label != skip {
+			kept = append(kept, label)
+		}
+	}
+	return kept
 }
 
 func isNotFound(err error) bool {

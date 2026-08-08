@@ -184,7 +184,8 @@ func ParseProjects(raw string) ([]ProjectConfig, error) {
 			return nil, fmt.Errorf("PROJECTS has slug %q outside of [a-z0-9-]{1,32}", p.Slug)
 		case seen[p.Slug]:
 			return nil, fmt.Errorf("PROJECTS has duplicate slug %q", p.Slug)
-		case p.Title == "" || p.Owner == "" || p.Repo == "":
+		case strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Owner) == "" ||
+			strings.TrimSpace(p.Repo) == "":
 			return nil, fmt.Errorf("PROJECTS entry %q needs title, owner and repo", p.Slug)
 		// Пустой контекст оставил бы интервью без представления о проекте: вопросы
 		// станут общими, а тикет - бесполезным.

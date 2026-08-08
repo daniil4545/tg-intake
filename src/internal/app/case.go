@@ -953,6 +953,9 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 	if reopened {
 		c.log.Warn("case_reopened", "case_id", p.CaseID)
 	}
+	if job.Kind == JobCancelIssue {
+		c.log.Warn("cancel_failed", "case_id", p.CaseID, "error", oneLine(cause.Error()))
+	}
 }
 
 // reopenCase возвращает обращение в сбор. Два пути возврата - «разобрать не

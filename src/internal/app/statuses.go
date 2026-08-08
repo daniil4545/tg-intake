@@ -66,10 +66,13 @@ func parseStatuses(data []byte) (Statuses, error) {
 	if open == 0 {
 		return nil, fmt.Errorf("status rules have no non-final status")
 	}
-	// Метку отмены ставит код, и её отсутствие в правилах означало бы статус,
-	// который бот проставит, но не сумеет показать.
-	if !seen[labelCancelled] {
-		return nil, fmt.Errorf("status rules have no %q", labelCancelled)
+	// Эти две метки ставит код: начальную - публикация, отмену - работа отмены.
+	// Отсутствие любой из них в правилах означало бы статус, который бот
+	// проставит, но не сумеет ни показать, ни завести в репозитории.
+	for _, required := range []string{labelNew, labelCancelled} {
+		if !seen[required] {
+			return nil, fmt.Errorf("status rules have no %q", required)
+		}
 	}
 	return file.Statuses, nil
 }

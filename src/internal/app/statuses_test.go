@@ -16,6 +16,7 @@ func TestParseStatuses(t *testing.T) {
 		{"пустой список", `{"statuses":[]}`, false},
 		{"метка без префикса", `{"statuses":[
 			{"label":"new","title":"Заведён"},
+			{"label":"status:new","title":"Заведён"},
 			{"label":"status:cancelled","title":"Отменён","final":true}]}`, false},
 		{"дубль метки", `{"statuses":[
 			{"label":"status:new","title":"Заведён"},
@@ -24,7 +25,11 @@ func TestParseStatuses(t *testing.T) {
 		{"пустой заголовок", `{"statuses":[
 			{"label":"status:new","title":""},
 			{"label":"status:cancelled","title":"Отменён","final":true}]}`, false},
+		{"нет начальной метки", `{"statuses":[
+			{"label":"status:dev","title":"В dev"},
+			{"label":"status:cancelled","title":"Отменён","final":true}]}`, false},
 		{"только финальные", `{"statuses":[
+			{"label":"status:new","title":"Заведён","final":true},
 			{"label":"status:cancelled","title":"Отменён","final":true}]}`, false},
 		{"без метки отмены", `{"statuses":[{"label":"status:new","title":"Заведён"}]}`, false},
 	}
