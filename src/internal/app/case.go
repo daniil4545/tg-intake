@@ -568,6 +568,9 @@ func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 		return nil
 	}
 	if cs.Status == statusPublishing {
+		// Лог обязателен: без него нажатая и молча отклонённая кнопка выглядит
+		// как зависший бот, а в логах не остаётся ничего.
+		c.log.Info("cancel_refused", "case_id", cs.ID, "user_id", cs.UserID, "reason", reason)
 		return ErrPublishing
 	}
 
@@ -729,6 +732,58 @@ func (c *Cases) SweepDrafts(ctx context.Context) error {
 		if err := c.DropFiles(ctx, id); err != nil {
 			c.log.Error("sweep_failed", "case_id", id, "error", err)
 		}
+	}
+	return nil
+}
+
+// RecoverStuck возвращает в очередь работы обращений, которые двигаются только
+// работой и остались без неё. Такое обращение висит молча: автор ждёт тикет,
+// сервис здоров, в логах пусто, а выхода нет - из publishing не отменяют.
+//
+// Причины разные и все внешние: работа исчерпала повторы, процесс умер между
+// сменой статуса и постановкой, старая версия сервиса оставила погашенный ключ.
+// Разбирать каждую отдельно смысла нет - состояние в БД само говорит, чего не
+// хватает, и восстановление идёт от него.
+//
+// Статусы разговора сюда не входят: в interview и summary обращение ждёт
+// человека, отсутствие работы там - норма.
+func (c *Cases) RecoverStuck(ctx context.Context) error {
+	rows, err := c.pool.Query(ctx, `
+		SELECT c.id, c.status FROM cases c
+		WHERE c.status IN ('normalizing', 'publishing')
+		  AND NOT EXISTS (
+		      SELECT 1 FROM jobs j
+		      WHERE j.status IN ('pending', 'running')
+		        AND j.payload->>'case_id' = c.id::text)`)
+	if err != nil {
+		return fmt.Errorf("query stuck cases: %w", err)
+	}
+
+	type stuck struct{ id, status string }
+	var cases []stuck
+	for rows.Next() {
+		var s stuck
+		if err := rows.Scan(&s.id, &s.status); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan stuck case: %w", err)
+		}
+		cases = append(cases, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read stuck cases: %w", err)
+	}
+
+	for _, s := range cases {
+		kind := JobPublish
+		if s.status == statusNormalizing {
+			kind = JobNormalizeImages
+		}
+		if err := replaceJob(ctx, c.pool, kind, s.id, casePayload{CaseID: s.id}); err != nil {
+			c.log.Error("recover_failed", "case_id", s.id, "status", s.status, "error", err)
+			continue
+		}
+		c.log.Warn("case_recovered", "case_id", s.id, "status", s.status, "job", kind)
 	}
 	return nil
 }

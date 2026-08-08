@@ -458,6 +458,33 @@ func TestPublishSkipsCancelled(t *testing.T) {
 	}
 }
 
+// TestRecoverStuck: обращение, потерявшее свою работу, двигаться нечем - из
+// publishing нет даже отмены. Восстановление возвращает работу в очередь, а
+// обращения, ждущие человека, не трогает.
+func TestRecoverStuck(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	stuck := startInterview(t, cases, 6008, 3)
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'publishing' WHERE id = $1`, stuck.ID); err != nil {
+		t.Fatalf("move to publishing: %v", err)
+	}
+	waiting := startInterview(t, cases, 6009, 1)
+
+	if err := cases.RecoverStuck(ctx); err != nil {
+		t.Fatalf("recover stuck: %v", err)
+	}
+
+	if n := countJobs(t, pool, JobPublish, stuck.ID); n != 1 {
+		t.Errorf("публикация не возвращена в очередь: работ %d, ожидалась 1", n)
+	}
+	// Обращение в интервью ждёт ответа автора: работы там нет и быть не должно.
+	if n := countJobs(t, pool, JobInterview, waiting.ID); n != 0 {
+		t.Errorf("восстановление тронуло ждущее обращение: работ %d", n)
+	}
+}
+
 // TestPrefixStable: стабильный префикс обязан идти первым сообщением и не
 // меняться от хода к ходу. Любая изменяющаяся строка перед промтом молча гасит
 // кэш провайдера, и заметить это по ответам модели нельзя.

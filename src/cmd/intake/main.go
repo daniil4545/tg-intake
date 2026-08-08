@@ -87,6 +87,12 @@ func main() {
 		app.JobNotify:          bot.Notify,
 	}
 
+	// Первым делом после старта: обращение, потерявшее свою работу, не
+	// двигается ничем и ничего не сообщает - ни автору, ни в лог.
+	if err := cases.RecoverStuck(ctx); err != nil {
+		log.Error("recover_failed", "error", err)
+	}
+
 	var background sync.WaitGroup
 	background.Add(2)
 	go func() {
@@ -122,6 +128,9 @@ func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if err := cases.RecoverStuck(ctx); err != nil {
+				log.Error("recover_failed", "error", err)
+			}
 			// Напоминание идёт до уборки: автору честнее узнать про удалённые
 			// вложения тем же сообщением, которым его зовут вернуться.
 			if err := cases.RemindDrafts(ctx); err != nil {
