@@ -1,4 +1,4 @@
-# intake (Galera Предложка)
+# tg-intake (Galera Предложка)
 
 Внутренний Telegram-бот: принимает обращения сотрудников по работающим
 сервисам, доводит их интервью до пригодного к работе описания и заводит тикет
@@ -35,13 +35,15 @@ GitHub REST API. Runtime - один сервис в Docker, dev-контур в 
 | [docs/architecture.md](docs/architecture.md) | сущности, схема данных, потоки, контракты, псевдокод |
 | [docs/backlog.md](docs/backlog.md) | milestones и активные задачи |
 | [docs/state.md](docs/state.md) | что сделано, что в работе, принятые решения |
+| [docs/plans/](docs/plans/) | спека каждого нетривиального среза до его реализации |
 | [AGENTS.md](AGENTS.md) | точка входа для AI-агентов |
 
 ## Запуск
 
-Кода пока нет. Команды появятся с первым срезом:
+Всё из каталога `src`, переменные - в `.env` по образцу `.env.example`.
 
 ```sh
+cp .env.example .env
 docker compose up -d postgres
 make migrate-up
 make run
