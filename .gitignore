@@ -1,0 +1,37 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Go artifacts
+/bin/
+/dist/
+/tmp/
+/src/intake
+vendor/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Media downloaded from Telegram: never enters git
+/src/media/
+*.ogg
+*.oga
+*.mp3
+*.jpg
+*.jpeg
+*.png
+
+# Local AI tool state
+.claude/settings.local.json
+.claude/projects/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
