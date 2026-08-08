@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,35 +17,60 @@ import (
 )
 
 const (
-	githubAPI     = "https://api.github.com"
+	GitHubAPI     = "https://api.github.com"
 	githubTimeout = 20 * time.Second
-	githubRetries = 3
-	githubLimit   = 1 << 20
+	// Просмотр ждёт человек, и ждёт он же за всех остальных авторов: бюджет
+	// короткий, повторов нет, отказ сразу превращается в «статус недоступен».
+	githubFastTimeout = 5 * time.Second
+	githubRetries     = 3
+	githubLimit       = 1 << 20
+	// Сколько последних комментариев страниц просматриваем в поиске последнего.
+	githubCommentPages = 5
 	// Сколько последних issue просматриваем в поиске своего маркера. Дубль
 	// ищется сразу после потерянного ответа, поэтому нужный тикет лежит в самом
 	// начале списка.
 	githubScan = 30
 )
 
-// GitHub - клиент Issues API. Один сервис, четыре запроса: SDK потянул бы
+// GitHub - клиент Issues API. Один сервис, десяток запросов: SDK потянул бы
 // чужую модель ошибок и повторов ради того же кода.
+//
+// Два клиента, а не один. Рабочий обслуживает очередь: там повторы уместны,
+// никто не ждёт у экрана. Быстрый обслуживает просмотр из хендлера: телебот
+// поднят с Synchronous, апдейты всех авторов идут одной очередью, и один отказ
+// GitHub с полным бюджетом заморозил бы бота почти на полминуты.
+//
+// Прокси ни тому, ни другому не задаётся: по инварианту контура GitHub доступен
+// напрямую, через прокси ходят только OpenRouter и Telegram.
 type GitHub struct {
-	token string
-	http  *http.Client
-	log   *slog.Logger
+	token    string
+	api      string
+	http     *http.Client
+	fast     *http.Client
+	statuses Statuses
+	log      *slog.Logger
 }
 
-func NewGitHub(token string, log *slog.Logger) *GitHub {
-	return &GitHub{token: token, http: &http.Client{Timeout: githubTimeout}, log: log}
+// NewGitHub: api - базовый адрес, параметром ради тестов на httptest.Server.
+func NewGitHub(token, api string, statuses Statuses, log *slog.Logger) *GitHub {
+	return &GitHub{
+		token:    token,
+		api:      api,
+		http:     &http.Client{Timeout: githubTimeout},
+		fast:     &http.Client{Timeout: githubFastTimeout},
+		statuses: statuses,
+		log:      log,
+	}
 }
 
 // Метки проекта. Статус тикета живёт меткой и остаётся единственным источником
 // истины: сервис их только заводит и читает.
+// Статусов здесь нет: они приходят из rules/statuses.json. Иначе добавленный в
+// правила статус бот умел бы читать, но никогда не завёл бы в репозитории.
 var baseLabels = []struct{ Name, Color, Desc string }{
 	{"type:bug", "d73a4a", "Сервис ведёт себя не так, как ожидали"},
 	{"type:feature", "a2eeef", "Нужно то, чего в сервисе нет"},
 	{"type:question", "d876e3", "Нужен ответ, а не изменение в коде"},
-	{"status:new", "0e8a16", "Заведён, к работе не приступали"},
 	{"incomplete", "fbca04", "Контракт готовности недобран, пробелы в теле"},
 }
 
@@ -65,6 +91,11 @@ func (g *GitHub) PrepareProject(ctx context.Context, p Project) error {
 			return err
 		}
 	}
+	for _, s := range g.statuses {
+		if err := g.createLabel(ctx, p, s.Label, s.Color, "Статус: "+s.Title); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -74,7 +105,7 @@ func (g *GitHub) EnsureLabels(ctx context.Context, p Project) error {
 	if err := g.PrepareProject(ctx, p); err != nil {
 		return err
 	}
-	g.log.Info("labels_created", "project", p.Slug, "labels", len(baseLabels))
+	g.log.Info("labels_created", "project", p.Slug, "labels", len(baseLabels)+len(g.statuses))
 	return nil
 }
 
@@ -104,7 +135,7 @@ func (g *GitHub) CreateIssue(ctx context.Context, p Project, title, body string,
 	// Единственный неидемпотентный запрос сервиса, и повторов у него нет.
 	// Оборванный ответ на успешный POST означает, что тикет уже создан: слепой
 	// повтор дал бы второй. Повторяет очередь, а она перед этим ищет маркер.
-	raw, _, err := g.send(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues", p.Owner, p.Repo), payload)
+	raw, _, err := g.send(ctx, g.http, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues", p.Owner, p.Repo), payload)
 	if err != nil {
 		return 0, "", err
 	}
@@ -129,20 +160,9 @@ func (g *GitHub) CreateIssue(ctx context.Context, p Project, title, body string,
 // Список, а не поиск: индекс search обновляется с задержкой, и только что
 // созданный issue он не покажет, а список отдаёт его сразу.
 func (g *GitHub) FindIssue(ctx context.Context, p Project, marker string) (int, string, error) {
-	path := fmt.Sprintf("/repos/%s/%s/issues?state=all&per_page=%d&sort=created&direction=desc",
-		p.Owner, p.Repo, githubScan)
-	raw, err := g.call(ctx, http.MethodGet, path, nil)
+	issues, err := g.listIssues(ctx, p, githubScan, false)
 	if err != nil {
 		return 0, "", err
-	}
-
-	var issues []struct {
-		Number  int    `json:"number"`
-		HTMLURL string `json:"html_url"`
-		Body    string `json:"body"`
-	}
-	if err := json.Unmarshal(raw, &issues); err != nil {
-		return 0, "", fmt.Errorf("decode issue list: %w", err)
 	}
 	for _, issue := range issues {
 		if strings.Contains(issue.Body, marker) {
@@ -150,6 +170,142 @@ func (g *GitHub) FindIssue(ctx context.Context, p Project, marker string) (int, 
 		}
 	}
 	return 0, "", nil
+}
+
+// Issue - тикет в том виде, в каком его читает сервис. Labels нужны просмотру,
+// Body - поиску маркера, PullRequest - отсеву: REST GitHub считает issue каждый
+// pull request, и в активном репозитории они вытесняют тикеты из окна.
+type Issue struct {
+	Number      int    `json:"number"`
+	HTMLURL     string `json:"html_url"`
+	Body        string `json:"body"`
+	PullRequest *struct {
+		URL string `json:"url"`
+	} `json:"pull_request"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
+}
+
+// LabelNames - имена меток тикета.
+func (i Issue) LabelNames() []string {
+	names := make([]string, 0, len(i.Labels))
+	for _, l := range i.Labels {
+		names = append(names, l.Name)
+	}
+	return names
+}
+
+// listIssues читает последние тикеты репозитория. Pull request'ы отсеиваются
+// здесь, чтобы ни один вызывающий не забыл про них.
+func (g *GitHub) listIssues(ctx context.Context, p Project, limit int, fast bool) ([]Issue, error) {
+	path := fmt.Sprintf("/repos/%s/%s/issues?state=all&per_page=%d&sort=created&direction=desc",
+		p.Owner, p.Repo, limit)
+	raw, err := g.get(ctx, path, fast)
+	if err != nil {
+		return nil, err
+	}
+
+	var issues []Issue
+	if err := json.Unmarshal(raw, &issues); err != nil {
+		return nil, fmt.Errorf("decode issue list: %w", err)
+	}
+	kept := issues[:0]
+	for _, issue := range issues {
+		if issue.PullRequest == nil {
+			kept = append(kept, issue)
+		}
+	}
+	return kept, nil
+}
+
+// ListIssues - список для просмотра: короткий бюджет, без повторов.
+func (g *GitHub) ListIssues(ctx context.Context, p Project, limit int) ([]Issue, error) {
+	return g.listIssues(ctx, p, limit, true)
+}
+
+// GetIssue читает один тикет. fast решает, чей это вызов: просмотр из хендлера
+// или работа из очереди.
+func (g *GitHub) GetIssue(ctx context.Context, p Project, number int, fast bool) (Issue, error) {
+	raw, err := g.get(ctx, fmt.Sprintf("/repos/%s/%s/issues/%d", p.Owner, p.Repo, number), fast)
+	if err != nil {
+		return Issue{}, err
+	}
+
+	var issue Issue
+	if err := json.Unmarshal(raw, &issue); err != nil {
+		return Issue{}, fmt.Errorf("decode issue %d: %w", number, err)
+	}
+	return issue, nil
+}
+
+// LastComment - последний комментарий тикета. Комментарии приходят по
+// возрастанию идентификатора, поэтому нужна последняя страница: листаем, пока
+// страница полна, но не дальше пяти - пятьсот комментариев у внутреннего тикета
+// означают, что что-то пошло не так, и это видно в логе.
+func (g *GitHub) LastComment(ctx context.Context, p Project, number int) (string, error) {
+	const perPage = 100
+	last := ""
+	for page := 1; page <= githubCommentPages; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=%d&page=%d",
+			p.Owner, p.Repo, number, perPage, page)
+		raw, err := g.get(ctx, path, true)
+		if err != nil {
+			return "", err
+		}
+
+		var comments []struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal(raw, &comments); err != nil {
+			return "", fmt.Errorf("decode comments of issue %d: %w", number, err)
+		}
+		if len(comments) > 0 {
+			last = comments[len(comments)-1].Body
+		}
+		if len(comments) < perPage {
+			return last, nil
+		}
+	}
+	g.log.Warn("comments_truncated", "repo", p.Owner+"/"+p.Repo, "issue", number)
+	return last, nil
+}
+
+// AddLabel добавляет метку, не трогая остальные: PUT затёр бы всё, включая
+// проставленное владельцем вручную.
+func (g *GitHub) AddLabel(ctx context.Context, p Project, number int, label string) error {
+	body, err := json.Marshal(map[string][]string{"labels": {label}})
+	if err != nil {
+		return fmt.Errorf("build label request: %w", err)
+	}
+	_, err = g.call(ctx, http.MethodPost,
+		fmt.Sprintf("/repos/%s/%s/issues/%d/labels", p.Owner, p.Repo, number), body)
+	return err
+}
+
+// RemoveLabel снимает одну метку. 404 означает, что её и не было, - это не
+// ошибка, а то состояние, которого мы добивались.
+func (g *GitHub) RemoveLabel(ctx context.Context, p Project, number int, label string) error {
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s",
+		p.Owner, p.Repo, number, url.PathEscape(label))
+	_, err := g.call(ctx, http.MethodDelete, path, nil)
+	var apiErr *githubError
+	if errors.As(err, &apiErr) && apiErr.status == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
+
+// CloseIssue закрывает тикет как незапланированный: автор от него отказался, а
+// не работа была сделана.
+func (g *GitHub) CloseIssue(ctx context.Context, p Project, number int) error {
+	body, err := json.Marshal(map[string]string{"state": "closed", "state_reason": "not_planned"})
+	if err != nil {
+		return fmt.Errorf("build close request: %w", err)
+	}
+	_, err = g.call(ctx, http.MethodPatch,
+		fmt.Sprintf("/repos/%s/%s/issues/%d", p.Owner, p.Repo, number), body)
+	return err
 }
 
 // githubError несёт код ответа: 422 на метке означает «уже есть», и отличить
@@ -161,9 +317,20 @@ type githubError struct {
 
 func (e *githubError) Error() string { return fmt.Sprintf("github status %d: %s", e.status, e.message) }
 
+// get - чтение с выбором бюджета. fast означает «зовут из хендлера»: одна
+// попытка коротким клиентом, потому что автор ждёт ответа, а с ним и все
+// остальные авторы.
+func (g *GitHub) get(ctx context.Context, path string, fast bool) (json.RawMessage, error) {
+	if fast {
+		raw, _, err := g.send(ctx, g.fast, http.MethodGet, path, nil)
+		return raw, err
+	}
+	return g.call(ctx, http.MethodGet, path, nil)
+}
+
 func (g *GitHub) call(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
 	for attempt := 0; ; attempt++ {
-		raw, retry, err := g.send(ctx, method, path, body)
+		raw, retry, err := g.send(ctx, g.http, method, path, body)
 		if err == nil {
 			return raw, nil
 		}
@@ -182,12 +349,12 @@ func (g *GitHub) call(ctx context.Context, method, path string, body []byte) (js
 
 // send делает одну попытку. Второе значение - повторять ли: 429, 5xx и
 // вторичный лимит (403 с Retry-After) да, остальные 4xx нет.
-func (g *GitHub) send(ctx context.Context, method, path string, body []byte) (json.RawMessage, bool, error) {
+func (g *GitHub) send(ctx context.Context, client *http.Client, method, path string, body []byte) (json.RawMessage, bool, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, githubAPI+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, g.api+path, reader)
 	if err != nil {
 		return nil, false, fmt.Errorf("build github request: %w", err)
 	}
@@ -198,7 +365,7 @@ func (g *GitHub) send(ctx context.Context, method, path string, body []byte) (js
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := g.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// Ответа не было, значит и запрос мог не отработать: повтор безопасен,
 		// от дубля защищает поиск маркера.

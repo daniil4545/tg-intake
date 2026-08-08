@@ -62,17 +62,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	statuses, err := app.LoadStatuses()
+	if err != nil {
+		log.Error("statuses_failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Строго до checkGitHub: тот заводит метки по активным проектам, и новый
+	// проект должен появиться в таблице раньше, иначе метки доедут только
+	// следующим стартом.
+	if err := app.SyncProjects(ctx, pool, cfg.Projects, log); err != nil {
+		log.Error("projects_sync_failed", "error", err)
+		os.Exit(1)
+	}
+
 	cases := app.NewCases(pool, media, log, cfg.MaxItems)
 	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, cfg.OpenRouterProxy, log)
 	log.Info("openrouter_ready", "proxy", cfg.OpenRouterProxy != "")
 	normalizer := app.NewNormalizer(cases, llm, log, cfg.AudioConvert)
 	interview := app.NewInterview(cases, llm, log, rules, cfg.ModelDialog, cfg.InterviewRounds)
-	github := app.NewGitHub(cfg.GitHubToken, log)
+	github := app.NewGitHub(cfg.GitHubToken, app.GitHubAPI, statuses, log)
 	publisher := app.NewPublisher(cases, github, rules, log)
 
 	checkGitHub(ctx, pool, github, log)
 
-	bot, err := app.NewBot(ctx, cfg, pool, cases, log)
+	tickets := app.NewTickets(cases, github, statuses, log)
+
+	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, log)
 	if err != nil {
 		log.Error("bot_failed", "error", err)
 		os.Exit(1)
@@ -85,6 +101,7 @@ func main() {
 		app.JobSummarize:       interview.Summarize,
 		app.JobPublish:         publisher.Run,
 		app.JobNotify:          bot.Notify,
+		app.JobCancelIssue:     tickets.RunCancel,
 	}
 
 	// Первым делом после старта: обращение, потерявшее свою работу, не
