@@ -18,6 +18,7 @@ Read-only actions:
   app-logs [N]     логи приложения, по умолчанию 200 строк, максимум 1000
   db-logs [N]      логи PostgreSQL, по умолчанию 200 строк, максимум 1000
   app-env          переменные окружения приложения, значения скрыты
+  db-counts        число строк по таблицам, без содержимого
 
 INTAKE_SSH_HOST переопределяет root@5.42.118.105.
 INTAKE_RESOURCE переопределяет контур intake-dev.
@@ -62,6 +63,11 @@ case "$action" in
     db-logs)
         lines="$(tail_lines "$arg")"
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker logs --tail $lines \"\$c\" 2>&1"
+        ;;
+    db-counts)
+        # Только счётчики: строки таблиц содержат ФИО автора и текст обращения,
+        # им место в базе, а не в терминале.
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select 'projects='||(select count(*) from projects)||' users='||(select count(*) from users)||' cases='||(select count(*) from cases)||' case_items='||(select count(*) from case_items)||' jobs='||(select count(*) from jobs)\""
         ;;
     app-env)
         # Значения скрыты намеренно: в окружении лежат токен бота и пароль базы.
