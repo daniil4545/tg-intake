@@ -19,6 +19,7 @@ Read-only actions:
   db-logs [N]      логи PostgreSQL, по умолчанию 200 строк, максимум 1000
   app-env          переменные окружения приложения, значения скрыты
   db-counts        число строк по таблицам, без содержимого
+  case-trace [N]   ход разговора: события обращений, статус и раунд, без текстов
   deploy-config    имена переменных сервиса в Coolify и версия его compose
   deploy-state     образ кандидата на хосте и незавершённые деплои Coolify
 
@@ -70,6 +71,13 @@ case "$action" in
         # Только счётчики: строки таблиц содержат ФИО автора и текст обращения,
         # им место в базе, а не в терминале.
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select 'projects='||(select count(*) from projects)||' users='||(select count(*) from users)||' cases='||(select count(*) from cases)||' case_items='||(select count(*) from case_items)||' jobs='||(select count(*) from jobs)\""
+        ;;
+    case-trace)
+        # Ход разговора без единого слова автора: вид события, время, статус и
+        # раунд. Тексты вопросов, ответов и саммари лежат в payload и наружу не
+        # выходят - разбирать надо последовательность, а не содержание.
+        lines="$(tail_lines "$arg")"
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select e.created_at||' case='||left(e.case_id::text,8)||' event='||e.kind||' status='||c.status||' round='||c.round from case_events e join cases c on c.id = e.case_id order by e.id desc limit $lines\" | tac"
         ;;
     deploy-state)
         # Зелёный workflow означает «Coolify принял запрос». Выкат мог не

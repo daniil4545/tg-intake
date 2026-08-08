@@ -478,16 +478,16 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 			return ErrNotCollecting
 		}
 
-		// Ключ работы детерминирован, поэтому работа прошлого захода молча съела
-		// бы новую через ON CONFLICT DO NOTHING, и возвращённое в сбор обращение
-		// больше не запустилось бы. Статус старой работы не важен: обращение
-		// вернулось в сбор и с провалом (HandleFailedJob), и с успехом самой
-		// работы (разбирать было нечего). Аудит остаётся в case_events.
+		// Работы обращения заменяются при постановке, а расшифровка привязана к
+		// элементу: её ключ несёт item_id, и работа прошлого захода молча съела
+		// бы новую через ON CONFLICT DO NOTHING. Снимаем их здесь, чтобы
+		// возвращённое в сбор обращение снова дошло до конца. Аудит остаётся в
+		// case_events.
 		_, err = tx.Exec(ctx, `
-			DELETE FROM jobs WHERE kind = ANY($2) AND payload->>'case_id' = $1`,
-			cs.ID, caseJobKinds)
+			DELETE FROM jobs WHERE kind = $2 AND payload->>'case_id' = $1`,
+			cs.ID, JobNormalizeVoice)
 		if err != nil {
-			return fmt.Errorf("clear jobs of case %s: %w", cs.ID, err)
+			return fmt.Errorf("clear voice jobs of case %s: %w", cs.ID, err)
 		}
 
 		ids, err := pendingVoice(ctx, tx, cs.ID)
@@ -555,7 +555,7 @@ func putImagesJob(ctx context.Context, db txRunner, caseID string) error {
 	if left > 0 {
 		return nil
 	}
-	return PutJob(ctx, db, JobNormalizeImages, JobNormalizeImages+":"+caseID, casePayload{CaseID: caseID})
+	return replaceJob(ctx, db, JobNormalizeImages, caseID, casePayload{CaseID: caseID})
 }
 
 // CancelCase - один путь для «Отмены», /cancel и «начать заново»: слот
@@ -693,13 +693,19 @@ func (c *Cases) DropFiles(ctx context.Context, caseID string) error {
 // normalizing и publishing: там работа держит файлы открытыми, и выдёргивать их
 // из-под воркера нельзя. Срок считаем от последнего движения, а не от создания:
 // разговор идёт часами, и created_at перестал быть признаком заброшенности.
+//
+// Закрытое обращение убирается без отсрочки и независимо от срока: файлы там
+// уже никому не нужны, а сбой уборки в момент публикации иначе оставил бы их на
+// диске навсегда - повтор работы выходит на проверке issue_number.
 func (c *Cases) SweepDrafts(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
 		SELECT DISTINCT c.id FROM cases c
 		JOIN case_items i ON i.case_id = c.id
-		WHERE c.status IN ('collecting', 'interview', 'summary')
-		  AND c.updated_at < now() - $1::int * interval '1 second'
-		  AND i.file_path IS NOT NULL`, int(draftTTL.Seconds()))
+		WHERE i.file_path IS NOT NULL
+		  AND (c.status IN ('published', 'cancelled')
+		       OR (c.status IN ('collecting', 'interview', 'summary')
+		           AND c.updated_at < now() - $1::int * interval '1 second'))`,
+		int(draftTTL.Seconds()))
 	if err != nil {
 		return fmt.Errorf("query stale drafts: %w", err)
 	}
@@ -867,8 +873,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				WHERE id = $1 AND status = 'publishing'`, p.CaseID); err != nil {
 				return fmt.Errorf("return case %s to summary: %w", p.CaseID, err)
 			}
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не удалось создать тикет в GitHub. Нажмите «Публикую» ещё раз - материал на месте."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, publishFailedText(cause)); err != nil {
 				return err
 			}
 		}
@@ -911,19 +916,24 @@ func putNotifyKey(ctx context.Context, db Runner, caseID, suffix, text, buttons 
 	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons})
 }
 
-// putCaseJob ставит работу разговора. Ключ монотонен по числу ответов автора:
-// детерминированный ключ вида «interview:<case>» второй раунд молча съел бы
-// через ON CONFLICT DO NOTHING, а счётчик ответов растёт с каждым ходом и не
-// повторяется даже после правки саммари.
-func putCaseJob(ctx context.Context, db txRunner, kind, caseID string, payload any) error {
-	var answers int
-	err := db.QueryRow(ctx, `
-		SELECT count(*) FROM case_events
-		WHERE case_id = $1 AND kind = 'answer_given'`, caseID).Scan(&answers)
-	if err != nil {
-		return fmt.Errorf("count answers of case %s: %w", caseID, err)
+// replaceJob - единственный способ поставить работу обращения. Правило одно:
+// работа каждого вида существует у обращения в единственном экземпляре, и новая
+// заменяет прежнюю.
+//
+// Отсюда следует всё остальное. Второе «Готово» перезапускает нормализацию.
+// Дописанный ответ отменяет ещё не начатый ход, и модель отвечает один раз на
+// всё сразу. Повторное «Публикую» после исчерпанных повторов снова уходит в
+// очередь, а не упирается в ключ погашенной работы. Без замены пришлось бы
+// плодить уникальные ключи и следить, чтобы они не столкнулись.
+//
+// От дубля наружу защищает не ключ, а состояние: issue_number обращения и
+// маркер в теле тикета.
+func replaceJob(ctx context.Context, db Runner, kind, caseID string, payload any) error {
+	if _, err := db.Exec(ctx, `
+		DELETE FROM jobs WHERE kind = $2 AND payload->>'case_id' = $1`, caseID, kind); err != nil {
+		return fmt.Errorf("clear %s jobs of case %s: %w", kind, caseID, err)
 	}
-	return PutJob(ctx, db, kind, fmt.Sprintf("%s:%s:%d", kind, caseID, answers), payload)
+	return PutJob(ctx, db, kind, kind+":"+caseID, payload)
 }
 
 // SaveNormalized и SaveProtocol - переходы, которые оставляет после себя шаг

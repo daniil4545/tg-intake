@@ -50,11 +50,16 @@ var baseLabels = []struct{ Name, Color, Desc string }{
 
 const authorLabelColor = "ededed"
 
-// CheckAccess - виден ли репозиторий токену. Fine-grained PAT выдаётся на
+// CheckAccess - видит ли токен Issues проекта. Fine-grained PAT выдаётся на
 // конкретные репозитории, поэтому право на второй проект не следует из права на
 // первый, и проверять надо каждый.
+//
+// Смотрим именно Issues, а не сам репозиторий: доступ к репозиторию есть и у
+// токена, которому Issues не выданы вовсе. Права на запись эта проверка всё
+// равно не доказывает - её даёт только первый созданный тикет.
 func (g *GitHub) CheckAccess(ctx context.Context, p Project) error {
-	_, err := g.call(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s", p.Owner, p.Repo), nil)
+	path := fmt.Sprintf("/repos/%s/%s/issues?per_page=1", p.Owner, p.Repo)
+	_, err := g.call(ctx, http.MethodGet, path, nil)
 	return err
 }
 
@@ -93,7 +98,10 @@ func (g *GitHub) CreateIssue(ctx context.Context, p Project, title, body string,
 		return 0, "", fmt.Errorf("build issue: %w", err)
 	}
 
-	raw, err := g.call(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues", p.Owner, p.Repo), payload)
+	// Единственный неидемпотентный запрос сервиса, и повторов у него нет.
+	// Оборванный ответ на успешный POST означает, что тикет уже создан: слепой
+	// повтор дал бы второй. Повторяет очередь, а она перед этим ищет маркер.
+	raw, _, err := g.send(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/issues", p.Owner, p.Repo), payload)
 	if err != nil {
 		return 0, "", err
 	}
@@ -275,8 +283,9 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 
 	marker := caseMarker(cs.ID)
 	number, url := 0, ""
-	// На первой попытке дубля быть не может, а лишний запрос стоит секунды на
-	// каждом тикете.
+	// На первой попытке дубля быть не может: создание issue повторов не делает,
+	// и до второй попытки очереди тикета в GitHub нет. Лишний запрос стоил бы
+	// секунды на каждом тикете.
 	if job.Attempts > 1 {
 		if number, url, err = p.gh.FindIssue(ctx, project, marker); err != nil {
 			return err
@@ -322,10 +331,18 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 
 	p.log.Info("issue_created", "case_id", cs.ID, "project", project.Slug,
 		"issue", number, "incomplete", cs.Incomplete)
+
 	// Медиа не переживает обращение. Удаление стоит здесь, а не в конце
 	// нормализации: до подтверждения саммари файл - последняя возможность
 	// поймать неверно прочитанный скриншот.
-	return p.cases.DropFiles(ctx, cs.ID)
+	//
+	// Сбой уборки не возвращает ошибку: тикет уже создан, и повтор работы вышел
+	// бы на первой же проверке issue_number, ни разу не дойдя до файлов.
+	// Подчищает почасовой сборщик, он смотрит и на опубликованные обращения.
+	if err := p.cases.DropFiles(ctx, cs.ID); err != nil {
+		p.log.Error("drop_files_failed", "case_id", cs.ID, "error", err)
+	}
+	return nil
 }
 
 // body собирает тело тикета: авторство, разделы контракта, пробелы и маркер.
@@ -362,6 +379,19 @@ func authorName(u User) string {
 		return name + " (@" + u.Username + ")"
 	}
 	return name
+}
+
+// publishFailedText отделяет отказ в правах от временного сбоя. Советовать
+// «нажмите ещё раз» там, где токену не хватает прав, значит гонять автора по
+// кругу: повтор не поможет, пока владелец не выдаст право заводить тикеты.
+func publishFailedText(cause error) string {
+	var apiErr *githubError
+	if errors.As(cause, &apiErr) &&
+		(apiErr.status == http.StatusForbidden || apiErr.status == http.StatusNotFound) {
+		return "Тикет не создан: у сервиса нет прав заводить задачи в этом проекте. " +
+			"Материал сохранён, я передал владельцу - опубликуем, как права появятся."
+	}
+	return "Не удалось создать тикет в GitHub. Нажмите «Публикую» ещё раз - материал на месте."
 }
 
 func publishedMessage(number int, url string, incomplete bool) string {

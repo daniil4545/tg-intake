@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -253,19 +252,86 @@ func TestAcceptRound(t *testing.T) {
 	if n := countJobs(t, pool, JobInterview, cs.ID); n != 1 {
 		t.Errorf("работ интервью после ответа: %d, ожидалась 1", n)
 	}
+
+	// Следующий ход идёт секунды, и человек жмёт кнопку ещё раз. Второе нажатие
+	// не должно давать ни второго ответа в истории, ни второго хода модели.
+	if err := cases.AcceptRound(ctx, reload(t, cases, cs.ID), 1); !errors.Is(err, ErrStaleRound) {
+		t.Fatalf("повторное «Всё так»: получено %v, ожидалось ErrStaleRound", err)
+	}
+	if n := countJobs(t, pool, JobInterview, cs.ID); n != 1 {
+		t.Errorf("повтор нажатия добавил работу: работ %d, ожидалась 1", n)
+	}
 }
 
-// TestAnswerAfterSummaryIsFix: правка саммари возвращает обращение в интервью и
-// идёт признаком fix. Без него автор, заметивший ошибку на последнем раунде, не
-// может её исправить: предел раундов уже исчерпан.
+// TestReplaceJobRevivesPublish: работа обращения существует в единственном
+// экземпляре, и новая заменяет прежнюю. Без этого исчерпавшая повторы
+// публикация оставляла бы свой ключ в очереди, повторное «Публикую» молча не
+// вставало бы, а обращение застряло бы в publishing навсегда.
+func TestReplaceJobRevivesPublish(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6005, 3)
+
+	if err := replaceJob(ctx, pool, JobPublish, cs.ID, casePayload{CaseID: cs.ID}); err != nil {
+		t.Fatalf("put publish job: %v", err)
+	}
+	_, err := pool.Exec(ctx, `
+		UPDATE jobs SET status = 'failed', attempts = 6 WHERE kind = $1`, JobPublish)
+	if err != nil {
+		t.Fatalf("fail publish job: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `UPDATE cases SET status = 'summary' WHERE id = $1`, cs.ID)
+	if err != nil {
+		t.Fatalf("move to summary: %v", err)
+	}
+	if err := cases.ConfirmSummary(ctx, reload(t, cases, cs.ID)); err != nil {
+		t.Fatalf("confirm summary: %v", err)
+	}
+
+	var status string
+	var attempts int
+	err = pool.QueryRow(ctx, `
+		SELECT status, attempts FROM jobs WHERE kind = $1 AND payload->>'case_id' = $2`,
+		JobPublish, cs.ID).Scan(&status, &attempts)
+	if err != nil {
+		t.Fatalf("load publish job: %v", err)
+	}
+	if status != "pending" || attempts != 0 {
+		t.Errorf("публикация не вернулась в очередь: status=%s attempts=%d", status, attempts)
+	}
+}
+
+// TestAnswerAfterSummaryIsFix: правка саммари возвращает обращение в интервью, и
+// следующий ход узнаёт в ней правку по журналу. Без этого автор, заметивший
+// ошибку на последнем раунде, не может её исправить: предел раундов исчерпан, и
+// правка молча ушла бы в новое саммари.
 func TestAnswerAfterSummaryIsFix(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
 	cs := startInterview(t, cases, 6002, 3)
 
+	err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
+		"round": 3, "questions": []Question{{Key: "case", Text: "какой заказ?"}},
+	})
+	if err != nil {
+		t.Fatalf("add round: %v", err)
+	}
+	if err := addEvent(ctx, pool, cs.ID, "summary_ready", map[string]any{"incomplete": false}); err != nil {
+		t.Fatalf("add summary event: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'summary' WHERE id = $1`, cs.ID); err != nil {
 		t.Fatalf("move to summary: %v", err)
+	}
+
+	fix, err := cases.isFix(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("is fix: %v", err)
+	}
+	if !fix {
+		t.Error("ход после показанного саммари не опознан как правка")
 	}
 
 	if err := cases.AddAnswer(ctx, reload(t, cases, cs.ID), "заказ был 4821, а не 4812"); err != nil {
@@ -274,20 +340,85 @@ func TestAnswerAfterSummaryIsFix(t *testing.T) {
 	if got := reload(t, cases, cs.ID).Status; got != statusInterview {
 		t.Errorf("статус после правки: %s, ожидался %s", got, statusInterview)
 	}
+	if n := countJobs(t, pool, JobInterview, cs.ID); n != 1 {
+		t.Errorf("работ интервью после правки: %d, ожидалась 1", n)
+	}
+}
 
-	var payload []byte
-	err := pool.QueryRow(ctx, `
-		SELECT payload FROM jobs WHERE kind = $1 AND payload->>'case_id' = $2`,
-		JobInterview, cs.ID).Scan(&payload)
+// TestStaleTurnIsDropped: пока модель думает, автор дописывает - и его ответ уже
+// поставил свежий ход. Устаревший результат не имеет права лечь поверх: иначе
+// автор получает два раунда вопросов на один свой ответ.
+func TestStaleTurnIsDropped(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	i := newTestInterview(t, cases, 3)
+	cs := startInterview(t, cases, 6006, 1)
+
+	version, err := cases.turnsCount(ctx, pool, cs.ID)
 	if err != nil {
-		t.Fatalf("load interview job: %v", err)
+		t.Fatalf("turns count: %v", err)
 	}
-	var p interviewPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
-		t.Fatalf("decode job payload: %v", err)
+	if err := cases.AddAnswer(ctx, cs, "и ещё вот что: падает только в Safari"); err != nil {
+		t.Fatalf("add answer: %v", err)
 	}
-	if !p.Fix {
-		t.Errorf("работа правки без признака fix: %s", payload)
+
+	turn := interviewTurn{
+		Kind:      "bug",
+		Filled:    []keyValue{{Key: "case", Value: "заказ 4821"}},
+		Gaps:      []string{"expected", "actual"},
+		Questions: []Question{{Key: "expected", Text: "что ожидали?"}},
+	}
+	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 2, false, version)
+	if err != nil {
+		t.Fatalf("save turn: %v", err)
+	}
+	if saved {
+		t.Error("ход, устаревший на ответе автора, записан в базу")
+	}
+	if got := reload(t, cases, cs.ID).Round; got != 1 {
+		t.Errorf("раунд сдвинут устаревшим ходом: %d, ожидался 1", got)
+	}
+}
+
+// TestRoundLimitGoesToSummary: исчерпав раунды, ход не спрашивает больше ничего,
+// а собирает саммари с тем, что есть. Недобранный контракт даёт тикет с
+// пробелами, а не отказ.
+func TestRoundLimitGoesToSummary(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	i := newTestInterview(t, cases, 3)
+	cs := startInterview(t, cases, 6007, 3)
+
+	version, err := cases.turnsCount(ctx, pool, cs.ID)
+	if err != nil {
+		t.Fatalf("turns count: %v", err)
+	}
+	turn := interviewTurn{
+		Kind:      "bug",
+		Filled:    []keyValue{{Key: "case", Value: "заказ 4821"}},
+		Gaps:      []string{"expected", "actual"},
+		Questions: []Question{{Key: "expected", Text: "что ожидали?"}},
+	}
+	// Предел исчерпан (round=3 при пределе 3), поэтому ход идёт в саммари, а не
+	// задаёт четвёртый раунд.
+	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 3, true, version)
+	if err != nil {
+		t.Fatalf("save turn: %v", err)
+	}
+	if !saved {
+		t.Fatal("ход не записан")
+	}
+
+	if n := countJobs(t, pool, JobSummarize, cs.ID); n != 1 {
+		t.Errorf("работ саммари: %d, ожидалась 1", n)
+	}
+	if n := countJobs(t, pool, JobNotify, cs.ID); n != 0 {
+		t.Errorf("на пределе раундов автору ушли вопросы: уведомлений %d", n)
+	}
+	if got := reload(t, cases, cs.ID); len(got.Gaps) != 2 {
+		t.Errorf("пробелы не сохранены: %v", got.Gaps)
 	}
 }
 
