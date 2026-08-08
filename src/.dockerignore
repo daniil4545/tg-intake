@@ -1,0 +1,9 @@
+# .env с боевым токеном не должен попадать даже в слой builder-стадии:
+# .gitignore docker-контекст не закрывает.
+.env
+.env.*
+!.env.example
+
+docker-compose.yml
+Makefile
+*_test.go
