@@ -50,26 +50,29 @@ var baseLabels = []struct{ Name, Color, Desc string }{
 
 const authorLabelColor = "ededed"
 
-// CheckAccess - видит ли токен Issues проекта. Fine-grained PAT выдаётся на
-// конкретные репозитории, поэтому право на второй проект не следует из права на
-// первый, и проверять надо каждый.
+// PrepareProject заводит метки проекта. Он же и есть проверка доступа: метка
+// создаётся записью, поэтому отказ в правах виден сразу, а не после того, как
+// автор потратил пять минут на интервью.
 //
-// Смотрим именно Issues, а не сам репозиторий: доступ к репозиторию есть и у
-// токена, которому Issues не выданы вовсе. Права на запись эта проверка всё
-// равно не доказывает - её даёт только первый созданный тикет.
-func (g *GitHub) CheckAccess(ctx context.Context, p Project) error {
-	path := fmt.Sprintf("/repos/%s/%s/issues?per_page=1", p.Owner, p.Repo)
-	_, err := g.call(ctx, http.MethodGet, path, nil)
-	return err
+// Чтение репозитория для этого не годится вовсе: публичный репозиторий читает
+// кто угодно, и токен без права на Issues проходил бы такую проверку насквозь.
+//
+// Fine-grained PAT выдаётся на конкретные репозитории, поэтому право на второй
+// проект не следует из права на первый - проверять надо каждый.
+func (g *GitHub) PrepareProject(ctx context.Context, p Project) error {
+	for _, l := range baseLabels {
+		if err := g.createLabel(ctx, p, l.Name, l.Color, l.Desc); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // EnsureLabels заводит недостающие метки проекта. Автосоздание метки при
 // создании issue документацией не обещано, поэтому шаг явный.
 func (g *GitHub) EnsureLabels(ctx context.Context, p Project) error {
-	for _, l := range baseLabels {
-		if err := g.createLabel(ctx, p, l.Name, l.Color, l.Desc); err != nil {
-			return err
-		}
+	if err := g.PrepareProject(ctx, p); err != nil {
+		return err
 	}
 	g.log.Info("labels_created", "project", p.Slug, "labels", len(baseLabels))
 	return nil
@@ -210,7 +213,14 @@ func (g *GitHub) send(ctx context.Context, method, path string, body []byte) (js
 	if resp.StatusCode >= 300 {
 		retry := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 ||
 			(resp.StatusCode == http.StatusForbidden && resp.Header.Get("Retry-After") != "")
-		return nil, retry, &githubError{status: resp.StatusCode, message: githubMessage(raw)}
+		message := githubMessage(raw)
+		// GitHub называет недостающее право заголовком. Без него «Resource not
+		// accessible» не отличает «прав нет» от «токен не выдан на этот
+		// репозиторий», и разбор упирается в догадки.
+		if need := resp.Header.Get("X-Accepted-GitHub-Permissions"); need != "" {
+			message += " (нужно: " + need + ")"
+		}
+		return nil, retry, &githubError{status: resp.StatusCode, message: message}
 	}
 	return raw, false, nil
 }

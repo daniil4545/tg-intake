@@ -134,10 +134,13 @@ func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
 	}
 }
 
-// checkGitHub проверяет токен по каждому активному проекту: fine-grained PAT
-// выдаётся на конкретные репозитории, и право на второй проект не следует из
-// права на первый. Отказ по одному проекту не мешает остальным работать,
-// поэтому это предупреждение, а не падение старта.
+// checkGitHub заводит метки каждого активного проекта, и этим же проверяет
+// право писать: метка создаётся записью. Чтение репозитория ничего не доказало
+// бы - публичный репозиторий читает кто угодно.
+//
+// Отказ по одному проекту не мешает остальным работать, поэтому это
+// предупреждение, а не падение старта. Успех снимает bootstrap с горячего пути:
+// первый тикет проекта не тратит запросы на существующие метки.
 func checkGitHub(ctx context.Context, pool *pgxpool.Pool, github *app.GitHub, log *slog.Logger) {
 	projects, err := app.ListProjects(ctx, pool)
 	if err != nil {
@@ -145,11 +148,16 @@ func checkGitHub(ctx context.Context, pool *pgxpool.Pool, github *app.GitHub, lo
 		return
 	}
 	for _, p := range projects {
-		if err := github.CheckAccess(ctx, p); err != nil {
-			log.Warn("github_access_denied", "project", p.Slug, "error", err)
+		if err := github.PrepareProject(ctx, p); err != nil {
+			log.Warn("github_write_denied", "project", p.Slug, "repo", p.Owner+"/"+p.Repo, "error", err)
 			continue
 		}
-		log.Info("github_access_ok", "project", p.Slug)
+		if !p.LabelsReady {
+			if err := app.MarkLabelsReady(ctx, pool, p.ID); err != nil {
+				log.Error("labels_ready_failed", "project", p.Slug, "error", err)
+			}
+		}
+		log.Info("github_write_ok", "project", p.Slug)
 	}
 }
 
