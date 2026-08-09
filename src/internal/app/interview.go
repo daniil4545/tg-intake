@@ -31,6 +31,7 @@ var (
 	ErrNotInterview = errors.New("case is not in interview")
 	ErrStaleRound   = errors.New("round is not current")
 	ErrNoSummary    = errors.New("case has no summary to confirm")
+	ErrNoSuggestion = errors.New("round has no suggestions to accept")
 )
 
 // Interview - шаги разговора: добивание контракта раундами вопросов и сборка
@@ -239,10 +240,7 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	if !toSummary {
 		round++
 	}
-	filled := make(map[string]string, len(turn.Filled))
-	for _, kv := range turn.Filled {
-		filled[kv.Key] = strings.TrimSpace(kv.Value)
-	}
+	filled := i.mergeFilled(cs.Filled, turn)
 
 	saved, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
 	if err != nil {
@@ -342,7 +340,7 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 		var turn interviewTurn
 		if err := json.Unmarshal(raw, &turn); err != nil {
 			lastErr = fmt.Errorf("decode turn: %w", err)
-		} else if err := i.checkTurn(turn); err != nil {
+		} else if err := i.checkTurn(cs.Filled, turn); err != nil {
 			lastErr = err
 		} else {
 			return turn, nil
@@ -353,10 +351,31 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 	return interviewTurn{}, fmt.Errorf("interview turn of case %s: %w", cs.ID, lastErr)
 }
 
+// mergeFilled - состояние контракта после хода: накопленное прошлыми раундами
+// плюс свежее. Ключ в gaps переоткрывает пункт, смена типа обращения снимает
+// ключи чужого контракта.
+func (i *Interview) mergeFilled(prior map[string]string, turn interviewTurn) map[string]string {
+	filled := make(map[string]string, len(prior)+len(turn.Filled))
+	for key, value := range prior {
+		if i.rules.Title(turn.Kind, key) != "" {
+			filled[key] = value
+		}
+	}
+	for _, kv := range turn.Filled {
+		filled[kv.Key] = strings.TrimSpace(kv.Value)
+	}
+	for _, key := range turn.Gaps {
+		delete(filled, key)
+	}
+	return filled
+}
+
 // checkTurn - проверки недоверенного вывода модели. Схема гарантирует форму, а
 // смысл проверяет Go: ключи вне контракта, вопрос про закрытый пункт и
 // готовность при незакрытых обязательных пунктах прошли бы схему насквозь.
-func (i *Interview) checkTurn(turn interviewTurn) error {
+// Обязательность считается по слитому состоянию: контракт копится, и пункт,
+// закрытый прошлым раундом, модель повторять не обязана.
+func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error {
 	items := i.rules.Items(turn.Kind)
 	if len(items) == 0 {
 		return fmt.Errorf("unknown case kind %q", turn.Kind)
@@ -365,12 +384,10 @@ func (i *Interview) checkTurn(turn interviewTurn) error {
 		return fmt.Errorf("turn has %d questions", len(turn.Questions))
 	}
 
-	filled := make(map[string]string, len(turn.Filled))
 	for _, kv := range turn.Filled {
 		if i.rules.Title(turn.Kind, kv.Key) == "" {
 			return fmt.Errorf("filled key %q is not in contract", kv.Key)
 		}
-		filled[kv.Key] = kv.Value
 	}
 	for _, key := range turn.Gaps {
 		if i.rules.Title(turn.Kind, key) == "" {
@@ -394,7 +411,7 @@ func (i *Interview) checkTurn(turn interviewTurn) error {
 	}
 	// Обязательный пункт, не закрытый и не названный пробелом, ушёл бы в тикет
 	// молчанием. Признаваться в непрочитанном модель обязана.
-	for _, key := range i.rules.Missing(turn.Kind, filled) {
+	for _, key := range i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn)) {
 		if !slices.Contains(turn.Gaps, key) {
 			return fmt.Errorf("required key %q is neither filled nor in gaps", key)
 		}
@@ -736,9 +753,19 @@ func (c *Cases) AcceptRound(ctx context.Context, cs *Case, round int) error {
 		return ErrStaleRound
 	}
 
+	// Вопрос без догадки кнопка не закрывает: пустая строка стала бы
+	// подтверждённым ответом, которого автор не видел. Такой пункт остаётся
+	// открытым, и модель спросит его снова.
 	var b strings.Builder
 	for _, q := range questions {
-		fmt.Fprintf(&b, "%s: %s\n", q.Text, q.Suggested)
+		suggested := strings.TrimSpace(q.Suggested)
+		if suggested == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "%s: %s\n", q.Text, suggested)
+	}
+	if b.Len() == 0 {
+		return ErrNoSuggestion
 	}
 	return c.AddAnswer(ctx, cs, b.String())
 }
@@ -889,7 +916,7 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 func roundMessage(questions []Question) string {
 	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) +
 		"\n\nОтветьте своими словами - текстом или голосовым. Если предположения верны, " +
-		"нажмите «Всё так»."
+		"нажмите «Всё так». Передумали заводить тикет - /cancel."
 }
 
 func questionList(questions []Question) string {
