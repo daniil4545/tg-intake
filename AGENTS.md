@@ -61,7 +61,8 @@
 
 ```text
 intake/
-├── docs/              # prd.md, architecture.md, state.md, backlog.md, plans/
+├── docs/              # prd.md, architecture.md, contracts.md, state.md,
+│                      # backlog.md, plans/, acceptance/
 ├── deploy/            # инфраструктура, dev compose, release
 └── src/
     ├── cmd/intake/
