@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -14,6 +15,12 @@ import (
 // readmeLimit - сколько текста README уходит в модель. Дальше начинается
 // установка и лицензия, а токены платные.
 const readmeLimit = 8000
+
+// askTimeout - бюджет хода модели. Команда идёт синхронно, и апдейты всех
+// авторов ждут её в очереди: полный бюджет клиента с повторами держал бы бота
+// до двух минут. Отказ по таймауту не роняет команду - сработает фолбэк на
+// поля репозитория.
+const askTimeout = 20 * time.Second
 
 var (
 	// ErrBadProjectRef - в команде нет разбираемой ссылки на репозиторий.
@@ -55,6 +62,11 @@ func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectC
 	repo, err := p.gh.GetRepo(ctx, ref.Owner, ref.Repo)
 	if err != nil {
 		return ProjectConfig{}, "", err
+	}
+	// GitHub принимает owner/repo в любом регистре, у нас же это и ключ поиска,
+	// и строка карточки: берём каноническое написание из ответа API.
+	if owner, name, ok := strings.Cut(repo.FullName, "/"); ok && owner != "" && name != "" {
+		ref.Owner, ref.Repo = owner, name
 	}
 
 	source := "автор"
@@ -109,9 +121,13 @@ func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectC
 // одной командой можно было бы перенацелить чужой проект, а обращения остались
 // бы привязаны к нему по project_id.
 func (p *Projects) slugFor(ctx context.Context, ref projectRef) (string, error) {
+	// Регистр не различается: GitHub считает Owner/Repo и owner/repo одним
+	// репозиторием, а точное сравнение давало бы ложный «занят» на строках,
+	// заведённых до канонизации написания.
 	var existing string
 	err := p.cases.pool.QueryRow(ctx, `
-		SELECT slug FROM projects WHERE github_owner = $1 AND github_repo = $2`,
+		SELECT slug FROM projects
+		WHERE LOWER(github_owner) = LOWER($1) AND LOWER(github_repo) = LOWER($2)`,
 		ref.Owner, ref.Repo).Scan(&existing)
 	if err == nil {
 		return existing, nil
@@ -170,6 +186,9 @@ var projectSchema = json.RawMessage(`{
 }`)
 
 func (p *Projects) ask(ctx context.Context, repo Repo, readme string) (projectGuess, error) {
+	ctx, cancel := context.WithTimeout(ctx, askTimeout)
+	defer cancel()
+
 	if len(readme) > readmeLimit {
 		readme = readme[:readmeLimit]
 	}

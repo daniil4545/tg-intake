@@ -461,6 +461,12 @@ func (b *Bot) onRestart(c tele.Context) error {
 		return err
 	}
 	if cs != nil {
+		// Гвардия та же, что у onContinue: кнопка живёт в переписке бессрочно,
+		// и после ухода обращения в разговор она стёрла бы собранные ответы
+		// молча.
+		if cs.Status != statusCollecting {
+			return b.sendState(c, cs)
+		}
 		if err := b.cases.CancelCase(ctx, cs, "restart"); err != nil {
 			if errors.Is(err, ErrPublishing) {
 				return c.Send("Прошлое обращение уже уходит в GitHub. Заведём новое, как только придёт номер.")
@@ -645,6 +651,8 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		return c.Send("Это кнопка от прошлого вопроса. Ответьте на последний - текстом или голосовым.")
 	case errors.Is(err, ErrNotInterview):
 		return c.Send("Обращение уже ушло дальше.")
+	case errors.Is(err, ErrNoSuggestion):
+		return c.Send("Догадок у меня нет, подтверждать нечего. Ответьте, пожалуйста, текстом или голосовым.")
 	case err != nil:
 		return err
 	}
@@ -722,6 +730,12 @@ func (b *Bot) onDone(c tele.Context) error {
 	if cs == nil {
 		return c.Send("Сейчас нечего завершать. Отправьте /start или просто пришлите материал.")
 	}
+	// Слово «Готово» в разговоре - обычный ответ («статус заказа - Готово»), а
+	// не команда сбора: reply-кнопка маршрутизируется по точному тексту раньше
+	// OnText, и без этой развилки ответ автора пропадал бы молча.
+	if !isCommand(c) && inDialog(cs.Status) {
+		return b.onAnswer(ctx, c, cs)
+	}
 
 	switch err := b.cases.FinishCollect(ctx, cs); {
 	case errors.Is(err, ErrNoItems):
@@ -730,7 +744,9 @@ func (b *Bot) onDone(c tele.Context) error {
 		// Сырьё на месте, статус не менялся: не хватает только проекта.
 		return b.askProject(ctx, c, "Выберите проект, без него тикет некуда заводить.")
 	case errors.Is(err, ErrNotCollecting):
-		return c.Send("Сбор уже закрыт, разбираю материал.")
+		// Статусный ответ вместо «разбираю»: /done в нормализации и правда
+		// значит «идёт разбор», а в разговоре бот ждёт автора, а не наоборот.
+		return b.sendState(c, cs)
 	case err != nil:
 		return err
 	}
@@ -758,6 +774,12 @@ func (b *Bot) onCancel(c tele.Context) error {
 	if cs == nil {
 		return c.Send("Отменять нечего.", hideKeyboard())
 	}
+	// Слово «Отмена» в разговоре - ответ («статус заявки - Отмена»), а не
+	// желание всё бросить: цена ошибки несимметрична, отмена стирает обращение
+	// и файлы безвозвратно. Выход из разговора - /cancel и кнопка отмены.
+	if c.Callback() == nil && !isCommand(c) && inDialog(cs.Status) {
+		return b.onAnswer(ctx, c, cs)
+	}
 	if err := b.cases.CancelCase(ctx, cs, "user"); err != nil {
 		if errors.Is(err, ErrPublishing) {
 			// Работа publish уже в очереди: погасив обращение здесь, мы получили
@@ -767,6 +789,17 @@ func (b *Bot) onCancel(c tele.Context) error {
 		return err
 	}
 	return c.Send("Обращение отменено, файлы удалены.", hideKeyboard())
+}
+
+// isCommand отличает набранную команду от текста reply-кнопки: у них общий
+// хендлер, а смысл разный.
+func isCommand(c tele.Context) bool {
+	return strings.HasPrefix(strings.TrimSpace(c.Text()), "/")
+}
+
+// inDialog - статусы, в которых любой текст автора считается ответом.
+func inDialog(status string) bool {
+	return status == statusInterview || status == statusSummary
 }
 
 // collectKeyboard - кнопки сбора. Reply-клавиатура, а не инлайн: её видно
@@ -1007,7 +1040,7 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 		return c.Send(projectHelp)
 	case errors.Is(err, ErrSlugTaken):
 		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
-			"Выключите старый или заведите репозиторий под другим именем.")
+			"Напишите владельцу сервиса - выключить проект из бота пока можно только через базу.")
 	case err != nil:
 		b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
 		return c.Send(projectFailText(err))

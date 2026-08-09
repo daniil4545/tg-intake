@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"strings"
 	"testing"
 
@@ -69,14 +70,26 @@ func TestCheckTurn(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		turn interviewTurn
-		ok   bool
+		name  string
+		prior map[string]string
+		turn  interviewTurn
+		ok    bool
 	}{
 		{
 			name: "готовый ход",
 			turn: interviewTurn{Kind: "bug", Filled: full, Ready: true},
 			ok:   true,
+		},
+		{
+			name:  "обязательный пункт закрыт прошлым раундом",
+			prior: map[string]string{"case": "заказ 4821"},
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[1:],
+				Gaps:      []string{"where"},
+				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
+			},
+			ok: true,
 		},
 		{
 			name: "четыре вопроса",
@@ -127,7 +140,7 @@ func TestCheckTurn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := i.checkTurn(tt.turn)
+			err := i.checkTurn(tt.prior, tt.turn)
 			if tt.ok && err != nil {
 				t.Errorf("ход отклонён: %v", err)
 			}
@@ -135,6 +148,30 @@ func TestCheckTurn(t *testing.T) {
 				t.Error("ход принят, ожидался отказ")
 			}
 		})
+	}
+}
+
+// TestMergeFilled: контракт копится между раундами. Пункт, не повторённый
+// моделью, не пропадает; ключ в gaps переоткрывает пункт; ключ вне контракта
+// текущего типа снимается.
+func TestMergeFilled(t *testing.T) {
+	i := newTestInterview(t, nil, 3)
+
+	prior := map[string]string{
+		"case":     "заказ 4821",
+		"expected": "статус меняется",
+		"чужой":    "ключ другого типа",
+	}
+	turn := interviewTurn{
+		Kind:   "bug",
+		Filled: []keyValue{{Key: "actual", Value: " статус прежний "}},
+		Gaps:   []string{"expected"},
+	}
+
+	got := i.mergeFilled(prior, turn)
+	want := map[string]string{"case": "заказ 4821", "actual": "статус прежний"}
+	if !maps.Equal(got, want) {
+		t.Errorf("слито %v, ожидалось %v", got, want)
 	}
 }
 

@@ -108,7 +108,21 @@ func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
 	for i := range tickets {
 		names, ok := labels[tickets[i].Number]
 		if !ok {
-			continue
+			// Тикет старше окна сканирования: сотню последних номеров в живом
+			// репозитории занимают и pull request'ы, вытеснить оттуда тикет
+			// проще, чем кажется. Добираем поштучно - в списке их не больше
+			// десяти. Первый отказ останавливает добор: GitHub деградировал, и
+			// долбить его из синхронного хендлера значит морозить бота.
+			issue, err := t.gh.GetIssue(ctx, project, tickets[i].Number, true)
+			if err != nil {
+				if isNotFound(err) {
+					continue
+				}
+				t.log.Warn("issue_unavailable", "project", project.Slug,
+					"issue", tickets[i].Number, "error", err)
+				break
+			}
+			names = issue.LabelNames()
 		}
 		t.noteUnknown(project, tickets[i].Number, names)
 		if status, ok := t.statuses.Pick(names); ok {
@@ -228,7 +242,12 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 	issue, err := t.gh.GetIssue(ctx, project, cs.IssueNumber, false)
 	if err != nil {
 		if isNotFound(err) {
-			return nil
+			// Автору обещано «сообщу, когда закроется»: молчание про пропавший
+			// issue читалось бы как зависший бот.
+			return t.cases.inTx(ctx, func(tx pgx.Tx) error {
+				return putNotifyKey(ctx, tx, cs.ID, "cancel-gone",
+					fmt.Sprintf("Тикета #%d уже нет в GitHub, отменять нечего.", cs.IssueNumber), "")
+			})
 		}
 		return err
 	}
