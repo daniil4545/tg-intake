@@ -834,10 +834,10 @@ func (c *Cases) RemindDrafts(ctx context.Context) error {
 func remindText(status string) string {
 	if status == statusCollecting {
 		return "Обращение ждёт вас сутки. Пришлите остальное и нажмите «Готово» " +
-			"либо отмените его командой /cancel. Вложения уже удалены, текст на месте."
+			"либо нажмите «Сброс». Вложения уже удалены, текст на месте."
 	}
 	return "Обращение ждёт вашего ответа сутки. Ответьте, и я доведу его до тикета, " +
-		"либо отмените командой /cancel. Вложения уже удалены, разбор на месте."
+		"либо нажмите «Сброс». Вложения уже удалены, разбор на месте."
 }
 
 type casePayload struct {
@@ -861,7 +861,8 @@ type notifyPayload struct {
 // Наборы кнопок под сообщением из очереди.
 const (
 	keysRound   = "round"   // «Всё так» на раунд вопросов
-	keysSummary = "summary" // «Публикую», «Поправить», «Отмена»
+	keysSummary = "summary" // «Публикую», «Поправить»
+	keysHome    = "home"    // панель «Меню | Сброс»: обращение доиграно
 )
 
 // HandleFailedJob - исход работы, исчерпавшей повторы. Воркер зовёт её через
@@ -918,18 +919,19 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			// Обращение остаётся живым: следующий ответ автора поставит новую
 			// работу, и разговор продолжится с того же места.
 			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог разобрать обращение. Напишите ещё раз своими словами - или отмените командой /cancel."); err != nil {
+				"Не смог разобрать обращение. Напишите ещё раз своими словами - или нажмите «Сброс»."); err != nil {
 				return err
 			}
 		case JobPublish:
-			// Возврат в summary возвращает и кнопку «Публикую»: тикет не создан,
-			// и повторить должен автор, а не бесконечные повторы очереди.
+			// Возврат в summary возвращает и кнопку «Публикую» тем же сообщением:
+			// тикет не создан, и повторить должен автор, а не повторы очереди.
 			if _, err := tx.Exec(ctx, `
 				UPDATE cases SET status = 'summary', updated_at = now()
 				WHERE id = $1 AND status = 'publishing'`, p.CaseID); err != nil {
 				return fmt.Errorf("return case %s to summary: %w", p.CaseID, err)
 			}
-			if err := putNotify(ctx, tx, p.CaseID, job.ID, publishFailedText(cause)); err != nil {
+			if err := putNotifyKey(ctx, tx, p.CaseID, strconv.FormatInt(job.ID, 10),
+				publishFailedText(cause), keysSummary); err != nil {
 				return err
 			}
 		case JobCancelIssue:
@@ -968,6 +970,17 @@ func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
 		return false, fmt.Errorf("reopen case %s: %w", caseID, err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// HasMaterial - есть ли в обращении хоть один элемент сырья. Пустой сбор
+// сбрасывается без подтверждения: терять нечего.
+func (c *Cases) HasMaterial(ctx context.Context, caseID string) (bool, error) {
+	var n int
+	if err := c.pool.QueryRow(ctx,
+		`SELECT count(*) FROM case_items WHERE case_id = $1`, caseID).Scan(&n); err != nil {
+		return false, fmt.Errorf("count items of case %s: %w", caseID, err)
+	}
+	return n > 0, nil
 }
 
 // putNotify ставит сообщение автору. Ключ по идентификатору работы: её повтор

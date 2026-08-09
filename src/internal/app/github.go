@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -522,7 +523,10 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		}); err != nil {
 			return err
 		}
-		return putNotify(ctx, tx, cs.ID, job.ID, publishedMessage(number, url, cs.Incomplete))
+		// Панель возвращается в исходное состояние тем же сообщением: обращение
+		// доиграно, «Готово» больше не по чему нажимать.
+		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
+			publishedMessage(number, url, cs.Incomplete), keysHome)
 	})
 	if err != nil {
 		return err
