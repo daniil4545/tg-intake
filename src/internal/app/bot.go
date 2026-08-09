@@ -34,6 +34,11 @@ const (
 	// перебирает, а отказ Telegram отправил бы работу notify в повторы, и автор
 	// не увидел бы результат вовсе.
 	maxMessage = 4000
+	// Пачка пересылок без активного обращения приходит за секунды; меню в
+	// ответ на неё должно быть одно, а не по числу сообщений.
+	menuRepeat = 10 * time.Second
+	// Сколько живёт обещание «пришлю ссылку» после «Добавить проект».
+	linkWait = 10 * time.Minute
 )
 
 // Инлайн-кнопки: telebot маршрутизирует callback по Unique и кодирует кнопку
@@ -41,19 +46,21 @@ const (
 // поймается. Кнопки сбора - reply-клавиатура, они маршрутизируются по тексту,
 // поэтому один и тот же Btn идёт и в Handle, и в клавиатуру.
 var (
-	projectBtn  = &tele.Btn{Unique: "project"}
-	createBtn   = &tele.Btn{Unique: "create"}
-	continueBtn = &tele.Btn{Unique: "continue"}
-	restartBtn  = &tele.Btn{Unique: "restart"}
-	allTrueBtn  = &tele.Btn{Unique: "all_true"}
-	publishBtn  = &tele.Btn{Unique: "publish"}
-	fixBtn      = &tele.Btn{Unique: "fix"}
-	dropBtn     = &tele.Btn{Unique: "drop"}
-	ticketsBtn  = &tele.Btn{Unique: "tickets"}
-	cardBtn     = &tele.Btn{Unique: "card"}
-	killBtn     = &tele.Btn{Unique: "kill"}
-	doneBtn     = &tele.Btn{Text: "Готово"}
-	cancelBtn   = &tele.Btn{Text: "Отмена"}
+	projectBtn    = &tele.Btn{Unique: "project"}
+	createBtn     = &tele.Btn{Unique: "create"}
+	continueBtn   = &tele.Btn{Unique: "continue"}
+	allTrueBtn    = &tele.Btn{Unique: "all_true"}
+	publishBtn    = &tele.Btn{Unique: "publish"}
+	fixBtn        = &tele.Btn{Unique: "fix"}
+	ticketsBtn    = &tele.Btn{Unique: "tickets"}
+	cardBtn       = &tele.Btn{Unique: "card"}
+	killBtn       = &tele.Btn{Unique: "kill"}
+	addProjectBtn = &tele.Btn{Unique: "add_project"}
+	resetYesBtn   = &tele.Btn{Unique: "reset_yes"}
+	resetNoBtn    = &tele.Btn{Unique: "reset_no"}
+	doneBtn       = &tele.Btn{Text: "Готово"}
+	menuBtn       = &tele.Btn{Text: "Меню"}
+	resetBtn      = &tele.Btn{Text: "Сброс"}
 )
 
 type Bot struct {
@@ -65,11 +72,20 @@ type Bot struct {
 	log      *slog.Logger
 	allowed  []int64
 	maxItems int
+	// Когда автору в последний раз отвечали меню на свободное сообщение.
+	// Хендлеры идут последовательно (Synchronous), мьютекс не нужен; потеря
+	// при рестарте безвредна - автор получит меню лишний раз.
+	menuAt map[int64]time.Time
+	// Ожидание ссылки после «Добавить проект»: следующий текст автора - ссылка
+	// на репозиторий. Та же дисциплина, что и menuAt: последовательные хендлеры,
+	// потеря при рестарте безвредна - автор нажмёт кнопку снова.
+	awaitLink map[int64]time.Time
 }
 
 func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, projects *Projects, log *slog.Logger) (*Bot, error) {
 	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
-		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems}
+		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
+		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{}}
 
 	// Verbose дампит сырые payload Bot API вместе с текстами сообщений, а
 	// стандартный OnError пишет через stdlib log мимо JSON.
@@ -95,7 +111,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Use(b.allow)
 	tb.Handle("/start", b.onStart)
 	tb.Handle("/done", b.onDone)
-	tb.Handle("/cancel", b.onCancel)
+	tb.Handle("/cancel", b.onReset)
 	tb.Handle("/tickets", b.onTicketList)
 	tb.Handle("/project", b.onProjectAdd)
 
@@ -105,13 +121,35 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(killBtn, b.onKill)
 	tb.Handle(createBtn, b.onCreate)
 	tb.Handle(continueBtn, b.onContinue)
-	tb.Handle(restartBtn, b.onRestart)
 	tb.Handle(allTrueBtn, b.onAllTrue)
 	tb.Handle(publishBtn, b.onPublish)
 	tb.Handle(fixBtn, b.onFix)
-	tb.Handle(dropBtn, b.onCancel)
+	tb.Handle(addProjectBtn, b.onAddProject)
+	tb.Handle(resetYesBtn, b.onResetYes)
+	tb.Handle(resetNoBtn, b.onResetNo)
 	tb.Handle(doneBtn, b.onDone)
-	tb.Handle(cancelBtn, b.onCancel)
+	tb.Handle(menuBtn, b.onMenu)
+	tb.Handle(resetBtn, b.onReset)
+
+	// Кнопки прежних версий («Отмена» под саммари, «Начать заново») хендлеров
+	// больше не имеют; без фолбэка их нажатие - вечный спиннер и вид зависшего
+	// бота. Сюда же падает любой незнакомый callback.
+	tb.Handle(tele.OnCallback, func(c tele.Context) error {
+		if err := c.Respond(); err != nil {
+			return err
+		}
+		return c.Send("Кнопка устарела. Нажмите «Меню» и продолжите оттуда.")
+	})
+
+	// Меню «/» в клиенте. Отказ не роняет старт: бот работает и без него.
+	if err := tb.SetCommands([]tele.Command{
+		{Text: "start", Description: "Меню"},
+		{Text: "tickets", Description: "Мои тикеты"},
+		{Text: "project", Description: "Добавить проект"},
+		{Text: "cancel", Description: "Сброс"},
+	}); err != nil {
+		log.Warn("set_commands_failed", "error", err)
+	}
 
 	tb.Handle(tele.OnText, b.onItem)
 	tb.Handle(tele.OnVoice, b.onItem)
@@ -204,6 +242,8 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 		opts = append(opts, roundKeyboard(cs.Round))
 	case p.Buttons == keysSummary:
 		opts = append(opts, summaryKeyboard())
+	case p.Buttons == keysHome:
+		opts = append(opts, homeKeyboard())
 	}
 	return b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...)
 }
@@ -255,8 +295,25 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 			b.log.Warn("access_denied", "user_id", sender.ID)
 			return refuse(c, "Доступ к боту закрыт. Напишите владельцу сервиса.")
 		}
+		// Ожидание ссылки после «Добавить проект» живёт до первого апдейта:
+		// скрытый режим не должен пережить смену темы. Слова панели пропускаются
+		// к своим хендлерам - нажатие «Меню» не должно разбираться как ссылка.
+		if since, ok := b.awaitLink[sender.ID]; ok {
+			delete(b.awaitLink, sender.ID)
+			text := strings.TrimSpace(c.Text())
+			if c.Callback() == nil && text != "" && !isCommand(c) && !panelWord(text) &&
+				time.Since(since) < linkWait {
+				return b.onProjectLink(c)
+			}
+		}
 		return next(c)
 	}
+}
+
+// panelWord - тексты reply-кнопок: они маршрутизируются по точному совпадению
+// и не могут быть ни ссылкой, ни сырьём вне сбора.
+func panelWord(text string) bool {
+	return text == doneBtn.Text || text == menuBtn.Text || text == resetBtn.Text
 }
 
 // refuse отвечает отказом и гасит спиннер, если отказ пришёл на нажатие
@@ -292,19 +349,43 @@ func (b *Bot) onStart(c tele.Context) error {
 		return err
 	}
 
-	// Активное обращение вне сбора занимает единственный слот автора, и меню
-	// проектов из него ведёт в тупик: выбор проекта упрётся в «сбор закрыт», а
-	// человек читает это как зависший бот. Говорим прямо, где он находится.
+	// Активное обращение занимает единственный слот автора, и начальный экран
+	// из него ведёт в тупик; вдобавок он сменил бы панель сбора на «Меню |
+	// Сброс», и «Готово» пропала бы с экрана. Говорим прямо, где автор стоит.
 	cs, err := b.cases.Active(ctx, senderID(c))
 	if err != nil {
 		return err
 	}
-	if cs != nil && cs.Status != statusCollecting {
+	if cs != nil {
 		return b.sendState(c, cs)
 	}
 
 	b.log.Info("start", "user_id", senderID(c))
-	return b.askProject(ctx, c, "Выберите проект.")
+	return b.homeScreen(ctx, c, "Я завожу тикеты по обращениям сотрудников.")
+}
+
+// homeScreen - начальная точка: панель управления и экран проектов. Единая для
+// /start, «Меню», «Сброса» без обращения и любого свободного сообщения.
+//
+// Два сообщения, потому что у Telegram reply-панель и инлайн-кнопки не живут в
+// одном: первое ставит панель, второе несёт экран проектов.
+func (b *Bot) homeScreen(ctx context.Context, c tele.Context, intro string) error {
+	if err := c.Send(intro, homeKeyboard()); err != nil {
+		return err
+	}
+
+	projects, err := ListProjects(ctx, b.pool)
+	if err != nil {
+		return err
+	}
+	markup := &tele.ReplyMarkup{}
+	rows := make([]tele.Row, 0, len(projects)+1)
+	for _, p := range projects {
+		rows = append(rows, markup.Row(markup.Data(p.Title, projectBtn.Unique, p.Slug)))
+	}
+	rows = append(rows, markup.Row(markup.Data("Добавить проект", addProjectBtn.Unique)))
+	markup.Inline(rows...)
+	return c.Send("Выберите проект или добавьте новый:", markup)
 }
 
 // askProject показывает меню проектов. Вопрос задаётся ровно один раз за
@@ -323,7 +404,9 @@ func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, bt
 	}
 	if len(projects) == 0 {
 		b.log.Warn("no_projects", "user_id", senderID(c))
-		return c.Send("Проекты ещё не заведены. Напишите владельцу сервиса.")
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(markup.Row(markup.Data("Добавить проект", addProjectBtn.Unique)))
+		return c.Send("Проекты ещё не заведены. Добавьте первый:", markup)
 	}
 
 	markup := &tele.ReplyMarkup{}
@@ -405,16 +488,16 @@ func (b *Bot) onCreate(c tele.Context) error {
 	}
 	if existed {
 		// Выбор «продолжить или заново» уместен только в сборе: из разбора
-		// продолжать нечего, там обращение двигает ответ автора.
+		// продолжать нечего, там обращение двигает ответ автора. «Начать
+		// заново» - это «Сброс» на панели плюс «Создать тикет», своей кнопки
+		// у него нет.
 		if cs.Status != statusCollecting {
 			return b.sendState(c, cs)
 		}
 		markup := &tele.ReplyMarkup{}
-		markup.Inline(markup.Row(
-			markup.Data("Продолжить", continueBtn.Unique, slug),
-			markup.Data("Начать заново", restartBtn.Unique, slug),
-		))
-		return c.Send("У вас уже есть незакрытое обращение.", markup)
+		markup.Inline(markup.Row(markup.Data("Продолжить", continueBtn.Unique, slug)))
+		return c.Send("У вас уже есть незакрытое обращение. Продолжайте его "+
+			"или нажмите «Сброс», чтобы начать заново.", markup)
 	}
 	return c.Send("Присылайте текст, голосовые и скриншоты. Когда закончите, нажмите «Готово».", collectKeyboard())
 }
@@ -448,45 +531,16 @@ func (b *Bot) onContinue(c tele.Context) error {
 	return c.Send("Продолжаем. Присылайте материал и нажмите «Готово».", collectKeyboard())
 }
 
-func (b *Bot) onRestart(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
-	defer cancel()
-
-	cs, err := b.cases.Active(ctx, senderID(c))
-	if err != nil {
-		return err
-	}
-	if cs != nil {
-		// Гвардия та же, что у onContinue: кнопка живёт в переписке бессрочно,
-		// и после ухода обращения в разговор она стёрла бы собранные ответы
-		// молча.
-		if cs.Status != statusCollecting {
-			return b.sendState(c, cs)
-		}
-		if err := b.cases.CancelCase(ctx, cs, "restart"); err != nil {
-			if errors.Is(err, ErrPublishing) {
-				return c.Send("Прошлое обращение уже уходит в GitHub. Заведём новое, как только придёт номер.")
-			}
-			return err
-		}
-	}
-	if _, _, err := b.cases.StartCase(ctx, author(c), c.Data()); err != nil {
-		return err
-	}
-	return c.Send("Начали заново. Присылайте материал и нажмите «Готово».", collectKeyboard())
-}
-
 // onItem принимает любое сообщение автора. Куда оно пойдёт, решает состояние
 // обращения, а не то, какой экран автор видел последним: сырьё в сборе, ответ в
 // разговоре. Без этой развилки ответ на вопрос интервью упирался бы в «сбор
 // закрыт» и диалог не работал бы вовсе.
 //
-// Активного обращения нет - оно заводится тут же, сырьё не теряется: человек
-// начинает с материала, а не с репозитория.
+// Сообщение без активного обращения ничего не заводит и не сохраняется: бот
+// отвечает меню. Решение владельца 2026-08-09, отменяет автозаведение от
+// 2026-08-08: управление кнопками, открытый текст - только содержимое
+// обращения. Случайная ссылка заводила обращение, а следующая реплика молча
+// становилась его сырьём.
 func (b *Bot) onItem(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -495,27 +549,28 @@ func (b *Bot) onItem(c tele.Context) error {
 	if err != nil {
 		return err
 	}
-	if cs != nil {
-		switch cs.Status {
-		case statusInterview, statusSummary:
-			return b.onAnswer(ctx, c, cs)
-		case statusNormalizing, statusPublishing:
-			return b.sendState(c, cs)
-		}
-	}
 	if cs == nil {
-		cs, _, err = b.cases.StartCase(ctx, author(c), "")
-		if err != nil {
-			return err
+		// Одно меню на пачку: пересылка десяти сообщений дала бы десять меню
+		// подряд. Апдейты идут последовательно, карта без мьютекса.
+		if time.Since(b.menuAt[senderID(c)]) < menuRepeat {
+			return nil
 		}
-		// Кнопки сбора видны с самого начала: меню проекта несёт собственную
-		// разметку, а клавиатура «Готово»/«Отмена» - reply, и в одно сообщение
-		// с ним не помещается.
-		if err := c.Send("Собираю новое обращение. Когда закончите, нажмите «Готово».", collectKeyboard()); err != nil {
-			return err
-		}
+		b.menuAt[senderID(c)] = time.Now()
+		return b.homeScreen(ctx, c, "Это сообщение я не сохраняю: сбор начинается кнопкой. "+
+			"Выберите проект, нажмите «Создать тикет» и пришлите материал ещё раз.")
 	}
+	switch cs.Status {
+	case statusInterview, statusSummary:
+		return b.onAnswer(ctx, c, cs)
+	case statusNormalizing, statusPublishing:
+		return b.sendState(c, cs)
+	}
+	return b.collect(ctx, c, cs)
+}
 
+// collect кладёт сообщение сырьём в обращение. Отдельно от onItem, потому что
+// сырьём приходит и слово «Меню» из своего хендлера.
+func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	askProject, err := b.cases.CollectItem(ctx, b.bot, cs, c.Message())
 	reply, internal := itemReply(err, b.maxItems)
 	if reply != "" {
@@ -561,24 +616,20 @@ func itemReply(err error, maxItems int) (text string, internal bool) {
 // sendState объясняет автору, где стоит его обращение и чем оно двигается
 // дальше. Один ответ на все входы, где человек упирается в занятый слот:
 // активное обращение у автора одно, и без объяснения тупик читается как
-// зависший бот.
-//
-// Кнопка сброса идёт тем же сообщением: команду /cancel в переписке ещё надо
-// вспомнить, а выход нужен ровно в тот момент, когда человек уткнулся.
+// зависший бот. Выход - «Сброс» на панели, своя кнопка тут не нужна.
 func (b *Bot) sendState(c tele.Context, cs *Case) error {
-	// Из публикации выхода нет: работа уже в очереди, и отмена разошлась бы с
-	// ответом GitHub.
-	if cs.Status == statusPublishing {
-		return c.Send(stateReply(cs.Status))
+	// В сборе ответ заодно чинит панель: /start успел бы заменить её на
+	// «Меню | Сброс», и «Готово» пропала бы с экрана.
+	if cs.Status == statusCollecting {
+		return c.Send(stateReply(cs.Status), collectKeyboard())
 	}
-
-	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("Отменить обращение", dropBtn.Unique)))
-	return c.Send(stateReply(cs.Status), markup)
+	return c.Send(stateReply(cs.Status))
 }
 
 func stateReply(status string) string {
 	switch status {
+	case statusCollecting:
+		return "Идёт сбор обращения. Присылайте материал и нажмите «Готово»."
 	case statusInterview:
 		return "У вас идёт разбор обращения. Ответьте на последний вопрос - текстом " +
 			"или голосовым. Если вопросов не видно, напишите, что хотели добавить, " +
@@ -697,12 +748,15 @@ func (b *Bot) onPublish(c tele.Context) error {
 
 	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
 		if errors.Is(err, ErrNoSummary) {
-			// Кнопка осталась в чате, а обращение ушло дальше: либо публикация
-			// уже идёт, либо автор прислал правку и саммари переписывается.
-			if cs.Status == statusInterview {
+			// Кнопка осталась в чате, а обращение ушло дальше - или это уже
+			// другое обращение того же автора: слот один, кнопка вечная.
+			switch cs.Status {
+			case statusInterview:
 				return c.Send("Переписываю саммари с вашей правкой. Покажу заново - тогда и опубликуем.")
+			case statusPublishing:
+				return c.Send("Уже публикую. Пришлю номер, как только тикет заведётся.")
 			}
-			return c.Send("Уже публикую. Пришлю номер, как только тикет заведётся.")
+			return b.sendState(c, cs)
 		}
 		return err
 	}
@@ -712,9 +766,27 @@ func (b *Bot) onPublish(c tele.Context) error {
 // onFix - «Поправить». Состояние не меняет: правкой становится следующее
 // сообщение автора, и обрабатывает его тот же onAnswer. Отдельное состояние
 // «ждём замечание» дало бы восьмой статус ради одной подсказки.
+//
+// Гвардия обязательна: кнопка живёт в переписке дольше обращения, и без неё
+// приглашение «напишите правку» отправило бы следующий текст автора в сырьё
+// нового обращения или в пустоту.
 func (b *Bot) onFix(c tele.Context) error {
 	if err := c.Respond(); err != nil {
 		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return c.Send("Обращение уже закрыто. Нажмите «Меню» и начните новое.")
+	}
+	if !inDialog(cs.Status) {
+		return b.sendState(c, cs)
 	}
 	return c.Send("Что поправить? Напишите или наговорите - перепишу и покажу снова.")
 }
@@ -728,7 +800,7 @@ func (b *Bot) onDone(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Сейчас нечего завершать. Отправьте /start или просто пришлите материал.")
+		return c.Send("Сейчас нечего завершать. Нажмите «Меню» и начните с проекта.")
 	}
 	// Слово «Готово» в разговоре - обычный ответ («статус заказа - Готово»), а
 	// не команда сбора: reply-кнопка маршрутизируется по точному тексту раньше
@@ -750,18 +822,74 @@ func (b *Bot) onDone(c tele.Context) error {
 	case err != nil:
 		return err
 	}
-	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", hideKeyboard())
+	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", homeKeyboard())
 }
 
-// onCancel - «Отмена» из клавиатуры сбора, кнопка под саммари и /cancel: один
-// путь на все три входа.
-func (b *Bot) onCancel(c tele.Context) error {
-	// Отмена приходит и кнопкой под саммари: без Respond она крутится до
-	// таймаута Telegram.
-	if c.Callback() != nil {
-		if err := c.Respond(); err != nil {
-			return err
-		}
+// onMenu - «Меню» с панели: показать начало или объяснить, где автор стоит.
+// В сборе слово уходит сырьём: на панели сбора кнопки «Меню» нет, значит это
+// текст материала, и красть его нельзя.
+func (b *Bot) onMenu(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return b.homeScreen(ctx, c, "Начнём.")
+	}
+	if cs.Status == statusCollecting {
+		return b.collect(ctx, c, cs)
+	}
+	return b.sendState(c, cs)
+}
+
+// onReset - глобальный «Сброс» и /cancel: отменить активное обращение и
+// вернуть в начало. Обращение с материалом переспрашивает: reply-кнопка
+// нажимается одним касанием, а сброс стирает обращение с файлами безвозвратно.
+func (b *Bot) onReset(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return b.homeScreen(ctx, c, "Сбрасывать нечего.")
+	}
+	if cs.Status == statusPublishing {
+		// Работа publish уже в очереди: погасив обращение здесь, мы получили
+		// бы issue по отменённому.
+		return c.Send("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
+	}
+
+	material, err := b.cases.HasMaterial(ctx, cs.ID)
+	if err != nil {
+		return err
+	}
+	if material {
+		// Подтверждение привязано к обращению: кнопка живёт в переписке дольше,
+		// чем слот, и без привязки отменяла бы уже другое обращение автора.
+		markup := &tele.ReplyMarkup{}
+		markup.Inline(
+			markup.Row(markup.Data("Да, сбросить", resetYesBtn.Unique, cs.ID)),
+			markup.Row(markup.Data("Оставить", resetNoBtn.Unique)),
+		)
+		return c.Send("Обращение будет отменено безвозвратно, вместе с файлами. Сбросить?", markup)
+	}
+	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
+		return err
+	}
+	return b.homeScreen(ctx, c, "Сброшено.")
+}
+
+// onResetYes - подтверждение сброса. Кнопка живёт в переписке дольше экрана:
+// обращение могло уйти дальше или закрыться, отменяется то, что активно сейчас.
+func (b *Bot) onResetYes(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
@@ -772,23 +900,31 @@ func (b *Bot) onCancel(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Отменять нечего.", hideKeyboard())
+		return c.Edit("Обращение уже закрыто.")
 	}
-	// Слово «Отмена» в разговоре - ответ («статус заявки - Отмена»), а не
-	// желание всё бросить: цена ошибки несимметрична, отмена стирает обращение
-	// и файлы безвозвратно. Выход из разговора - /cancel и кнопка отмены.
-	if c.Callback() == nil && !isCommand(c) && inDialog(cs.Status) {
-		return b.onAnswer(ctx, c, cs)
+	if c.Data() != cs.ID {
+		return c.Edit("Кнопка устарела: это подтверждение другого обращения. " +
+			"Чтобы сбросить текущее, нажмите «Сброс».")
 	}
-	if err := b.cases.CancelCase(ctx, cs, "user"); err != nil {
+	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		if errors.Is(err, ErrPublishing) {
-			// Работа publish уже в очереди: погасив обращение здесь, мы получили
-			// бы issue по отменённому.
-			return c.Send("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
+			return c.Edit("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
 		}
 		return err
 	}
-	return c.Send("Обращение отменено, файлы удалены.", hideKeyboard())
+	if err := c.Edit("Обращение отменено, файлы удалены."); err != nil {
+		b.log.Warn("reset_edit_failed", "user_id", senderID(c), "error", err)
+	}
+	return b.homeScreen(ctx, c, "Начнём заново.")
+}
+
+func (b *Bot) onResetNo(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+	// Правка вместо нового сообщения: кнопки подтверждения снимаются, чтобы
+	// «Да, сбросить» не сработала неделю спустя.
+	return c.Edit("Оставил, продолжаем.")
 }
 
 // isCommand отличает набранную команду от текста reply-кнопки: у них общий
@@ -802,18 +938,18 @@ func inDialog(status string) bool {
 	return status == statusInterview || status == statusSummary
 }
 
-// collectKeyboard - кнопки сбора. Reply-клавиатура, а не инлайн: её видно
-// всегда и не надо искать кнопку выше по переписке.
-func collectKeyboard() *tele.ReplyMarkup {
+// Панель управления. Reply-клавиатура, а не инлайн: её видно всегда и не надо
+// искать кнопку выше по переписке. Раскладок две: вне сбора и в сборе.
+func homeKeyboard() *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{ResizeKeyboard: true, IsPersistent: true}
-	markup.Reply(markup.Row(*doneBtn, *cancelBtn))
+	markup.Reply(markup.Row(*menuBtn, *resetBtn))
 	return markup
 }
 
-// hideKeyboard убирает кнопки сбора: обращение закрыто, нажимать «Готово»
-// больше не по чему.
-func hideKeyboard() *tele.ReplyMarkup {
-	return &tele.ReplyMarkup{RemoveKeyboard: true}
+func collectKeyboard() *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{ResizeKeyboard: true, IsPersistent: true}
+	markup.Reply(markup.Row(*doneBtn, *resetBtn))
+	return markup
 }
 
 // roundKeyboard - «Всё так» под раундом вопросов. Номер раунда уезжает в
@@ -825,12 +961,13 @@ func roundKeyboard(round int) *tele.ReplyMarkup {
 	return markup
 }
 
+// summaryKeyboard - решение по саммари. Отмены здесь нет: её несёт «Сброс» на
+// панели, и один путь выхода лучше двух одинаковых.
 func summaryKeyboard() *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(
 		markup.Data("Публикую", publishBtn.Unique),
 		markup.Data("Поправить", fixBtn.Unique),
-		markup.Data("Отмена", dropBtn.Unique),
 	))
 	return markup
 }
@@ -1015,21 +1152,68 @@ func cardText(t *Ticket) string {
 	return text.String()
 }
 
-// projectHelp - подсказка команды. Один пример важнее описания синтаксиса:
-// ссылку копируют со страницы репозитория и присылают как есть.
+// projectHelp - подсказка. Один пример важнее описания синтаксиса: ссылку
+// копируют со страницы репозитория и присылают как есть.
 const projectHelp = "Пришлите ссылку на репозиторий проекта:\n" +
-	"/project https://github.com/owner/repo\n\n" +
+	"https://github.com/owner/repo\n\n" +
 	"Название и описание я соберу сам по README. Можно задать их явно:\n" +
-	"/project owner/repo Название | Чем занят сервис"
+	"owner/repo Название | Чем занят сервис"
 
-// onProjectAdd заводит проект по ссылке. Заводить может любой из белого списка:
-// ролей в сервисе нет, а токен всё равно ограничен своими репозиториями.
+// onProjectAdd - команда /project: быстрый путь для того, кто ссылку уже
+// скопировал. Заводить может любой из белого списка: ролей в сервисе нет, а
+// токен всё равно ограничен своими репозиториями.
 func (b *Bot) onProjectAdd(c tele.Context) error {
 	args := strings.TrimSpace(c.Message().Payload)
 	if args == "" {
 		return c.Send(projectHelp)
 	}
+	if err := b.addProject(c, args); err != nil {
+		if errors.Is(err, ErrBadProjectRef) {
+			return c.Send(projectHelp)
+		}
+		return err
+	}
+	return nil
+}
 
+// onAddProject - кнопка «Добавить проект»: следующее сообщение автора - ссылка.
+// При активном обращении кнопка не работает: ссылка ушла бы в него сырьём.
+func (b *Bot) onAddProject(c tele.Context) error {
+	if err := c.Respond(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs != nil {
+		return b.sendState(c, cs)
+	}
+	b.awaitLink[senderID(c)] = time.Now()
+	return c.Send("Пришлите ссылку на репозиторий следующим сообщением.")
+}
+
+// onProjectLink - сообщение, обещанное после «Добавить проект». Зовёт allow:
+// хендлера у него нет, ожидание разбирается до маршрутизации.
+func (b *Bot) onProjectLink(c tele.Context) error {
+	err := b.addProject(c, strings.TrimSpace(c.Text()))
+	if errors.Is(err, ErrBadProjectRef) {
+		// Обещание ссылки продлевается: автор ошибся, а не передумал. Только
+		// здесь: команда /project с мусором ждать следующее сообщение не
+		// обещала, и взведённое ею ожидание крало бы сырьё активного сбора.
+		b.awaitLink[senderID(c)] = time.Now()
+		return c.Send(projectHelp)
+	}
+	return err
+}
+
+// addProject заводит проект и отвечает карточкой. ErrBadProjectRef возвращает
+// как есть: подсказку каждый вход даёт свою.
+func (b *Bot) addProject(c tele.Context, args string) error {
 	// Бюджет с запасом: чтение репозитория, README и ход модели.
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -1037,7 +1221,7 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 	project, source, err := b.projects.Add(ctx, senderID(c), args)
 	switch {
 	case errors.Is(err, ErrBadProjectRef):
-		return c.Send(projectHelp)
+		return err
 	case errors.Is(err, ErrSlugTaken):
 		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
 			"Напишите владельцу сервиса - выключить проект из бота пока можно только через базу.")

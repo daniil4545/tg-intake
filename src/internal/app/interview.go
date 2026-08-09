@@ -916,7 +916,7 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 func roundMessage(questions []Question) string {
 	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) +
 		"\n\nОтветьте своими словами - текстом или голосовым. Если предположения верны, " +
-		"нажмите «Всё так». Передумали заводить тикет - /cancel."
+		"нажмите «Всё так»."
 }
 
 func questionList(questions []Question) string {
