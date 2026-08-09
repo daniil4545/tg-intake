@@ -47,6 +47,29 @@ func TestListSkipsPullRequests(t *testing.T) {
 	}
 }
 
+// TestListBackfillsOldTicket: тикет, вытесненный из окна сканирования свежими
+// issue и pull request'ами, добирается поштучно, а не остаётся «без статуса»
+// при живом GitHub.
+func TestListBackfillsOldTicket(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	publishCase(t, cases, 7009, 5)
+
+	server := githubStub(t, map[string]string{
+		"GET /repos/daniil4545/tg-intake/issues":   `[{"number": 120, "labels": []}]`,
+		"GET /repos/daniil4545/tg-intake/issues/5": `{"number": 5, "labels": [{"name": "status:prod"}]}`,
+	})
+	tickets := newTestTickets(t, cases, server.URL)
+
+	list, err := tickets.List(context.Background(), testProject(t, pool))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Status.Label != "status:prod" {
+		t.Fatalf("статус не добрался поштучно: %+v", list)
+	}
+}
+
 // TestListSurvivesGitHubError: просмотр не должен умирать вместе с чужим
 // сервисом - номера и заголовки уже прочитаны из своей базы.
 func TestListSurvivesGitHubError(t *testing.T) {
