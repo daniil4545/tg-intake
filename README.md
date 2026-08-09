@@ -33,7 +33,7 @@
 
 Go 1.25, PostgreSQL 16 (данные и очередь через `FOR UPDATE SKIP LOCKED`),
 миграции goose, Telegram Bot API через `telebot.v4`, LLM через OpenRouter,
-GitHub REST API. Runtime - один сервис в Docker, dev-контур в Coolify.
+GitHub REST API. Runtime - один сервис в Docker, контур в Coolify.
 
 ## Документы
 
@@ -62,8 +62,8 @@ make ci-check
 токен Telegram-бота, ключ OpenRouter, GitHub PAT с правом Issues read/write,
 белый список Telegram ID, строка подключения к базе.
 
-## Ветки
+## Ветки и релизы
 
-`feature/<slug>` для среза, PR в `dev`; push в `dev` автодеплоится в
-dev-контур; `main` релизная, обновляется release PR из `dev`. Прод только по
-неизменяемому тегу и явной команде владельца.
+Ветка одна - `prod`. Срез делается в `feature/<slug>`, идёт PR в `prod` и
+после мерджа удаляется. Деплой только по неизменяемому тегу `v*` и команде
+владельца; автодеплоя по push нет. История версий - [CHANGELOG.md](CHANGELOG.md).
