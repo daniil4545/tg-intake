@@ -9,13 +9,9 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
-// Обе стороны миграции применяются: down-to 0, а не down, потому что down
-// откатывает ровно одну миграцию и схема осталась бы непроверенной.
-//
-// DSN берётся из TEST_DATABASE_URL, а не из DATABASE_URL: тест дропает все
-// таблицы, а DATABASE_URL молча подхватывается из .env и может смотреть в
-// dev-контур. Отдельная переменная - единственное, что отделяет `make test` от
-// стирания чужой базы.
+// Обе стороны миграции: down-to 0, а не down - down откатывает ровно одну.
+// DSN из TEST_DATABASE_URL, не из DATABASE_URL: тест дропает все таблицы, а
+// DATABASE_URL молча подхватывается из .env и может смотреть в dev-контур.
 func TestMigrations(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
