@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,7 +73,7 @@ func TestAddProjectUsesExplicitFields(t *testing.T) {
 	})
 	projects := newTestProjects(t, cases, server.URL, "")
 
-	got, err := projects.Add(context.Background(), 501,
+	got, source, err := projects.Add(context.Background(), 501,
 		"https://github.com/daniil4545/planerka Планёрка | Транскрипт и конспект встреч")
 	if err != nil {
 		t.Fatalf("add: %v", err)
@@ -80,13 +81,27 @@ func TestAddProjectUsesExplicitFields(t *testing.T) {
 	if got.Title != "Планёрка" || got.Context != "Транскрипт и конспект встреч" {
 		t.Errorf("поля перезаписаны: %+v", got)
 	}
+	if source != "автор" {
+		t.Errorf("источник описания: %q", source)
+	}
 	for _, path := range seen.list() {
 		if strings.Contains(path, "/readme") {
 			t.Error("README читался, хотя описание задано автором")
 		}
 	}
 	if !seen.has("POST /repos/daniil4545/planerka/labels") {
-		t.Errorf("метки не заводились: %v", seen.list())
+		t.Errorf("право на запись не проверялось: %v", seen.list())
+	}
+	// Полный bootstrap здесь запрещён: десять меток рабочим клиентом держали бы
+	// очередь апдейтов всех авторов.
+	labelCalls := 0
+	for _, got := range seen.list() {
+		if strings.HasSuffix(got, "/labels") {
+			labelCalls++
+		}
+	}
+	if labelCalls != 1 {
+		t.Errorf("запросов на метки: %d, ожидался один проверочный", labelCalls)
 	}
 	assertProjectSaved(t, pool, "planerka", "Планёрка")
 }
@@ -105,7 +120,7 @@ func TestAddProjectDeniedRepo(t *testing.T) {
 	t.Cleanup(server.Close)
 	projects := newTestProjects(t, cases, server.URL, "")
 
-	if _, err := projects.Add(context.Background(), 502, "daniil4545/secret"); err == nil {
+	if _, _, err := projects.Add(context.Background(), 502, "daniil4545/secret"); err == nil {
 		t.Fatal("want error, got nil")
 	}
 	var count int
@@ -132,20 +147,24 @@ func TestAddProjectFallsBack(t *testing.T) {
 	})
 	// Отказ модели: клиент OpenRouter ходит через прокси, и тестовый прокси
 	// отказывает на любой запрос. Другой точки внедрения у клиента нет.
+	//
+	// Отказ на CONNECT клиент видит как сетевую ошибку и тратит на неё повторы -
+	// отсюда несколько секунд на этом тесте.
 	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 4xx, а не 5xx: на пятисотку клиент тратит три повтора с отсрочкой, и
-		// тест растянулся бы на семь секунд ради того же исхода.
 		w.WriteHeader(http.StatusBadRequest)
 	}))
 	t.Cleanup(broken.Close)
 
 	projects := newTestProjects(t, cases, github.URL, broken.URL)
-	got, err := projects.Add(context.Background(), 503, "daniil4545/qualifier")
+	got, source, err := projects.Add(context.Background(), 503, "daniil4545/qualifier")
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if got.Title != "qualifier" || got.Context != "Квалификация лидов в Telegram" {
 		t.Errorf("фолбэк не сработал: %+v", got)
+	}
+	if source != "репозиторий" {
+		t.Errorf("источник описания: %q", source)
 	}
 	assertProjectSaved(t, pool, "qualifier", "qualifier")
 }
@@ -181,5 +200,72 @@ func assertProjectSaved(t *testing.T, pool *pgxpool.Pool, slug, title string) {
 	}
 	if got != title {
 		t.Errorf("название проекта: %q, ожидалось %q", got, title)
+	}
+}
+
+// TestAddProjectKeepsForeignSlug: имя репозитория - ключ проекта, и чужой
+// репозиторий с тем же именем не должен перенацеливать существующий. Обращения
+// привязаны к проекту по id, и подмена увела бы их тикеты в другой репозиторий.
+func TestAddProjectKeepsForeignSlug(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	addProject(t, pool, "planerka")
+
+	server := githubStub(t, map[string]string{
+		"GET /repos/other-owner/planerka": `{"name": "planerka", "full_name": "other-owner/planerka",
+			"description": "чужой", "private": true}`,
+	})
+	projects := newTestProjects(t, cases, server.URL, "")
+
+	_, _, err := projects.Add(context.Background(), 504, "other-owner/planerka Чужой | Чужое описание")
+	if !errors.Is(err, ErrSlugTaken) {
+		t.Fatalf("чужой репозиторий занял ключ: %v", err)
+	}
+
+	var owner string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT github_owner FROM projects WHERE slug = 'planerka'`).Scan(&owner); err != nil {
+		t.Fatalf("read project: %v", err)
+	}
+	if owner != "acme" {
+		t.Errorf("владелец репозитория подменён: %q", owner)
+	}
+}
+
+// TestAddProjectUpdatesSameRepo: тот же репозиторий обновляет свою строку, а не
+// заводит вторую, даже если ключ уже отличается от имени репозитория.
+func TestAddProjectUpdatesSameRepo(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cleanupProject(t, pool, "zz-old-slug")
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	seed := ProjectConfig{Slug: "zz-old-slug", Title: "Старое", Owner: "acme",
+		Repo: "renamed", Context: "старый контекст"}
+	if err := SyncProjects(context.Background(), pool, []ProjectConfig{seed}, log); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	server := githubStub(t, map[string]string{
+		"GET /repos/acme/renamed": `{"name": "renamed", "full_name": "acme/renamed", "private": true}`,
+	})
+	projects := newTestProjects(t, cases, server.URL, "")
+
+	got, _, err := projects.Add(context.Background(), 505, "acme/renamed Новое | Новый контекст")
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got.Slug != "zz-old-slug" {
+		t.Errorf("ключ пересчитан: %q", got.Slug)
+	}
+	assertProjectSaved(t, pool, "zz-old-slug", "Новое")
+
+	var count int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM projects WHERE github_owner = 'acme' AND github_repo = 'renamed'`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("строк на репозиторий: %d", count)
 	}
 }

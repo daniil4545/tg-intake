@@ -110,6 +110,26 @@ func (g *GitHub) EnsureLabels(ctx context.Context, p Project) error {
 	return nil
 }
 
+// CheckWrite проверяет право писать в Issues одной меткой и коротким бюджетом.
+// Полный bootstrap здесь не годится: десять меток рабочим клиентом - это до
+// двух минут с повторами, а зовут отсюда хендлер, который держит очередь
+// апдейтов всех авторов. Остальные метки заведёт старт либо первая публикация.
+func (g *GitHub) CheckWrite(ctx context.Context, p Project) error {
+	l := baseLabels[0]
+	body, err := json.Marshal(map[string]string{"name": l.Name, "color": l.Color, "description": l.Desc})
+	if err != nil {
+		return fmt.Errorf("build label %s: %w", l.Name, err)
+	}
+
+	_, _, err = g.send(ctx, g.fast, http.MethodPost,
+		fmt.Sprintf("/repos/%s/%s/labels", p.Owner, p.Repo), body)
+	var apiErr *githubError
+	if errors.As(err, &apiErr) && apiErr.status == http.StatusUnprocessableEntity {
+		return nil
+	}
+	return err
+}
+
 // createLabel: существующая метка возвращает 422, и это не ошибка - именно
 // такого состояния мы и добивались.
 func (g *GitHub) createLabel(ctx context.Context, p Project, name, color, desc string) error {

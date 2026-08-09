@@ -1001,22 +1001,39 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
-	project, err := b.projects.Add(ctx, senderID(c), args)
+	project, source, err := b.projects.Add(ctx, senderID(c), args)
 	switch {
 	case errors.Is(err, ErrBadProjectRef):
 		return c.Send(projectHelp)
+	case errors.Is(err, ErrSlugTaken):
+		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
+			"Выключите старый или заведите репозиторий под другим именем.")
 	case err != nil:
 		b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
 		return c.Send(projectFailText(err))
 	}
 
-	return b.sendLong(c.Recipient(), projectCard(project))
+	return b.sendLong(c.Recipient(), projectCard(project, source))
 }
 
-func projectCard(p ProjectConfig) string {
-	return fmt.Sprintf("Проект «%s» заведён и появился в меню.\nРепозиторий: %s/%s\n\n%s\n\n"+
-		"Название и описание можно переписать той же командой:\n/project %s/%s Название | Описание",
-		p.Title, p.Owner, p.Repo, p.Context, p.Owner, p.Repo)
+// projectCard показывает и то, откуда взялось описание: контекст уходит в
+// инструкцию интервью и определяет вопросы по всем будущим обращениям проекта,
+// поэтому придуманное моделью автор должен отличать от своего.
+func projectCard(p ProjectConfig, source string) string {
+	return fmt.Sprintf("Проект «%s» заведён и появился в меню.\nРепозиторий: %s/%s\n\n%s\n\n%s\n"+
+		"Переписать: /project %s/%s Название | Описание",
+		p.Title, p.Owner, p.Repo, p.Context, projectSourceNote(source), p.Owner, p.Repo)
+}
+
+func projectSourceNote(source string) string {
+	switch source {
+	case "модель":
+		return "Название и описание я собрал по README - проверьте, так ли это."
+	case "репозиторий":
+		return "Описание модель собрать не смогла, взял из полей репозитория."
+	default:
+		return "Название и описание ваши, я их не трогал."
+	}
 }
 
 // projectFailText объясняет отказ словами автора, а не статусом API: для

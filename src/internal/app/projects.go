@@ -7,14 +7,20 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // readmeLimit - сколько текста README уходит в модель. Дальше начинается
 // установка и лицензия, а токены платные.
 const readmeLimit = 8000
 
-// ErrBadProjectRef - в команде нет разбираемой ссылки на репозиторий.
-var ErrBadProjectRef = errors.New("project reference is not a github repository")
+var (
+	// ErrBadProjectRef - в команде нет разбираемой ссылки на репозиторий.
+	ErrBadProjectRef = errors.New("project reference is not a github repository")
+	// ErrSlugTaken - имя репозитория уже занято другим проектом.
+	ErrSlugTaken = errors.New("project slug belongs to another repository")
+)
 
 // Projects - заведение проекта из бота. Владелец таблицы по-прежнему db.go,
 // здесь сценарий: прочитать репозиторий, собрать описание, завести метки.
@@ -40,15 +46,15 @@ type projectRef struct {
 
 // Add заводит проект по ссылке. Возвращает сохранённую строку - её же бот
 // показывает автору карточкой.
-func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectConfig, error) {
+func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectConfig, string, error) {
 	ref, err := parseProjectRef(args)
 	if err != nil {
-		return ProjectConfig{}, err
+		return ProjectConfig{}, "", err
 	}
 
 	repo, err := p.gh.GetRepo(ctx, ref.Owner, ref.Repo)
 	if err != nil {
-		return ProjectConfig{}, err
+		return ProjectConfig{}, "", err
 	}
 
 	source := "автор"
@@ -57,30 +63,78 @@ func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectC
 		title, context, source = p.describe(ctx, ref, repo, title, context)
 	}
 
+	slug, err := p.slugFor(ctx, ref)
+	if err != nil {
+		return ProjectConfig{}, "", err
+	}
 	project := ProjectConfig{
-		Slug:    projectSlugFrom(repo.Name, ref.Repo),
+		Slug:    slug,
 		Title:   title,
 		Owner:   ref.Owner,
 		Repo:    ref.Repo,
 		Context: context,
 	}
 
-	// Метки заводятся до сохранения и служат проверкой права на запись: строка в
+	// Право на запись проверяется одной меткой и коротким бюджетом: строка в
 	// меню, ведущая в репозиторий без доступа, хуже её отсутствия - автор
-	// потратит на интервью пять минут и упрётся в отказ на публикации.
-	if err := p.gh.PrepareProject(ctx, Project{
+	// потратит на интервью пять минут и упрётся в отказ на публикации. Полный
+	// набор меток заведёт старт или первая публикация: десять меток рабочим
+	// клиентом держали бы очередь апдейтов всех авторов.
+	if err := p.gh.CheckWrite(ctx, Project{
 		Slug: project.Slug, Owner: project.Owner, Repo: project.Repo,
 	}); err != nil {
-		return ProjectConfig{}, err
+		return ProjectConfig{}, "", err
 	}
 
-	if err := SyncProjects(ctx, p.cases.pool, []ProjectConfig{project}, p.log); err != nil {
-		return ProjectConfig{}, err
+	_, err = p.cases.pool.Exec(ctx, `
+		INSERT INTO projects (slug, title, github_owner, github_repo, context, active)
+		VALUES ($1, $2, $3, $4, $5, true)
+		ON CONFLICT (slug) DO UPDATE SET
+			title = excluded.title, github_owner = excluded.github_owner,
+			github_repo = excluded.github_repo, context = excluded.context,
+			active = true, updated_at = now()`,
+		project.Slug, project.Title, project.Owner, project.Repo, project.Context)
+	if err != nil {
+		return ProjectConfig{}, "", fmt.Errorf("save project %s: %w", project.Slug, err)
 	}
 
 	p.log.Info("project_saved", "user_id", userID, "project", project.Slug,
 		"repo", project.Owner+"/"+project.Repo, "source", source)
-	return project, nil
+	return project, source, nil
+}
+
+// slugFor выбирает ключ проекта. Репозиторий, уже заведённый под другим ключом,
+// обновляется по нему: ключ считается один раз и дальше живёт в callback_data и
+// в тикетах. Занятый чужим репозиторием ключ - отказ, а не перезапись: иначе
+// одной командой можно было бы перенацелить чужой проект, а обращения остались
+// бы привязаны к нему по project_id.
+func (p *Projects) slugFor(ctx context.Context, ref projectRef) (string, error) {
+	var existing string
+	err := p.cases.pool.QueryRow(ctx, `
+		SELECT slug FROM projects WHERE github_owner = $1 AND github_repo = $2`,
+		ref.Owner, ref.Repo).Scan(&existing)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("look up project of %s/%s: %w", ref.Owner, ref.Repo, err)
+	}
+
+	slug := projectSlugFrom(ref.Repo)
+	if slug == "" {
+		return "", ErrBadProjectRef
+	}
+
+	var owner, repo string
+	err = p.cases.pool.QueryRow(ctx,
+		`SELECT github_owner, github_repo FROM projects WHERE slug = $1`, slug).Scan(&owner, &repo)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return slug, nil
+	case err != nil:
+		return "", fmt.Errorf("look up slug %s: %w", slug, err)
+	}
+	return "", fmt.Errorf("%w: %s занят репозиторием %s/%s", ErrSlugTaken, slug, owner, repo)
 }
 
 // describe собирает недостающие название и контекст. Отказ модели не роняет
@@ -182,11 +236,8 @@ func parseProjectRef(args string) (projectRef, error) {
 
 // projectSlugFrom приводит имя репозитория к маске схемы тем же способом, что и
 // метка автора: маска и предел callback_data у них общие.
-func projectSlugFrom(name, fallback string) string {
+func projectSlugFrom(name string) string {
 	slug := clean(strings.ToLower(name))
-	if slug == "" {
-		slug = clean(strings.ToLower(fallback))
-	}
 	if len(slug) > 32 {
 		slug = strings.Trim(slug[:32], "-")
 	}
