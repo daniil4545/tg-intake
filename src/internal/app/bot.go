@@ -560,8 +560,11 @@ func (b *Bot) onItem(c tele.Context) error {
 	}
 	if cs == nil {
 		// Одно меню на пачку: пересылка десяти сообщений дала бы десять меню
-		// подряд. Апдейты идут последовательно, карта без мьютекса.
+		// подряд. Апдейты идут последовательно, карта без мьютекса. Молча не
+		// уходим: отклик обязан быть у каждого сообщения, и здесь это отметка
+		// «вижу, но не сохраняю».
 		if time.Since(b.menuAt[senderID(c)]) < menuRepeat {
+			b.react(c, emojiSkip)
 			return nil
 		}
 		b.menuAt[senderID(c)] = time.Now()
@@ -581,6 +584,9 @@ func (b *Bot) onItem(c tele.Context) error {
 // сырьём приходит и слово «Меню» из своего хендлера.
 func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	askProject, err := b.cases.CollectItem(ctx, b.bot, cs, c.Message())
+	if err == nil {
+		b.ack(c)
+	}
 	reply, internal := itemReply(err, b.maxItems)
 	if reply != "" {
 		if sendErr := c.Send(reply); sendErr != nil {
@@ -671,13 +677,17 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 		}
 		return c.Send("Расшифровываю ответ.")
 	case strings.TrimSpace(msg.Text) != "":
-		if err := b.cases.AddAnswer(ctx, cs, msg.Text); err != nil {
-			if errors.Is(err, ErrNotInterview) {
-				return c.Send("Обращение уже ушло дальше. Отправьте /start, чтобы завести новое.")
-			}
-			return err
+		err := b.cases.AddAnswer(ctx, cs, msg.Text)
+		if err == nil {
+			// До следующего раунда - секунды молчания, пока думает модель;
+			// реакция говорит «ответ принят», не наращивая переписку.
+			b.ack(c)
+			return nil
 		}
-		return nil
+		if errors.Is(err, ErrNotInterview) {
+			return c.Send("Обращение уже ушло дальше. Нажмите «Меню» и заведите новое.")
+		}
+		return err
 	}
 	return c.Send("Ответьте текстом или голосовым. Скриншоты принимаются только до кнопки «Готово».")
 }
@@ -934,6 +944,31 @@ func (b *Bot) onResetNo(c tele.Context) error {
 	// Правка вместо нового сообщения: кнопки подтверждения снимаются, чтобы
 	// «Да, сбросить» не сработала неделю спустя.
 	return c.Edit("Оставил, продолжаем.")
+}
+
+// Реакции-отклики. Текстом это был бы шум: пачка из десяти пересылок дала бы
+// десять «принял», а ответ в интервью - лишнюю реплику перед вопросом.
+const (
+	emojiAck  = "\U0001F44D" // принято: сырьё легло в обращение, ответ записан
+	emojiSkip = "\U0001F440" // вижу, но не сохраняю: сообщение вне обращения
+)
+
+// ack - «принято»: сообщение сохранено.
+func (b *Bot) ack(c tele.Context) { b.react(c, emojiAck) }
+
+// react ставит реакцию на сообщение автора. Отказ не роняет обработку:
+// сообщение уже сохранено, а реакция - только отклик.
+func (b *Bot) react(c tele.Context, emoji string) {
+	msg := c.Message()
+	if msg == nil {
+		return
+	}
+	err := b.bot.React(c.Recipient(), msg, tele.Reactions{
+		Reactions: []tele.Reaction{{Type: tele.ReactionTypeEmoji, Emoji: emoji}},
+	})
+	if err != nil {
+		b.log.Warn("react_failed", "user_id", senderID(c), "error", err)
+	}
 }
 
 // isCommand отличает набранную команду от текста reply-кнопки: у них общий
