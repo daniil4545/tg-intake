@@ -98,6 +98,16 @@ type Bot struct {
 	mu     sync.Mutex
 	tally  map[int64]tele.StoredMessage
 	rounds map[int64]roundState
+	// Экран, с которого запустили отмену тикета, по обращению: исход приходит
+	// очередью и правит то же сообщение.
+	kills map[string]killScreen
+}
+
+// killScreen - «Отменяю тикет #N» вместе с проектом: кнопка возврата к списку
+// нужна и после правки.
+type killScreen struct {
+	tele.StoredMessage
+	slug string
 }
 
 // roundState - сообщение раунда: Bot API правит сообщение целиком, поэтому
@@ -140,6 +150,27 @@ func (b *Bot) dropRound(user int64) {
 	delete(b.rounds, user)
 }
 
+func (b *Bot) setKill(caseID string, screen killScreen) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.kills[caseID] = screen
+}
+
+func (b *Bot) getKill(caseID string) (killScreen, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	screen, ok := b.kills[caseID]
+	return screen, ok
+}
+
+// dropKill зовётся только после доставки: отказ Telegram уводит работу в
+// повтор, и забытый экран сделал бы повтор бесполезным.
+func (b *Bot) dropKill(caseID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.kills, caseID)
+}
+
 // answerRound отмечает ещё один ответ на текущий раунд и отдаёт состояние для
 // правки. Запись остаётся до следующего раунда: автор отвечает и двумя
 // сообщениями подряд, и каждое обязано получить отклик.
@@ -159,7 +190,8 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
 		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
-		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{}}
+		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{},
+		kills: map[string]killScreen{}}
 
 	// Verbose дампит сырые payload Bot API вместе с текстами сообщений, а
 	// стандартный OnError пишет через stdlib log мимо JSON.
@@ -317,6 +349,12 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 		return fmt.Errorf("notify: case %s not found", p.CaseID)
 	}
 
+	// Исход отмены тикета правит тот экран, с которого её запустили: автор
+	// смотрит на «Отменяю тикет #N», и ответ обязан прийти туда же.
+	if p.Buttons == keysCancel {
+		return b.finishKill(cs, p.Text)
+	}
+
 	var opts []any
 	switch {
 	// Провал нормализации возвращает обращение в сбор, а кнопки сбора сняты
@@ -354,6 +392,29 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	case p.Buttons == keysSummary:
 		b.dropRound(cs.UserID)
 	}
+	return nil
+}
+
+// finishKill доставляет исход отмены тикета. Экран запомнен нажатием кнопки и
+// живёт в памяти: рестарт между запросом и ответом отдаёт исход обычным
+// сообщением - лучше лишняя реплика, чем молчание.
+func (b *Bot) finishKill(cs *Case, text string) error {
+	screen, ok := b.getKill(cs.ID)
+	if !ok {
+		// Рестарт между нажатием и исходом либо повтор после доставки: экрана
+		// нет, но автор обязан узнать, чем кончилось.
+		b.log.Info("kill_screen_missing", "case_id", cs.ID)
+		_, err := b.sendLong(&tele.User{ID: cs.UserID}, text)
+		return err
+	}
+
+	if _, err := b.bot.Edit(screen.StoredMessage, text, backToList(screen.slug)); err != nil {
+		b.log.Warn("kill_edit_failed", "case_id", cs.ID, "error", err)
+		if _, err := b.sendLong(&tele.User{ID: cs.UserID}, text, backToList(screen.slug)); err != nil {
+			return err
+		}
+	}
+	b.dropKill(cs.ID)
 	return nil
 }
 
@@ -1386,7 +1447,7 @@ func (b *Bot) onKill(c tele.Context) error {
 		return err
 	}
 
-	err = b.tickets.Cancel(ctx, project, number, senderID(c))
+	caseID, err := b.tickets.Cancel(ctx, project, number, senderID(c))
 	switch {
 	case errors.Is(err, ErrNotAuthor):
 		b.log.Warn("cancel_denied", "user_id", senderID(c), "project", project.Slug, "issue", number)
@@ -1396,8 +1457,18 @@ func (b *Bot) onKill(c tele.Context) error {
 	case err != nil:
 		return err
 	}
+	// Экран запоминается до правки: исход отмены придёт очередью и перепишет
+	// это же сообщение, а не добавит новое ниже по переписке.
+	if msg := c.Message(); msg != nil {
+		b.setKill(caseID, killScreen{
+			StoredMessage: tele.StoredMessage{
+				MessageID: strconv.Itoa(msg.ID), ChatID: msg.Chat.ID,
+			},
+			slug: project.Slug,
+		})
+	}
 	// Кнопка отмены снимается сразу: работа уже в очереди, второе нажатие
-	// поставило бы её заново. Итог придёт отдельным сообщением из очереди.
+	// поставило бы её заново.
 	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу когда закроется.", number),
 		backToList(project.Slug))
 }

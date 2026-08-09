@@ -136,6 +136,37 @@ func TestCancelRemovesAllStatusLabels(t *testing.T) {
 	}
 }
 
+// TestCancelOutcomeMarked: тикет успели закрыть, пока отмена ждала очереди.
+// Исход всё равно помечен исходом отмены - иначе он придёт новым сообщением, а
+// экран «Отменяю тикет #N» останется висеть непереписанным.
+func TestCancelOutcomeMarked(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := publishCase(t, cases, 7005, 50)
+
+	server := githubStub(t, map[string]string{
+		"GET /repos/daniil4545/tg-intake/issues/50": `{"number": 50, "labels": [{"name": "status:prod"}]}`,
+	})
+	tickets := newTestTickets(t, cases, server.URL)
+
+	job := Job{ID: 1, Kind: JobCancelIssue, Payload: cancelJSON(cs.ID, 7005)}
+	if err := tickets.RunCancel(ctx, job); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	var buttons string
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(payload->>'buttons', '') FROM jobs
+		WHERE kind = $1 AND payload->>'case_id' = $2`, JobNotify, cs.ID).Scan(&buttons)
+	if err != nil {
+		t.Fatalf("load notify: %v", err)
+	}
+	if buttons != keysCancel {
+		t.Errorf("исход отмены помечен %q, ожидалось %q", buttons, keysCancel)
+	}
+}
+
 // TestCancelDeniedForStranger: просмотр общий, отмена авторская. Кнопка живёт в
 // чужом сообщении дольше, чем экран, поэтому право проверяется и в работе.
 func TestCancelDeniedForStranger(t *testing.T) {
@@ -155,7 +186,7 @@ func TestCancelDeniedForStranger(t *testing.T) {
 		t.Errorf("чужая отмена дошла до GitHub: %v", got)
 	}
 
-	if err := tickets.Cancel(context.Background(), testProject(t, pool), 40, 9999); err != ErrNotAuthor {
+	if _, err := tickets.Cancel(context.Background(), testProject(t, pool), 40, 9999); err != ErrNotAuthor {
 		t.Errorf("постановка чужой отмены: %v", err)
 	}
 }
