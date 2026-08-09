@@ -47,10 +47,8 @@ services:
       DATABASE_URL: postgres://intake:intake@postgres:5432/intake?sslmode=disable
       ENV: local
       MEDIA_DIR: /tmp/intake
-    # Файлы обращения живут минуты и стираются после нормализации: диску их
-    # переживать незачем. Режим не задаём: tmpfs монтируется с 1777, чего
-    # хватает образу distroless:nonroot, а `mode: 01777` ломает разбор Compose -
-    # ведущий ноль делает значение строкой, Docker ждёт число.
+    # tmpfs для короткоживущих файлов обращений, режим намеренно не задан:
+    # подробности в deploy/dev/docker-compose.coolify.yml.
     volumes:
       - type: tmpfs
         target: /tmp/intake
