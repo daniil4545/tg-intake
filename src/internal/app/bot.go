@@ -102,6 +102,15 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 		Synchronous: true,
 		OnError: func(err error, c tele.Context) {
 			log.Error("handler_failed", "error", err, "user_id", senderID(c))
+			// Молчание на действие читается как зависший бот: автор обязан
+			// получить хоть какой-то ответ. Best-effort: ошибку отправки уже
+			// некому чинить.
+			if c != nil {
+				if c.Callback() != nil {
+					_ = c.Respond()
+				}
+				_ = c.Send("Действие не прошло: внутренняя ошибка. Попробуйте ещё раз, детали уже в логе.")
+			}
 		},
 	}, log)
 	if err != nil {

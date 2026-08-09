@@ -140,6 +140,30 @@ func TestCaseWithoutProject(t *testing.T) {
 	}
 }
 
+// TestCancelWithoutProject: обращение, брошенное до выбора проекта, обязано
+// закрываться. До миграции 0005 CHECK разрешал без проекта только collecting,
+// отмена падала, и автор не мог ни закрыть обращение, ни пройти мимо.
+func TestCancelWithoutProject(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5002, First: "Тест"}, "")
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "случайная ссылка"}); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if err := cases.CancelCase(ctx, cs, "reset"); err != nil {
+		t.Fatalf("отмена без проекта: %v", err)
+	}
+	if got := reload(t, cases, cs.ID).Status; got != statusCancelled {
+		t.Errorf("статус после отмены: %s, ожидался %s", got, statusCancelled)
+	}
+}
+
 func TestDropFiles(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(t)
