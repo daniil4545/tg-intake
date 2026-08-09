@@ -20,6 +20,9 @@ Read-only actions:
   app-env          переменные окружения приложения, значения скрыты
   db-counts        число строк по таблицам, без содержимого
   case-trace [N]   ход разговора: события обращений, статус и раунд, без текстов
+  cases [N]        последние обращения: id, статус, проект, автор, тикет
+  case <id>        обращение целиком с текстами: протокол, сырьё, события, работы
+  job-errors [N]   упавшие и повторяющиеся работы очереди с ошибками
   deploy-config    имена переменных сервиса в Coolify и версия его compose
   deploy-state     образ кандидата на хосте и незавершённые деплои Coolify
 
@@ -71,6 +74,30 @@ case "$action" in
         # Только счётчики: строки таблиц содержат ФИО автора и текст обращения,
         # им место в базе, а не в терминале.
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select 'projects='||(select count(*) from projects)||' users='||(select count(*) from users)||' cases='||(select count(*) from cases)||' case_items='||(select count(*) from case_items)||' jobs='||(select count(*) from jobs)\""
+        ;;
+    cases)
+        # Содержимое обращений (тексты, транскрипты) выводится в терминал для
+        # дебага - решение владельца 2026-08-09. В git и логи сервиса оно
+        # по-прежнему не попадает.
+        lines="$(tail_lines "$arg")"
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select left(c.id::text,8)||' status='||c.status||' kind='||coalesce(c.kind,'-')||' project='||coalesce(p.slug,'-')||' user='||c.user_id||' issue='||coalesce(c.issue_number::text,'-')||' updated='||to_char(c.updated_at,'MM-DD HH24:MI') from cases c left join projects p on p.id = c.project_id order by c.updated_at desc limit $lines\""
+        ;;
+    case)
+        # Префикс id из вывода cases. Маска обязательна: аргумент уходит и в
+        # shell, и в SQL, произвольная строка тут - инъекция.
+        if [[ ! "$arg" =~ ^[0-9a-f][0-9a-f-]{3,35}$ ]]; then
+            echo "case <id>: нужен префикс uuid из вывода cases (минимум 4 символа)" >&2
+            exit 2
+        fi
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"
+            select '=== case ==='||chr(10)||'id='||id||' status='||status||' kind='||coalesce(kind,'-')||' round='||round||' incomplete='||incomplete||' issue='||coalesce(issue_number::text,'-')||coalesce(chr(10)||'url='||issue_url,'')||chr(10)||'=== title ==='||chr(10)||coalesce(title,'-')||chr(10)||'=== protocol ==='||chr(10)||coalesce(protocol,'-')||chr(10)||'=== contract ==='||chr(10)||coalesce(contract::text,'-')||chr(10)||'=== gaps ==='||chr(10)||coalesce(gaps::text,'-')||chr(10)||'=== summary ==='||chr(10)||coalesce(summary,'-') from cases where id::text like '$arg%';
+            select '=== item '||id||' ==='||chr(10)||'kind='||kind||' status='||status||coalesce(' error='||nullif(error,''),'')||' file_id='||coalesce(tg_file_id,'-')||chr(10)||'source: '||coalesce(source_text,'-')||chr(10)||'normalized: '||coalesce(normalized,'-') from case_items where case_id in (select id from cases where id::text like '$arg%') order by id;
+            select '=== event '||id||' '||to_char(created_at,'MM-DD HH24:MI:SS')||' '||kind||' ==='||chr(10)||coalesce(payload::text,'') from case_events where case_id in (select id from cases where id::text like '$arg%') order by id;
+            select '=== job '||id||' ==='||chr(10)||kind||' status='||status||' attempts='||attempts||coalesce(chr(10)||'error='||nullif(last_error,''),'') from jobs where payload->>'case_id' in (select id::text from cases where id::text like '$arg%') order by id;\""
+        ;;
+    job-errors)
+        lines="$(tail_lines "$arg")"
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select id||' '||kind||' status='||status||' attempts='||attempts||' case='||coalesce(left(payload->>'case_id',8),'-')||' updated='||to_char(updated_at,'MM-DD HH24:MI')||coalesce(chr(10)||'  error: '||nullif(last_error,''),'') from jobs where status = 'failed' or attempts > 1 order by updated_at desc limit $lines\""
         ;;
     case-trace)
         # Ход разговора без единого слова автора: вид события, время, статус и
