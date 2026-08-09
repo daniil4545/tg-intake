@@ -77,3 +77,17 @@ func TestUnknownLabels(t *testing.T) {
 		t.Errorf("неизвестные метки: %v, ожидалась только status:frozen", got)
 	}
 }
+
+// TestLoadStatuses: правила из образа обязаны проходить собственную валидацию.
+// Иначе опечатка в файле обнаружится падением старта в контуре, а не в CI.
+func TestLoadStatuses(t *testing.T) {
+	statuses, err := LoadStatuses()
+	if err != nil {
+		t.Fatalf("встроенные правила статусов не проходят валидацию: %v", err)
+	}
+	for _, label := range []string{labelNew, labelCancelled} {
+		if _, ok := statuses.Pick([]string{label}); !ok {
+			t.Errorf("в правилах нет метки %q", label)
+		}
+	}
+}

@@ -610,7 +610,6 @@ type Repo struct {
 	Name        string `json:"name"`
 	FullName    string `json:"full_name"`
 	Description string `json:"description"`
-	Private     bool   `json:"private"`
 }
 
 // GetRepo читает репозиторий быстрым клиентом: зовут из хендлера, автор ждёт.
