@@ -197,13 +197,55 @@ func TestScrubContacts(t *testing.T) {
 	}
 }
 
+// TestSummaryWithoutSections: ответ модели без разделов больше не отклоняется.
+// Именно эта проверка уводила работу в повторы и оставляла автора без единого
+// слова на минуты, пока модель не отвечала «как надо».
+func TestSummaryWithoutSections(t *testing.T) {
+	i := newTestInterview(t, nil, 3)
+	i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","sections":[]}`)
+	cs := &Case{ID: "case-1", Kind: "bug", Filled: map[string]string{"case": "заказ 4821"}}
+
+	messages := []Message{{Role: "system", Parts: []Part{TextPart("промт")}}}
+	out, err := i.askSummary(context.Background(), cs, messages)
+	if err != nil {
+		t.Fatalf("саммари без разделов отклонено: %v", err)
+	}
+	if out.Title != "Форма не сохраняется" {
+		t.Errorf("заголовок саммари: %q", out.Title)
+	}
+}
+
+// TestSectionsFallBackToContract: содержание пунктов уже собрано интервью, и
+// молчание модели не имеет права остановить тикет. Раньше такой ответ уходил в
+// повторы, а автор ждал в тишине.
+func TestSectionsFallBackToContract(t *testing.T) {
+	i := newTestInterview(t, nil, 3)
+	cs := &Case{
+		Kind:   "bug",
+		Filled: map[string]string{"case": "заказ 4821", "actual": "статус остался «новый»", "expected": "статус «оплачен»"},
+		Gaps:   []string{"expected"},
+	}
+
+	body := i.renderSections(cs, nil)
+
+	for _, want := range []string{"заказ 4821", "статус остался «новый»"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("закрытый пункт потерян: %q\nтело:\n%s", want, body)
+		}
+	}
+	// Пробел остаётся пробелом: недобранное не выдаётся за собранное.
+	if strings.Contains(body, "статус «оплачен»") {
+		t.Errorf("пробел ушёл в тело саммари:\n%s", body)
+	}
+}
+
 // TestRenderSections: порядок разделов задают правила, а не ответ модели, и
 // заголовки берутся оттуда же. Одно место задаёт и что спрашиваем, и как это
 // выглядит в тикете.
 func TestRenderSections(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
 
-	body := i.renderSections("bug", []section{
+	body := i.renderSections(&Case{Kind: "bug"}, []section{
 		{Key: "actual", Text: "статус остался «новый»"},
 		{Key: "case", Text: "заказ 4821 от вторника"},
 		{Key: "where", Text: ""},

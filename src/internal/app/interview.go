@@ -482,8 +482,13 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	}
 
 	title := scrubContacts(strings.TrimSpace(out.Title))
-	body := i.renderSections(cs.Kind, out.Sections)
+	body := i.renderSections(cs, out.Sections)
 	incomplete := len(cs.Gaps) > 0
+	// Ни одной строки ни от модели, ни из контракта: показывать автору нечего,
+	// и работа уходит в повторы, а исчерпав их - скажет ему об этом.
+	if body == "" {
+		return fmt.Errorf("summary of case %s has no content", cs.ID)
+	}
 
 	moved := false
 	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
@@ -570,30 +575,13 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 	if utf8.RuneCountInString(title) > maxTitle {
 		return fmt.Errorf("summary title is %d runes long", utf8.RuneCountInString(title))
 	}
-	if len(out.Sections) == 0 {
-		return errors.New("summary has no sections")
-	}
 
-	written := make(map[string]bool, len(out.Sections))
 	for _, s := range out.Sections {
 		if i.rules.Title(cs.Kind, s.Key) == "" {
 			return fmt.Errorf("section key %q is not in contract", s.Key)
 		}
 		if strings.TrimSpace(s.Text) == "" {
 			return fmt.Errorf("section %q is empty", s.Key)
-		}
-		written[s.Key] = true
-	}
-
-	// Пункт, который интервью закрыло, обязан дойти до тикета. Молча выпавший
-	// раздел не отличить от «этого автор не рассказывал»: пробелов у обращения
-	// нет, метки incomplete не будет, и потеря пройдёт незамеченной.
-	for key := range cs.Filled {
-		if slices.Contains(cs.Gaps, key) || i.rules.Title(cs.Kind, key) == "" {
-			continue
-		}
-		if !written[key] {
-			return fmt.Errorf("closed key %q has no section", key)
 		}
 	}
 	return nil
@@ -602,14 +590,30 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 // renderSections собирает тело саммари в markdown - тот же текст уходит и в
 // issue, и автору. Порядок разделов задают правила, а не ответ модели: тикет
 // одного типа должен выглядеть одинаково.
-func (i *Interview) renderSections(kind string, sections []section) string {
+//
+// Раздел, который модель не написала, достраивается из контракта: содержание
+// пункта уже собрано интервью, и требовать его пересказа второй раз значит
+// ставить весь тикет в зависимость от настроения модели. Раньше такой ответ
+// отклонялся, работа уходила в повторы, а автор ждал молча.
+func (i *Interview) renderSections(cs *Case, sections []section) string {
 	texts := make(map[string]string, len(sections))
 	for _, s := range sections {
+		// Пробел остаётся пробелом: раздел по незакрытому пункту - догадка,
+		// которой автор не давал, а сообщение о пробелах тут же ей противоречит.
+		if slices.Contains(cs.Gaps, s.Key) {
+			continue
+		}
 		texts[s.Key] = scrubContacts(strings.TrimSpace(s.Text))
+	}
+	for key, value := range cs.Filled {
+		if texts[key] != "" || slices.Contains(cs.Gaps, key) {
+			continue
+		}
+		texts[key] = scrubContacts(strings.TrimSpace(value))
 	}
 
 	var b strings.Builder
-	for _, item := range i.rules.Items(kind) {
+	for _, item := range i.rules.Items(cs.Kind) {
 		text := texts[item.Key]
 		if text == "" {
 			continue

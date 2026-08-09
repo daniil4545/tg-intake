@@ -192,8 +192,9 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 
 // Cancel ставит работу отмены. Через replaceJob: повторная отмена после
 // исчерпанных повторов первой снова уходит в очередь, а не упирается в ключ
-// погашенной работы.
-func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64) error {
+// погашенной работы. Первое значение - обращение тикета: его исход придёт
+// очередью, и бот правит им тот экран, с которого отмену запустили.
+func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64) (string, error) {
 	var caseID string
 	var owner int64
 	row := t.cases.pool.QueryRow(ctx,
@@ -201,14 +202,14 @@ func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userI
 		project.ID, number)
 	if err := row.Scan(&caseID, &owner); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrIssueGone
+			return "", ErrIssueGone
 		}
-		return fmt.Errorf("load case of issue %d: %w", number, err)
+		return "", fmt.Errorf("load case of issue %d: %w", number, err)
 	}
 	if owner != userID {
-		return ErrNotAuthor
+		return "", ErrNotAuthor
 	}
-	return replaceJob(ctx, t.cases.pool, JobCancelIssue, caseID,
+	return caseID, replaceJob(ctx, t.cases.pool, JobCancelIssue, caseID,
 		cancelPayload{CaseID: caseID, UserID: userID})
 }
 
@@ -246,7 +247,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 			// issue читалось бы как зависший бот.
 			return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 				return putNotifyKey(ctx, tx, cs.ID, "cancel-gone",
-					fmt.Sprintf("Тикета #%d уже нет в GitHub, отменять нечего.", cs.IssueNumber), "")
+					fmt.Sprintf("Тикета #%d уже нет в GitHub, отменять нечего.", cs.IssueNumber), keysCancel)
 			})
 		}
 		return err
@@ -261,7 +262,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 			return putNotifyKey(ctx, tx, cs.ID, "cancel-late",
 				fmt.Sprintf("Тикет #%d уже закрыт со статусом «%s», отменять нечего.",
-					cs.IssueNumber, status.Title), "")
+					cs.IssueNumber, status.Title), keysCancel)
 		})
 	}
 
@@ -300,7 +301,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		}
 		recorded = true
 		return putNotifyKey(ctx, tx, cs.ID, "cancelled",
-			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), "")
+			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), keysCancel)
 	})
 	if err != nil {
 		return err
