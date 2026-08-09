@@ -1,17 +1,17 @@
-name: Deploy dev
+name: Deploy
 
-# Автодеплой dev-контура: каждый push в dev прогоняет проверки, собирает
-# immutable образ sha-<commit> и перевыкатывает Coolify-сервис.
+# Деплой по неизменяемому тегу v*: проверки, immutable образ sha-<commit>,
+# перевыкат Coolify-сервиса. Автодеплоя по push нет: ветка одна, релиз - тег.
 # Репозиторий публичный, поэтому адрес Coolify и UUID сервиса живут в секретах,
 # а сборка и деплой выполняются только для владельца.
 
 on:
   push:
-    branches:
-      - dev
+    tags:
+      - "v*"
   # Ручной запуск: Coolify отвечает «принято» сразу, и выкат может не
   # состояться уже после зелёного workflow. Без этого триггера повторить
-  # деплой можно было только пустым коммитом в dev.
+  # деплой можно было бы только новым тегом.
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,7 @@ permissions:
 # оставила бы в Coolify образ, который никто не разворачивал, и контур
 # числился бы на коммите, который не крутится.
 concurrency:
-  group: intake-dev
+  group: intake-prod
   cancel-in-progress: false
 
 env:
@@ -64,7 +64,7 @@ jobs:
         run: make ci-check
 
   build:
-    name: Build and push dev image
+    name: Build and push image
     runs-on: ubuntu-latest
     needs: checks
     if: github.actor == 'daniil4545' && github.triggering_actor == 'daniil4545'
@@ -88,7 +88,7 @@ jobs:
           push: true
           build-args: |
             VCS_REF=${{ github.sha }}
-          # Только immutable-тег: плавающий :dev создавал бы второй,
+          # Только immutable-тег: плавающий :latest создавал бы второй,
           # неотслеживаемый способ выката.
           tags: |
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
@@ -97,14 +97,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
   deploy:
-    name: Deploy intake-dev
+    name: Deploy intake
     runs-on: ubuntu-latest
     needs: build
     if: github.actor == 'daniil4545' && github.triggering_actor == 'daniil4545'
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
-      - name: Sync dev Compose to Coolify
+      # Имена секретов исторические: сервис в Coolify заведён как intake-dev,
+      # с релиза 0.1.0 этот контур и есть прод.
+      - name: Sync Compose to Coolify
         env:
           COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
           COOLIFY_API_BASE: ${{ secrets.COOLIFY_API_BASE }}
@@ -112,7 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$COOLIFY_TOKEN" && test -n "$COOLIFY_API_BASE" && test -n "$COOLIFY_DEV_SERVICE_UUID"
-          jq -n --arg c "$(base64 -w 0 deploy/dev/docker-compose.coolify.yml)" '{docker_compose_raw: $c}' > payload.json
+          jq -n --arg c "$(base64 -w 0 deploy/prod/docker-compose.coolify.yml)" '{docker_compose_raw: $c}' > payload.json
           curl --fail --silent --show-error --request PATCH \
             "${COOLIFY_API_BASE}/services/${COOLIFY_DEV_SERVICE_UUID}" \
             --header "Authorization: Bearer ${COOLIFY_TOKEN}" \
@@ -149,4 +151,4 @@ jobs:
             echo "Coolify не принял выкат" >&2
             exit 1
           }
-          echo "intake-dev deploy queued for sha-${GITHUB_SHA}"
+          echo "intake deploy queued for sha-${GITHUB_SHA}"
