@@ -48,7 +48,7 @@ services:
       ENV: local
       MEDIA_DIR: /tmp/intake
     # tmpfs для короткоживущих файлов обращений, режим намеренно не задан:
-    # подробности в deploy/dev/docker-compose.coolify.yml.
+    # подробности в deploy/prod/docker-compose.coolify.yml.
     volumes:
       - type: tmpfs
         target: /tmp/intake
