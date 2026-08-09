@@ -82,7 +82,6 @@ type Case struct {
 	Summary     string
 	Incomplete  bool
 	IssueNumber int
-	IssueURL    string
 }
 
 // Item - элемент сырья. Forwarded помечает пересылку: модель должна знать, что
@@ -94,7 +93,6 @@ type Item struct {
 	Normalized string
 	FilePath   string
 	Mime       string
-	TgFileID   string
 	Status     string
 	Error      string
 	Forwarded  bool
@@ -121,7 +119,7 @@ type txRunner interface {
 
 const caseColumns = `id, user_id, project_id, status, protocol, COALESCE(kind, ''),
 	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), incomplete,
-	COALESCE(issue_number, 0), COALESCE(issue_url, '')`
+	COALESCE(issue_number, 0)`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -145,7 +143,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	var filled, gaps []byte
 	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Protocol, &cs.Kind,
 		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Incomplete,
-		&cs.IssueNumber, &cs.IssueURL)
+		&cs.IssueNumber)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -280,7 +278,7 @@ func (c *Cases) CollectItem(ctx context.Context, bot *tele.Bot, cs *Case, msg *t
 		return false, ErrUnsupportedItem
 	}
 
-	count, err := c.countItems(ctx, cs.ID)
+	count, err := c.CountItems(ctx, cs.ID)
 	if err != nil {
 		return false, err
 	}
@@ -401,7 +399,9 @@ func hasURL(entities tele.Entities) bool {
 	return false
 }
 
-func (c *Cases) countItems(ctx context.Context, caseID string) (int, error) {
+// CountItems - сколько сырья в обращении. Отклик сбора берёт число отсюда:
+// своё число в памяти врало бы после рестарта и после возврата обращения в сбор.
+func (c *Cases) CountItems(ctx context.Context, caseID string) (int, error) {
 	var count int
 	err := c.pool.QueryRow(ctx, `SELECT count(*) FROM case_items WHERE case_id = $1`, caseID).Scan(&count)
 	if err != nil {
@@ -415,8 +415,7 @@ func (c *Cases) countItems(ctx context.Context, caseID string) (int, error) {
 func (c *Cases) Items(ctx context.Context, caseID string) ([]Item, error) {
 	rows, err := c.pool.Query(ctx, `
 		SELECT id, kind, source_text, normalized, COALESCE(file_path, ''),
-		       COALESCE(mime, ''), COALESCE(tg_file_id, ''), status,
-		       COALESCE(error, ''), forwarded
+		       COALESCE(mime, ''), status, COALESCE(error, ''), forwarded
 		FROM case_items WHERE case_id = $1 ORDER BY id`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("query items of case %s: %w", caseID, err)
@@ -427,7 +426,7 @@ func (c *Cases) Items(ctx context.Context, caseID string) ([]Item, error) {
 	for rows.Next() {
 		var it Item
 		if err := rows.Scan(&it.ID, &it.Kind, &it.SourceText, &it.Normalized, &it.FilePath,
-			&it.Mime, &it.TgFileID, &it.Status, &it.Error, &it.Forwarded); err != nil {
+			&it.Mime, &it.Status, &it.Error, &it.Forwarded); err != nil {
 			return nil, fmt.Errorf("scan item: %w", err)
 		}
 		items = append(items, it)
@@ -454,7 +453,7 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 		return ErrNotCollecting
 	}
 
-	count, err := c.countItems(ctx, cs.ID)
+	count, err := c.CountItems(ctx, cs.ID)
 	if err != nil {
 		return err
 	}
@@ -974,19 +973,6 @@ func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
 		return false, fmt.Errorf("reopen case %s: %w", caseID, err)
 	}
 	return tag.RowsAffected() > 0, nil
-}
-
-// CountItems - сколько сырья в обращении. Нужен отклику сбора: своё число в
-// памяти врало бы после рестарта и после возврата обращения в сбор.
-func (c *Cases) CountItems(ctx context.Context, caseID string) (int, error) {
-	return c.countItems(ctx, caseID)
-}
-
-// HasMaterial - есть ли в обращении хоть один элемент сырья. Пустой сбор
-// сбрасывается без подтверждения: терять нечего.
-func (c *Cases) HasMaterial(ctx context.Context, caseID string) (bool, error) {
-	n, err := c.countItems(ctx, caseID)
-	return n > 0, err
 }
 
 // putNotify ставит сообщение автору. Ключ по идентификатору работы: её повтор

@@ -202,9 +202,17 @@ func TestDropFiles(t *testing.T) {
 		if it.FilePath != "" {
 			t.Errorf("file_path элемента %d не обнулён: %q", it.ID, it.FilePath)
 		}
-		if it.TgFileID == "" {
-			t.Errorf("tg_file_id элемента %d потерян", it.ID)
-		}
+	}
+	// Инвариант «file_id остаётся в БД» проверяется по колонке: в рабочем коде
+	// tg_file_id после публикации не читается.
+	var lost int
+	err = pool.QueryRow(ctx, `SELECT count(*) FROM case_items
+		WHERE case_id = $1 AND COALESCE(tg_file_id, '') = ''`, cs.ID).Scan(&lost)
+	if err != nil {
+		t.Fatalf("count tg_file_id: %v", err)
+	}
+	if lost > 0 {
+		t.Errorf("tg_file_id потерян у %d элементов", lost)
 	}
 }
 
