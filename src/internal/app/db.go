@@ -98,9 +98,10 @@ func scanProject(row pgx.Row, p *Project) error {
 	return nil
 }
 
-// SyncProjects приводит таблицу проектов к списку из конфига. Проекты, которых
-// в списке нет, не трогаются: убрать проект из меню - это active: false, а не
-// забытая строка, иначе опечатка в переменной гасила бы живой проект.
+// SyncProjects заводит проекты из конфига. Это сид, а не источник истины:
+// существующая строка не трогается вовсе. Иначе рестарт молча откатывал бы всё,
+// что автор поправил командой /project, - переменная и команда писали бы в одну
+// таблицу с необъявленным приоритетом.
 //
 // labels_ready не трогаем: PrepareProject на старте отрабатывает по всем
 // активным проектам независимо от флага, и метки в новом репозитории заведутся
@@ -110,28 +111,25 @@ func SyncProjects(ctx context.Context, pool *pgxpool.Pool, list []ProjectConfig,
 		return nil
 	}
 
+	added := 0
 	for _, p := range list {
-		// xmax = 0 отличает вставку от обновления: другого способа узнать это у
-		// одиночного upsert нет, а появление проекта в меню должно быть в логе.
-		var inserted bool
-		err := pool.QueryRow(ctx, `
+		tag, err := pool.Exec(ctx, `
 			INSERT INTO projects (slug, title, github_owner, github_repo, context, active)
 			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (slug) DO UPDATE SET
-				title = excluded.title, github_owner = excluded.github_owner,
-				github_repo = excluded.github_repo, context = excluded.context,
-				active = excluded.active, updated_at = now()
-			RETURNING (xmax = 0)`,
-			p.Slug, p.Title, p.Owner, p.Repo, p.Context, p.IsActive()).Scan(&inserted)
+			ON CONFLICT (slug) DO NOTHING`,
+			p.Slug, p.Title, p.Owner, p.Repo, p.Context, p.IsActive())
 		if err != nil {
-			return fmt.Errorf("sync project %s: %w", p.Slug, err)
+			return fmt.Errorf("seed project %s: %w", p.Slug, err)
 		}
-		if inserted {
+		if tag.RowsAffected() > 0 {
+			added++
 			log.Info("project_added", "project", p.Slug)
 		}
 	}
 
-	log.Info("projects_synced", "count", len(list))
+	if added > 0 {
+		log.Info("projects_seeded", "added", added, "listed", len(list))
+	}
 	return nil
 }
 
