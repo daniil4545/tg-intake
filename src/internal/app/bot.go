@@ -40,6 +40,9 @@ const (
 	menuRepeat = 10 * time.Second
 	// Сколько живёт обещание «пришлю ссылку» после «Добавить проект».
 	linkWait = 10 * time.Minute
+	// Начальный экран: один текст и для первого показа, и для возврата, иначе
+	// правка сообщения даёт другой заголовок на том же месте.
+	homeText = "Выберите проект или добавьте новый:"
 )
 
 // Инлайн-кнопки: telebot маршрутизирует callback по Unique и кодирует кнопку
@@ -57,11 +60,15 @@ var (
 	cardBtn       = &tele.Btn{Unique: "card"}
 	killBtn       = &tele.Btn{Unique: "kill"}
 	addProjectBtn = &tele.Btn{Unique: "add_project"}
-	resetYesBtn   = &tele.Btn{Unique: "reset_yes"}
-	resetNoBtn    = &tele.Btn{Unique: "reset_no"}
-	doneBtn       = &tele.Btn{Text: "Готово"}
-	menuBtn       = &tele.Btn{Text: "Меню"}
-	resetBtn      = &tele.Btn{Text: "Сброс"}
+	homeBtn       = &tele.Btn{Unique: "home"}
+	// Возврат в меню проекта отдельной кнопкой: projectBtn - это выбор, и он
+	// переставляет проект активного обращения. Навигация состояние не меняет.
+	backBtn     = &tele.Btn{Unique: "back"}
+	resetYesBtn = &tele.Btn{Unique: "reset_yes"}
+	resetNoBtn  = &tele.Btn{Unique: "reset_no"}
+	doneBtn     = &tele.Btn{Text: "Готово"}
+	menuBtn     = &tele.Btn{Text: "Меню"}
+	resetBtn    = &tele.Btn{Text: "Сброс"}
 )
 
 type Bot struct {
@@ -201,6 +208,8 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(publishBtn, b.onPublish)
 	tb.Handle(fixBtn, b.onFix)
 	tb.Handle(addProjectBtn, b.onAddProject)
+	tb.Handle(homeBtn, b.onHome)
+	tb.Handle(backBtn, b.onProjectMenu)
 	tb.Handle(resetYesBtn, b.onResetYes)
 	tb.Handle(resetNoBtn, b.onResetNo)
 	tb.Handle(doneBtn, b.onDone)
@@ -511,9 +520,32 @@ func (b *Bot) homeScreen(ctx context.Context, c tele.Context, intro string) erro
 		return err
 	}
 
-	projects, err := ListProjects(ctx, b.pool)
+	markup, err := b.projectsMarkup(ctx)
 	if err != nil {
 		return err
+	}
+	return c.Send(homeText, markup)
+}
+
+// onHome - «К проектам» с любого экрана. Возврат правкой того же сообщения:
+// экран без пути назад автор читает как тупик и идёт искать команду.
+func (b *Bot) onHome(c tele.Context) error {
+	b.toast(c, "Открываю проекты")
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	markup, err := b.projectsMarkup(ctx)
+	if err != nil {
+		return err
+	}
+	return b.screen(c, homeText, markup)
+}
+
+func (b *Bot) projectsMarkup(ctx context.Context) (*tele.ReplyMarkup, error) {
+	projects, err := ListProjects(ctx, b.pool)
+	if err != nil {
+		return nil, err
 	}
 	markup := &tele.ReplyMarkup{}
 	rows := make([]tele.Row, 0, len(projects)+1)
@@ -522,7 +554,51 @@ func (b *Bot) homeScreen(ctx context.Context, c tele.Context, intro string) erro
 	}
 	rows = append(rows, markup.Row(markup.Data("Добавить проект", addProjectBtn.Unique)))
 	markup.Inline(rows...)
-	return c.Send("Выберите проект или добавьте новый:", markup)
+	return markup, nil
+}
+
+// backHome и backProject - две ступени возврата: к списку проектов и к меню
+// проекта. Дальше вглубь возврат уже есть у карточки тикета.
+func backHome() *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("К проектам", homeBtn.Unique)))
+	return markup
+}
+
+func backProject(slug string) *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("Назад", backBtn.Unique, slug)))
+	return markup
+}
+
+// projectMenu - что можно делать с проектом. Один экран для выбора из списка и
+// для возврата из тикетов.
+func projectMenu(slug string) *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
+		markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
+		markup.Row(markup.Data("К проектам", homeBtn.Unique)),
+	)
+	return markup
+}
+
+// onProjectMenu - «Назад» со списка тикетов. Проект активного обращения не
+// трогает: возврат по экранам не должен переставлять цель сбора.
+func (b *Bot) onProjectMenu(c tele.Context) error {
+	b.toast(c, "Открываю проект")
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	project, ok, err := b.project(ctx, c.Data())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return b.screen(c, "Проект недоступен: его выключили.", backHome())
+	}
+	return b.screen(c, "Проект «"+project.Title+"». Что делаем?", projectMenu(project.Slug))
 }
 
 // askProject показывает меню проектов. Вопрос задаётся ровно один раз за
@@ -560,7 +636,7 @@ func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, bt
 // состояние в БД, а не то, какой экран автор видел последним.
 func (b *Bot) onProject(c tele.Context) error {
 	// Первым делом: иначе у автора висит спиннер на кнопке.
-	b.toast(c, "Проект выбран")
+	b.toast(c, "Открываю проект")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -574,7 +650,7 @@ func (b *Bot) onProject(c tele.Context) error {
 	index := slices.IndexFunc(projects, func(p Project) bool { return p.Slug == slug })
 	if index < 0 {
 		b.log.Warn("unknown_project", "user_id", senderID(c), "slug", slug)
-		return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
+		return b.screen(c, "Проект недоступен: его выключили.", backHome())
 	}
 	title := projects[index].Title
 
@@ -588,12 +664,7 @@ func (b *Bot) onProject(c tele.Context) error {
 		// Экран проектов превращается в экран проекта: то же сообщение, другие
 		// кнопки. Автор видит, что нажатие сработало, а список не остаётся
 		// висеть кликабельным выше по переписке.
-		markup := &tele.ReplyMarkup{}
-		markup.Inline(
-			markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
-			markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
-		)
-		return b.screen(c, "Проект «"+title+"». Что делаем?", markup)
+		return b.screen(c, "Проект «"+title+"». Что делаем?", projectMenu(slug))
 	}
 
 	if err := b.cases.SetProject(ctx, cs, slug); err != nil {
@@ -601,7 +672,7 @@ func (b *Bot) onProject(c tele.Context) error {
 			return b.sendState(c, cs)
 		}
 		if errors.Is(err, ErrUnknownProject) {
-			return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
+			return b.screen(c, "Проект недоступен: его выключили.", backHome())
 		}
 		return err
 	}
@@ -656,7 +727,7 @@ func (b *Bot) onContinue(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
+		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
 	if cs.Status != statusCollecting {
 		return b.sendState(c, cs)
@@ -904,7 +975,7 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
+		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
 
 	round, err := strconv.Atoi(c.Data())
@@ -958,7 +1029,7 @@ func (b *Bot) onPublish(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
+		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
 
 	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
@@ -998,7 +1069,7 @@ func (b *Bot) onFix(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и начните новое.", nil)
+		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
 	if !inDialog(cs.Status) {
 		return b.sendState(c, cs)
@@ -1124,7 +1195,7 @@ func (b *Bot) onResetYes(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто.", nil)
+		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
 	if c.Data() != cs.ID {
 		return b.screen(c, "Кнопка устарела: это подтверждение другого обращения. "+
@@ -1221,7 +1292,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return err
 	}
 	if !ok {
-		return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
+		return b.screen(c, "Проект недоступен: его выключили.", backHome())
 	}
 
 	tickets, err := b.tickets.List(ctx, project)
@@ -1229,12 +1300,12 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return err
 	}
 	if len(tickets) == 0 {
-		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.", nil)
+		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.", backProject(project.Slug))
 	}
 	b.log.Info("tickets_listed", "user_id", senderID(c), "project", project.Slug, "count", len(tickets))
 
 	markup := &tele.ReplyMarkup{}
-	rows := make([]tele.Row, 0, len(tickets))
+	rows := make([]tele.Row, 0, len(tickets)+1)
 	var text strings.Builder
 	text.WriteString("Тикеты проекта «" + project.Title + "»:\n\n")
 	for _, t := range tickets {
@@ -1243,6 +1314,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 			fmt.Sprintf("#%d %s", t.Number, statusTitle(t.Status)),
 			cardBtn.Unique, cardData(project.Slug, t.Number))))
 	}
+	rows = append(rows, markup.Row(markup.Data("Назад", backBtn.Unique, project.Slug)))
 	markup.Inline(rows...)
 	// Правкой длинный список не помещается: та же гвардия, что у карточки.
 	if len(text.String()) > maxMessage {
@@ -1337,7 +1409,7 @@ func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, boo
 	number, err := strconv.Atoi(raw)
 	if !found || err != nil {
 		b.log.Warn("bad_card_data", "user_id", senderID(c), "data", c.Data())
-		return Project{}, 0, false, b.screen(c, "Кнопка устарела. Нажмите «Меню» и откройте список заново.", nil)
+		return Project{}, 0, false, b.screen(c, "Кнопка устарела, откройте список заново.", backHome())
 	}
 
 	project, ok, err := b.project(ctx, slug)
@@ -1345,8 +1417,7 @@ func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, boo
 		return Project{}, 0, false, err
 	}
 	if !ok {
-		return Project{}, 0, false, b.screen(c,
-			"Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
+		return Project{}, 0, false, b.screen(c, "Проект недоступен: его выключили.", backHome())
 	}
 	return project, number, true, nil
 }
