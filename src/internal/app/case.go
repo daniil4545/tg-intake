@@ -972,15 +972,17 @@ func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
 	return tag.RowsAffected() > 0, nil
 }
 
+// CountItems - сколько сырья в обращении. Нужен отклику сбора: своё число в
+// памяти врало бы после рестарта и после возврата обращения в сбор.
+func (c *Cases) CountItems(ctx context.Context, caseID string) (int, error) {
+	return c.countItems(ctx, caseID)
+}
+
 // HasMaterial - есть ли в обращении хоть один элемент сырья. Пустой сбор
 // сбрасывается без подтверждения: терять нечего.
 func (c *Cases) HasMaterial(ctx context.Context, caseID string) (bool, error) {
-	var n int
-	if err := c.pool.QueryRow(ctx,
-		`SELECT count(*) FROM case_items WHERE case_id = $1`, caseID).Scan(&n); err != nil {
-		return false, fmt.Errorf("count items of case %s: %w", caseID, err)
-	}
-	return n > 0, nil
+	n, err := c.countItems(ctx, caseID)
+	return n > 0, err
 }
 
 // putNotify ставит сообщение автору. Ключ по идентификатору работы: её повтор

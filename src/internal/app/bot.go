@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -80,12 +81,78 @@ type Bot struct {
 	// на репозиторий. Та же дисциплина, что и menuAt: последовательные хендлеры,
 	// потеря при рестарте безвредна - автор нажмёт кнопку снова.
 	awaitLink map[int64]time.Time
+	// Сообщения, которые переписываются в отклик: счётчик сбора и последний
+	// раунд вопросов. Их пишет и поллер бота, и воркер очереди через Notify -
+	// две разные горутины, а конкурентная запись в карту роняет процесс без
+	// шанса на recover, поэтому доступ только под mu.
+	//
+	// Хранение в памяти осознанно: message_id нужен ровно до следующего шага, а
+	// потеря при рестарте стоит лишь пропущенной правки.
+	mu     sync.Mutex
+	tally  map[int64]tele.StoredMessage
+	rounds map[int64]roundState
+}
+
+// roundState - сообщение раунда: Bot API правит сообщение целиком, поэтому
+// исходный текст надо помнить, а счётчик ответов держит пометку честной, когда
+// автор отвечает несколькими сообщениями подряд.
+type roundState struct {
+	tele.StoredMessage
+	text    string
+	answers int
+}
+
+func (b *Bot) setTally(user int64, msg tele.StoredMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tally[user] = msg
+}
+
+func (b *Bot) getTally(user int64) (tele.StoredMessage, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	msg, ok := b.tally[user]
+	return msg, ok
+}
+
+func (b *Bot) dropTally(user int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.tally, user)
+}
+
+func (b *Bot) setRound(user int64, state roundState) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rounds[user] = state
+}
+
+func (b *Bot) dropRound(user int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.rounds, user)
+}
+
+// answerRound отмечает ещё один ответ на текущий раунд и отдаёт состояние для
+// правки. Запись остаётся до следующего раунда: автор отвечает и двумя
+// сообщениями подряд, и каждое обязано получить отклик.
+func (b *Bot) answerRound(user int64) (roundState, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state, ok := b.rounds[user]
+	if !ok {
+		return roundState{}, false
+	}
+	state.answers++
+	b.rounds[user] = state
+	return state, true
 }
 
 func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, projects *Projects, log *slog.Logger) (*Bot, error) {
 	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
-		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{}}
+		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
+		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{}}
 
 	// Verbose дампит сырые payload Bot API вместе с текстами сообщений, а
 	// стандартный OnError пишет через stdlib log мимо JSON.
@@ -254,19 +321,44 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	case p.Buttons == keysHome:
 		opts = append(opts, homeKeyboard())
 	}
-	return b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...)
+	sent, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...)
+	if err != nil {
+		return err
+	}
+	// Сбор закончился и обращение ушло дальше - счётчик материала больше не
+	// его: следующее обращение заведёт свой.
+	if cs.Status != statusCollecting {
+		b.dropTally(cs.UserID)
+	}
+	switch {
+	// Сообщение раунда запоминается: ответ автора пометит его принятым и снимет
+	// кнопку «Всё так».
+	case p.Buttons == keysRound && sent != nil:
+		b.setRound(cs.UserID, roundState{
+			StoredMessage: tele.StoredMessage{
+				MessageID: strconv.Itoa(sent.ID), ChatID: sent.Chat.ID,
+			},
+			text: sent.Text,
+		})
+	// Разговор ушёл дальше раундов: правка саммари не должна помечать вопросы,
+	// на которые уже ответили, - иначе пометка садится вверх переписки.
+	case p.Buttons == keysSummary:
+		b.dropRound(cs.UserID)
+	}
+	return nil
 }
 
 // sendLong режет длинный текст по границе строки: протокол не влезает в одно
-// сообщение, а отказ Telegram увёл бы работу в повторы.
-func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) error {
+// сообщение, а отказ Telegram увёл бы работу в повторы. Возвращает последний
+// кусок - тот, что несёт кнопки.
+func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Message, error) {
 	for {
 		if len(text) <= maxMessage {
-			_, err := b.bot.Send(to, text, opts...)
+			sent, err := b.bot.Send(to, text, opts...)
 			if err != nil {
-				return fmt.Errorf("send message: %w", err)
+				return nil, fmt.Errorf("send message: %w", err)
 			}
-			return nil
+			return sent, nil
 		}
 
 		cut := strings.LastIndex(text[:maxMessage], "\n")
@@ -279,7 +371,7 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) error {
 		// opts только на последнем куске: иначе кнопки дублируются под каждым, и
 		// автор жмёт устаревшую копию выше по переписке.
 		if _, err := b.bot.Send(to, strings.TrimRight(text[:cut], "\n")); err != nil {
-			return fmt.Errorf("send message part: %w", err)
+			return nil, fmt.Errorf("send message part: %w", err)
 		}
 		text = strings.TrimLeft(text[cut:], "\n")
 	}
@@ -323,6 +415,42 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 // и не могут быть ни ссылкой, ни сырьём вне сбора.
 func panelWord(text string) bool {
 	return text == doneBtn.Text || text == menuBtn.Text || text == resetBtn.Text
+}
+
+// toast - мгновенный отклик на нажатие: всплывающая подсказка Telegram гасит
+// спиннер кнопки и говорит, что действие принято, ещё до похода в базу, GitHub
+// или к модели. Без неё автор видит только крутящуюся кнопку.
+//
+// Отказ подсказки само действие не отменяет: у протухшего callback Telegram
+// отвечает ошибкой, но нажатие живое, и терять из-за подсказки публикацию
+// тикета нельзя.
+func (b *Bot) toast(c tele.Context, text string) {
+	if err := c.Respond(&tele.CallbackResponse{Text: text}); err != nil {
+		b.log.Warn("toast_failed", "user_id", senderID(c), "error", err)
+	}
+}
+
+// screen переписывает сообщение, на кнопку которого нажали: экран меняется на
+// месте, отработавшие кнопки исчезают, история не растёт копиями меню. Правка
+// не прошла (сообщение слишком старое либо текст совпал) - шлём новым, иначе
+// действие осталось бы без ответа.
+func (b *Bot) screen(c tele.Context, text string, markup *tele.ReplyMarkup) error {
+	var opts []any
+	if markup != nil {
+		opts = append(opts, markup)
+	}
+	err := c.Edit(text, opts...)
+	if err == nil {
+		return nil
+	}
+	// Экран уже такой: двойное нажатие «К списку» или того же проекта. Отклик
+	// автор получил всплывающей подсказкой, дубль экрана был бы ровно тем
+	// шумом, ради которого мы и правим сообщения.
+	if errors.Is(err, tele.ErrSameMessageContent) {
+		return nil
+	}
+	b.log.Warn("screen_edit_failed", "user_id", senderID(c), "error", err)
+	return c.Send(text, opts...)
 }
 
 // refuse отвечает отказом и гасит спиннер, если отказ пришёл на нажатие
@@ -432,9 +560,7 @@ func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, bt
 // состояние в БД, а не то, какой экран автор видел последним.
 func (b *Bot) onProject(c tele.Context) error {
 	// Первым делом: иначе у автора висит спиннер на кнопке.
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Проект выбран")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -448,7 +574,7 @@ func (b *Bot) onProject(c tele.Context) error {
 	index := slices.IndexFunc(projects, func(p Project) bool { return p.Slug == slug })
 	if index < 0 {
 		b.log.Warn("unknown_project", "user_id", senderID(c), "slug", slug)
-		return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+		return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
 	}
 	title := projects[index].Title
 
@@ -459,12 +585,15 @@ func (b *Bot) onProject(c tele.Context) error {
 	b.log.Info("project_selected", "user_id", senderID(c), "slug", slug)
 
 	if cs == nil {
+		// Экран проектов превращается в экран проекта: то же сообщение, другие
+		// кнопки. Автор видит, что нажатие сработало, а список не остаётся
+		// висеть кликабельным выше по переписке.
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(
 			markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
 			markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
 		)
-		return c.Send("Проект «"+title+"» выбран.", markup)
+		return b.screen(c, "Проект «"+title+"». Что делаем?", markup)
 	}
 
 	if err := b.cases.SetProject(ctx, cs, slug); err != nil {
@@ -472,20 +601,22 @@ func (b *Bot) onProject(c tele.Context) error {
 			return b.sendState(c, cs)
 		}
 		if errors.Is(err, ErrUnknownProject) {
-			return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+			return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
 		}
 		return err
 	}
-	return c.Send("Проект «"+title+"» выбран. Присылайте материал и нажмите «Готово».", collectKeyboard())
+	if err := b.screen(c, "Проект «"+title+"» выбран.", nil); err != nil {
+		return err
+	}
+	// Панель сбора - reply-клавиатура, в правку сообщения она не помещается.
+	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
 }
 
 // onCreate - «Создать тикет». При живом обращении автор выбирает: продолжить
 // его или начать заново. Активное обращение у автора одно, и молча подменять
 // его нельзя - в нём уже лежит сырьё.
 func (b *Bot) onCreate(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Собираю обращение")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -505,16 +636,17 @@ func (b *Bot) onCreate(c tele.Context) error {
 		}
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(markup.Row(markup.Data("Продолжить", continueBtn.Unique, slug)))
-		return c.Send("У вас уже есть незакрытое обращение. Продолжайте его "+
+		return b.screen(c, "У вас уже есть незакрытое обращение. Продолжайте его "+
 			"или нажмите «Сброс», чтобы начать заново.", markup)
+	}
+	if err := b.screen(c, "Собираю обращение.", nil); err != nil {
+		return err
 	}
 	return c.Send("Присылайте текст, голосовые и скриншоты. Когда закончите, нажмите «Готово».", collectKeyboard())
 }
 
 func (b *Bot) onContinue(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Продолжаем")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -524,7 +656,7 @@ func (b *Bot) onContinue(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
+		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
 	}
 	if cs.Status != statusCollecting {
 		return b.sendState(c, cs)
@@ -537,7 +669,10 @@ func (b *Bot) onContinue(c tele.Context) error {
 			return err
 		}
 	}
-	return c.Send("Продолжаем. Присылайте материал и нажмите «Готово».", collectKeyboard())
+	if err := b.screen(c, "Продолжаем прежнее обращение.", nil); err != nil {
+		return err
+	}
+	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
 }
 
 // onItem принимает любое сообщение автора. Куда оно пойдёт, решает состояние
@@ -581,6 +716,9 @@ func (b *Bot) onItem(c tele.Context) error {
 // сырьём приходит и слово «Меню» из своего хендлера.
 func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	askProject, err := b.cases.CollectItem(ctx, b.bot, cs, c.Message())
+	if err == nil {
+		b.countItem(ctx, c, cs)
+	}
 	reply, internal := itemReply(err, b.maxItems)
 	if reply != "" {
 		if sendErr := c.Send(reply); sendErr != nil {
@@ -598,6 +736,43 @@ func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 		return err
 	}
 	return nil
+}
+
+// countItem - отклик на принятый материал. Первое сообщение сбора заводит
+// счётчик, каждое следующее переписывает его же: отклик виден на каждом
+// сообщении, а переписка не растёт десятком «принял» на одну пересылку.
+//
+// Число берётся из базы, а не из памяти: после рестарта и после возврата
+// обращения в сбор память пуста, и свой счётчик врал бы автору.
+//
+// Отклик косметический и ошибку наверх не отдаёт: содержательные шаги приёма
+// (вопрос о проекте, отказ) не должны срываться из-за него.
+func (b *Bot) countItem(ctx context.Context, c tele.Context, cs *Case) {
+	user := senderID(c)
+	count, err := b.cases.CountItems(ctx, cs.ID)
+	if err != nil {
+		b.log.Warn("tally_count_failed", "case_id", cs.ID, "error", err)
+		return
+	}
+
+	text := fmt.Sprintf("Принято сообщений: %d. Закончите - нажмите «Готово».", count)
+	if msg, ok := b.getTally(user); ok {
+		if _, err := b.bot.Edit(msg, text); err == nil {
+			return
+		} else if errors.Is(err, tele.ErrSameMessageContent) {
+			return
+		} else {
+			// Сообщение удалили или оно слишком старое: заводим новый счётчик.
+			b.log.Warn("tally_edit_failed", "user_id", user, "error", err)
+		}
+	}
+
+	sent, err := b.bot.Send(c.Recipient(), text)
+	if err != nil {
+		b.log.Warn("tally_send_failed", "user_id", user, "error", err)
+		return
+	}
+	b.setTally(user, tele.StoredMessage{MessageID: strconv.Itoa(sent.ID), ChatID: sent.Chat.ID})
 }
 
 // itemReply - что ответить автору на неудачный приём и надо ли тащить ошибку
@@ -673,20 +848,53 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 	case strings.TrimSpace(msg.Text) != "":
 		if err := b.cases.AddAnswer(ctx, cs, msg.Text); err != nil {
 			if errors.Is(err, ErrNotInterview) {
-				return c.Send("Обращение уже ушло дальше. Отправьте /start, чтобы завести новое.")
+				return c.Send("Обращение уже ушло дальше. Нажмите «Меню» и заведите новое.")
 			}
 			return err
+		}
+		// До следующего раунда - секунды работы модели. Правим сообщение с
+		// вопросами: кнопка «Всё так» снимается (ответ уже дан), и видно, что
+		// ответ принят. Править нечего - отвечаем словами, молчания быть не
+		// должно.
+		if !b.markRound(cs) {
+			return c.Send("Ответ принят. Думаю дальше.")
 		}
 		return nil
 	}
 	return c.Send("Ответьте текстом или голосовым. Скриншоты принимаются только до кнопки «Готово».")
 }
 
+// markRound помечает сообщение раунда принятым и снимает кнопку «Всё так».
+// Запись живёт до следующего раунда: автор отвечает и двумя сообщениями
+// подряд, и каждое обязано получить отклик - счётчик ответов делает пометку
+// честной.
+//
+// Возвращает false, если правки не вышло: раунда нет в памяти после рестарта
+// либо Telegram отказал на старом сообщении. Тогда отклик даёт вызывающий, а
+// ответ автора в любом случае уже записан.
+func (b *Bot) markRound(cs *Case) bool {
+	state, ok := b.answerRound(cs.UserID)
+	if !ok {
+		return false
+	}
+
+	note := "Ответ принят. Думаю дальше."
+	if state.answers > 1 {
+		note = fmt.Sprintf("Принято ответов: %d. Думаю дальше.", state.answers)
+	}
+	if _, err := b.bot.Edit(state.StoredMessage, state.text+"\n\n---\n"+note); err != nil {
+		if errors.Is(err, tele.ErrSameMessageContent) {
+			return true
+		}
+		b.log.Warn("round_mark_failed", "case_id", cs.ID, "error", err)
+		return false
+	}
+	return true
+}
+
 // onAllTrue - «Всё так»: предположения модели становятся ответом целиком.
 func (b *Bot) onAllTrue(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Принято")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -696,12 +904,12 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
+		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
 	}
 
 	round, err := strconv.Atoi(c.Data())
 	if err != nil {
-		return c.Send("Кнопка устарела. Ответьте, пожалуйста, текстом.")
+		return b.screen(c, "Кнопка устарела. Ответьте, пожалуйста, текстом.", nil)
 	}
 
 	switch err := b.cases.AcceptRound(ctx, cs, round); {
@@ -717,32 +925,30 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		return err
 	}
 
-	// Кнопка снимается сразу, тем же ответом: следующий ход идёт секунды, и без
-	// видимой реакции человек жмёт её ещё раз. Каждое лишнее нажатие - ещё один
-	// ответ в истории и ещё один ход модели поверх незаконченного.
-	if err := c.Edit(acceptedText(c)); err != nil {
-		b.log.Warn("round_edit_failed", "user_id", senderID(c), "error", err)
-		return c.Send("Принял. Уточняю дальше.")
-	}
-	return nil
+	// Кнопка снимается сразу, тем же сообщением: следующий ход идёт секунды, и
+	// без видимой реакции человек жмёт её ещё раз. Каждое лишнее нажатие - ещё
+	// один ответ в истории и ещё один ход модели поверх незаконченного.
+	//
+	// Раунд помечен вручную, и запись о нём больше не нужна: следующий ответ
+	// автора относится уже к другому сообщению.
+	b.dropRound(senderID(c))
+	return b.screen(c, markAnswered(c, "Принято: всё так. Думаю дальше."), nil)
 }
 
-// acceptedText помечает раунд принятым прямо в исходном сообщении: история
-// переписки остаётся читаемой, а кнопки под ним больше нет.
-func acceptedText(c tele.Context) string {
+// markAnswered дописывает исход к сообщению раунда: вопросы остаются читаемыми
+// в истории, а под ними видно, что ответ принят и бот работает дальше.
+func markAnswered(c tele.Context, note string) string {
 	text := "Раунд вопросов"
 	if msg := c.Message(); msg != nil && msg.Text != "" {
 		text = msg.Text
 	}
-	return text + "\n\n---\nПринято: всё так. Уточняю дальше."
+	return text + "\n\n---\n" + note
 }
 
 // onPublish - «Публикую»: подтверждение саммари, после которого тикет уходит в
 // GitHub, а файлы обращения удаляются.
 func (b *Bot) onPublish(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Публикую")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -752,7 +958,7 @@ func (b *Bot) onPublish(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Обращение уже закрыто. Отправьте /start и заведите новое.")
+		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и заведите новое.", nil)
 	}
 
 	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
@@ -769,7 +975,9 @@ func (b *Bot) onPublish(c tele.Context) error {
 		}
 		return err
 	}
-	return c.Send("Публикую. Пришлю номер и ссылку.")
+	// Кнопки саммари снимаются: тикет уже уходит, второе нажатие только
+	// путало бы. Номер придёт отдельным сообщением из очереди.
+	return b.screen(c, markAnswered(c, "Публикую. Пришлю номер и ссылку."), nil)
 }
 
 // onFix - «Поправить». Состояние не меняет: правкой становится следующее
@@ -780,9 +988,7 @@ func (b *Bot) onPublish(c tele.Context) error {
 // приглашение «напишите правку» отправило бы следующий текст автора в сырьё
 // нового обращения или в пустоту.
 func (b *Bot) onFix(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Жду правку")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -792,12 +998,17 @@ func (b *Bot) onFix(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Обращение уже закрыто. Нажмите «Меню» и начните новое.")
+		return b.screen(c, "Обращение уже закрыто. Нажмите «Меню» и начните новое.", nil)
 	}
 	if !inDialog(cs.Status) {
 		return b.sendState(c, cs)
 	}
-	return c.Send("Что поправить? Напишите или наговорите - перепишу и покажу снова.")
+	// Кнопка «Публикую» остаётся: автор мог передумать править, и без неё
+	// пришлось бы искать саммари выше по переписке.
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("Публикую", publishBtn.Unique)))
+	return b.screen(c, markAnswered(c, "Жду правку: напишите или наговорите, "+
+		"перепишу и покажу снова."), markup)
 }
 
 func (b *Bot) onDone(c tele.Context) error {
@@ -831,6 +1042,8 @@ func (b *Bot) onDone(c tele.Context) error {
 	case err != nil:
 		return err
 	}
+	// Сбор закрыт: счётчик отработал, следующее обращение заведёт свой.
+	b.dropTally(senderID(c))
 	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", homeKeyboard())
 }
 
@@ -888,6 +1101,10 @@ func (b *Bot) onReset(c tele.Context) error {
 		)
 		return c.Send("Обращение будет отменено безвозвратно, вместе с файлами. Сбросить?", markup)
 	}
+	// Обращение уходит целиком: и счётчик сбора, и раунд вопросов больше не
+	// его.
+	b.dropTally(senderID(c))
+	b.dropRound(senderID(c))
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		return err
 	}
@@ -897,9 +1114,7 @@ func (b *Bot) onReset(c tele.Context) error {
 // onResetYes - подтверждение сброса. Кнопка живёт в переписке дольше экрана:
 // обращение могло уйти дальше или закрыться, отменяется то, что активно сейчас.
 func (b *Bot) onResetYes(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Сбрасываю")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -909,31 +1124,33 @@ func (b *Bot) onResetYes(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Edit("Обращение уже закрыто.")
+		return b.screen(c, "Обращение уже закрыто.", nil)
 	}
 	if c.Data() != cs.ID {
-		return c.Edit("Кнопка устарела: это подтверждение другого обращения. " +
-			"Чтобы сбросить текущее, нажмите «Сброс».")
+		return b.screen(c, "Кнопка устарела: это подтверждение другого обращения. "+
+			"Чтобы сбросить текущее, нажмите «Сброс».", nil)
 	}
+	// Обращение уходит целиком: и счётчик сбора, и раунд вопросов больше не
+	// его.
+	b.dropTally(senderID(c))
+	b.dropRound(senderID(c))
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		if errors.Is(err, ErrPublishing) {
-			return c.Edit("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
+			return b.screen(c, "Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.", nil)
 		}
 		return err
 	}
-	if err := c.Edit("Обращение отменено, файлы удалены."); err != nil {
-		b.log.Warn("reset_edit_failed", "user_id", senderID(c), "error", err)
+	if err := b.screen(c, "Обращение отменено, файлы удалены.", nil); err != nil {
+		return err
 	}
 	return b.homeScreen(ctx, c, "Начнём заново.")
 }
 
 func (b *Bot) onResetNo(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Оставляю")
 	// Правка вместо нового сообщения: кнопки подтверждения снимаются, чтобы
 	// «Да, сбросить» не сработала неделю спустя.
-	return c.Edit("Оставил, продолжаем.")
+	return b.screen(c, "Оставил, продолжаем.", nil)
 }
 
 // isCommand отличает набранную команду от текста reply-кнопки: у них общий
@@ -990,11 +1207,11 @@ func (b *Bot) onTicketList(c tele.Context) error {
 	return b.askProjectFor(ctx, c, "Тикеты какого проекта показать?", ticketsBtn)
 }
 
-// onTickets - список тикетов проекта.
+// onTickets - список тикетов проекта. Список, карточка и возврат к списку
+// живут одним сообщением-экраном: оно переписывается на каждом шаге, и автор
+// видит отклик там же, куда смотрит.
 func (b *Bot) onTickets(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Открываю тикеты")
 
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -1004,7 +1221,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return err
 	}
 	if !ok {
-		return c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+		return b.screen(c, "Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
 	}
 
 	tickets, err := b.tickets.List(ctx, project)
@@ -1012,7 +1229,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return err
 	}
 	if len(tickets) == 0 {
-		return c.Send("По проекту «" + project.Title + "» тикетов ещё нет.")
+		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.", nil)
 	}
 	b.log.Info("tickets_listed", "user_id", senderID(c), "project", project.Slug, "count", len(tickets))
 
@@ -1027,15 +1244,18 @@ func (b *Bot) onTickets(c tele.Context) error {
 			cardBtn.Unique, cardData(project.Slug, t.Number))))
 	}
 	markup.Inline(rows...)
-	return b.sendLong(c.Recipient(), text.String(), markup)
+	// Правкой длинный список не помещается: та же гвардия, что у карточки.
+	if len(text.String()) > maxMessage {
+		_, err := b.sendLong(c.Recipient(), text.String(), markup)
+		return err
+	}
+	return b.screen(c, text.String(), markup)
 }
 
 // onCard - карточка тикета. Кнопка отмены только автору: просмотр общий, отмена
 // нет.
 func (b *Bot) onCard(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Открываю тикет")
 
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -1048,11 +1268,11 @@ func (b *Bot) onCard(c tele.Context) error {
 	ticket, err := b.tickets.Load(ctx, project, number)
 	switch {
 	case errors.Is(err, ErrIssueGone):
-		return c.Send(fmt.Sprintf("Тикета #%d больше нет в GitHub.", number))
+		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug))
 	case err != nil:
 		return err
 	case ticket == nil:
-		return c.Send("Тикет не найден. Откройте список заново.")
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
 	}
 	b.log.Info("ticket_opened", "user_id", senderID(c), "case_id", ticket.CaseID, "issue", number)
 
@@ -1064,15 +1284,27 @@ func (b *Bot) onCard(c tele.Context) error {
 	}
 	rows = append(rows, markup.Row(markup.Data("К списку", ticketsBtn.Unique, project.Slug)))
 	markup.Inline(rows...)
-	return b.sendLong(c.Recipient(), cardText(ticket), markup)
+
+	// Карточка длиннее одного сообщения правкой не помещается: режем на куски
+	// и отправляем, экран списка при этом остаётся выше.
+	if len(cardText(ticket)) > maxMessage {
+		_, err := b.sendLong(c.Recipient(), cardText(ticket), markup)
+		return err
+	}
+	return b.screen(c, cardText(ticket), markup)
+}
+
+// backToList - единственная кнопка возврата к списку тикетов проекта.
+func backToList(slug string) *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, slug)))
+	return markup
 }
 
 // onKill ставит работу отмены. Ответ автору синхронный, сама отмена идёт
 // очередью: это мутация в GitHub, она обязана пережить рестарт.
 func (b *Bot) onKill(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Отменяю тикет")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -1086,13 +1318,16 @@ func (b *Bot) onKill(c tele.Context) error {
 	switch {
 	case errors.Is(err, ErrNotAuthor):
 		b.log.Warn("cancel_denied", "user_id", senderID(c), "project", project.Slug, "issue", number)
-		return c.Send("Отменить тикет может только его автор.")
+		return b.screen(c, "Отменить тикет может только его автор.", backToList(project.Slug))
 	case errors.Is(err, ErrIssueGone):
-		return c.Send("Тикет не найден. Откройте список заново.")
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
 	case err != nil:
 		return err
 	}
-	return c.Send(fmt.Sprintf("Отменяю тикет #%d, сообщу когда закроется.", number))
+	// Кнопка отмены снимается сразу: работа уже в очереди, второе нажатие
+	// поставило бы её заново. Итог придёт отдельным сообщением из очереди.
+	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу когда закроется.", number),
+		backToList(project.Slug))
 }
 
 // cardTarget разбирает кнопку карточки. Второе значение false означает, что
@@ -1102,7 +1337,7 @@ func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, boo
 	number, err := strconv.Atoi(raw)
 	if !found || err != nil {
 		b.log.Warn("bad_card_data", "user_id", senderID(c), "data", c.Data())
-		return Project{}, 0, false, c.Send("Кнопка устарела. Откройте список заново.")
+		return Project{}, 0, false, b.screen(c, "Кнопка устарела. Нажмите «Меню» и откройте список заново.", nil)
 	}
 
 	project, ok, err := b.project(ctx, slug)
@@ -1110,7 +1345,8 @@ func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, boo
 		return Project{}, 0, false, err
 	}
 	if !ok {
-		return Project{}, 0, false, c.Send("Проект недоступен. Отправьте /start и выберите заново.")
+		return Project{}, 0, false, b.screen(c,
+			"Проект недоступен: его выключили. Нажмите «Меню» и выберите заново.", nil)
 	}
 	return project, number, true, nil
 }
@@ -1188,9 +1424,7 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 // onAddProject - кнопка «Добавить проект»: следующее сообщение автора - ссылка.
 // При активном обращении кнопка не работает: ссылка ушла бы в него сырьём.
 func (b *Bot) onAddProject(c tele.Context) error {
-	if err := c.Respond(); err != nil {
-		return err
-	}
+	b.toast(c, "Жду ссылку")
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -1203,7 +1437,8 @@ func (b *Bot) onAddProject(c tele.Context) error {
 		return b.sendState(c, cs)
 	}
 	b.awaitLink[senderID(c)] = time.Now()
-	return c.Send("Пришлите ссылку на репозиторий следующим сообщением.")
+	return b.screen(c, "Пришлите ссылку на репозиторий следующим сообщением, "+
+		"например https://github.com/owner/repo", nil)
 }
 
 // onProjectLink - сообщение, обещанное после «Добавить проект». Зовёт allow:
@@ -1239,7 +1474,8 @@ func (b *Bot) addProject(c tele.Context, args string) error {
 		return c.Send(projectFailText(err))
 	}
 
-	return b.sendLong(c.Recipient(), projectCard(project, source))
+	_, err = b.sendLong(c.Recipient(), projectCard(project, source))
+	return err
 }
 
 // projectCard показывает и то, откуда взялось описание: контекст уходит в
