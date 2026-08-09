@@ -1,11 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"maps"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -297,6 +300,143 @@ func TestAcceptRound(t *testing.T) {
 	}
 	if n := countJobs(t, pool, JobInterview, cs.ID); n != 1 {
 		t.Errorf("повтор нажатия добавил работу: работ %d, ожидалась 1", n)
+	}
+}
+
+// TestAcceptRoundSkipsStub: «Всё так» превращает догадки в слова автора, и
+// отписка модели «не указано» стала бы подтверждённым фактом. Такой пункт
+// остаётся открытым.
+func TestAcceptRoundSkipsStub(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6010, 1)
+
+	questions := []Question{
+		{Key: "case", Text: "какой заказ?", Suggested: "заказ 4821"},
+		{Key: "actual", Text: "что вышло?", Suggested: "Не указано"},
+	}
+	err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{"round": 1, "questions": questions})
+	if err != nil {
+		t.Fatalf("add round: %v", err)
+	}
+	if err := cases.AcceptRound(ctx, reload(t, cases, cs.ID), 1); err != nil {
+		t.Fatalf("accept round: %v", err)
+	}
+
+	history, err := cases.history(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	answer := history[len(history)-1].Parts[0].text
+	if strings.Contains(strings.ToLower(answer), "не указано") {
+		t.Errorf("отписка ушла в ответ автора: %q", answer)
+	}
+	if !strings.Contains(answer, "заказ 4821") {
+		t.Errorf("содержательная догадка потеряна: %q", answer)
+	}
+}
+
+// TestExhaustedQuestionGoesToSummary: пункт, о котором уже спрашивали дважды,
+// третьего вопроса не получает. Ход не задаёт раунд из воздуха, а собирает
+// саммари с тем, что есть: повтор одного и того же автор читает как поломку.
+func TestExhaustedQuestionGoesToSummary(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6011, 1)
+
+	turn := `{"kind":"bug","filled":[{"key":"case","value":"заказ 4821"}],` +
+		`"gaps":["expected","actual"],"ready":false,` +
+		`"questions":[{"key":"expected","text":"что ожидали?","suggested":"статус «оплачен»"}]}`
+	i := newTestInterview(t, cases, 3)
+	i.llm = fakeLLM(t, turn)
+
+	// Два раунда об одном пункте: предел исчерпан, третьего вопроса быть не
+	// должно, даже если модель его предлагает.
+	for n := 1; n <= maxAsks; n++ {
+		err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
+			"round": n, "questions": []Question{{Key: "expected", Text: "что ожидали?"}},
+		})
+		if err != nil {
+			t.Fatalf("add round: %v", err)
+		}
+	}
+
+	job := Job{ID: 1, Kind: JobInterview, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := i.Run(ctx, job); err != nil {
+		t.Fatalf("run interview: %v", err)
+	}
+
+	if n := countJobs(t, pool, JobSummarize, cs.ID); n != 1 {
+		t.Errorf("работ саммари: %d, ожидалась 1", n)
+	}
+	if n := countJobs(t, pool, JobNotify, cs.ID); n != 0 {
+		t.Errorf("исчерпанный пункт ушёл автору третьим вопросом: уведомлений %d", n)
+	}
+	if got := reload(t, cases, cs.ID).Gaps; len(got) != 2 {
+		t.Errorf("пробелы не сохранены: %v", got)
+	}
+}
+
+// fakeLLM подменяет транспорт клиента: ответ модели приходит из теста, сеть не
+// нужна. Тест в том же пакете, поэтому обходится без параметра адреса.
+func fakeLLM(t *testing.T, content string) *OpenRouter {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"message": map[string]string{"content": content}}},
+	})
+	if err != nil {
+		t.Fatalf("encode llm response: %v", err)
+	}
+
+	llm := NewOpenRouter("test-key", "test-model", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	llm.http = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	})}
+	return llm
+}
+
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestAskedKeys: раунд задаёт несколько вопросов, а человек отвечает на один -
+// остальные модель спрашивает снова. Счётчик по журналу решает, когда пункт
+// исчерпан: третий заход по одному ключу автор читает как поломку бота.
+func TestAskedKeys(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6009, 1)
+
+	rounds := [][]Question{
+		{{Key: "case", Text: "какой заказ?"}, {Key: "expected", Text: "что ожидали?"}},
+		{{Key: "expected", Text: "а всё-таки, что должно было выйти?"}},
+	}
+	for n, questions := range rounds {
+		err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
+			"round": n + 1, "questions": questions,
+		})
+		if err != nil {
+			t.Fatalf("add round: %v", err)
+		}
+	}
+
+	asked, err := cases.askedKeys(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("asked keys: %v", err)
+	}
+	if asked["expected"] < maxAsks {
+		t.Errorf("пункт expected спрошен %d раз, ожидалось не меньше %d", asked["expected"], maxAsks)
+	}
+	if asked["case"] >= maxAsks {
+		t.Errorf("пункт case исчерпан после одного вопроса: %d", asked["case"])
 	}
 }
 

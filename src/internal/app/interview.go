@@ -21,7 +21,12 @@ const (
 	stepSummary   = "summary"
 	// Больше трёх вопросов за раз человек не читает, а отвечает на первый.
 	maxQuestions = 3
-	maxTitle     = 80
+	// Сколько раз один пункт контракта вообще может стать вопросом. Раунд
+	// задаёт несколько вопросов, а человек отвечает одной репликой на один из
+	// них - остальные модель законно спрашивает снова. Второй заход уместен,
+	// третий автор читает как испорченную пластинку.
+	maxAsks  = 2
+	maxTitle = 80
 )
 
 var (
@@ -231,11 +236,27 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return err
 	}
 
+	// Исчерпанный пункт снимается с вопросов и остаётся пробелом: тикет уйдёт с
+	// пометкой о неполноте, и это честнее третьего повтора. Правка саммари
+	// предела не знает, как и предела раундов: автор пришёл уточнять именно
+	// этот пункт, и молчание в ответ обесценило бы правку.
+	if !fix {
+		asked, err := i.cases.askedKeys(ctx, cs.ID)
+		if err != nil {
+			return err
+		}
+		kept := slices.DeleteFunc(turn.Questions, func(q Question) bool { return asked[q.Key] >= maxAsks })
+		if len(kept) < len(turn.Questions) {
+			i.log.Info("questions_exhausted", "case_id", cs.ID, "dropped", len(turn.Questions)-len(kept))
+		}
+		turn.Questions = kept
+	}
+
 	// Предел считается по уже заданным раундам: исчерпав их, ход не спрашивает
 	// ничего, а собирает саммари с тем, что есть. Правка саммари предел не
 	// проверяет - иначе автор, заметивший ошибку на последнем раунде, не может
 	// её исправить.
-	toSummary := turn.Ready || (!fix && cs.Round >= i.rounds)
+	toSummary := turn.Ready || len(turn.Questions) == 0 || (!fix && cs.Round >= i.rounds)
 	round := cs.Round
 	if !toSummary {
 		round++
@@ -394,6 +415,9 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 			return fmt.Errorf("gap key %q is not in contract", key)
 		}
 	}
+	// Два вопроса об одном пункте в одном раунде сожгли бы его предел за раз:
+	// счётчик заданных вопросов считает по журналу, а не по раундам.
+	seen := make(map[string]bool, len(turn.Questions))
 	for _, q := range turn.Questions {
 		if !slices.Contains(turn.Gaps, q.Key) {
 			return fmt.Errorf("question about closed key %q", q.Key)
@@ -401,6 +425,10 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		if strings.TrimSpace(q.Text) == "" {
 			return fmt.Errorf("question about %q is empty", q.Key)
 		}
+		if seen[q.Key] {
+			return fmt.Errorf("two questions about key %q", q.Key)
+		}
+		seen[q.Key] = true
 	}
 	if turn.Ready && len(turn.Gaps) > 0 {
 		return fmt.Errorf("turn is ready with %d gaps", len(turn.Gaps))
@@ -753,22 +781,47 @@ func (c *Cases) AcceptRound(ctx context.Context, cs *Case, round int) error {
 		return ErrStaleRound
 	}
 
-	// Вопрос без догадки кнопка не закрывает: пустая строка стала бы
-	// подтверждённым ответом, которого автор не видел. Такой пункт остаётся
-	// открытым, и модель спросит его снова.
+	// Вопрос без догадки кнопка не закрывает: отписка стала бы подтверждённым
+	// ответом, которого автор не видел. Такой пункт остаётся открытым.
 	var b strings.Builder
 	for _, q := range questions {
-		suggested := strings.TrimSpace(q.Suggested)
-		if suggested == "" {
+		if isStub(q.Suggested) {
 			continue
 		}
-		fmt.Fprintf(&b, "%s: %s\n", q.Text, suggested)
+		fmt.Fprintf(&b, "%s: %s\n", q.Text, strings.TrimSpace(q.Suggested))
 	}
 	if b.Len() == 0 {
 		return ErrNoSuggestion
 	}
 	return c.AddAnswer(ctx, cs, b.String())
 }
+
+// isStub - догадки нет: пусто или отписка вроде «не указано». Промт такие
+// строки запрещает, но кнопка «Всё так» превращает догадку в слова автора, а
+// выдуманный ответ дороже лишнего вопроса: сомнительную строку лучше не
+// принять, чем принять.
+func isStub(text string) bool {
+	text = strings.ToLower(strings.Trim(text, " .,:;-"))
+	if text == "" {
+		return true
+	}
+	// Отписка на этих словах обрывается: «дата не указана». Тот же оборот
+	// внутри фразы - факт о сервисе: «в заказе не указан адрес».
+	for _, tail := range stubTails {
+		if strings.HasSuffix(text, tail) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(stubPhrases, func(p string) bool { return strings.Contains(text, p) })
+}
+
+var (
+	stubTails = []string{"не указано", "не указан", "не указана", "не указаны", "неизвестно",
+		"не известно", "не разобрано", "неясно", "не ясно", "не сообщил", "не сообщила"}
+	stubPhrases = []string{"нет данных", "данных нет", "нет информации", "информации нет",
+		"информация отсутствует", "данные отсутствуют", "не удалось определить",
+		"уточнить не удалось", "не сообщается"}
+)
 
 // roundAnswered - последним событием разговора идёт ответ, а не вопрос. Значит
 // текущий раунд закрыт и подтверждать в нём нечего.
@@ -785,6 +838,36 @@ func (c *Cases) roundAnswered(ctx context.Context, caseID string) (bool, error) 
 		return false, fmt.Errorf("check last event of case %s: %w", caseID, err)
 	}
 	return kind == "answer_given", nil
+}
+
+// askedKeys - сколько раз каждый пункт контракта уже становился вопросом.
+// Считается по журналу: раунды переживают рестарт, а память процесса нет.
+func (c *Cases) askedKeys(ctx context.Context, caseID string) (map[string]int, error) {
+	rows, err := c.pool.Query(ctx, `
+		SELECT payload FROM case_events
+		WHERE case_id = $1 AND kind = 'round_asked'`, caseID)
+	if err != nil {
+		return nil, fmt.Errorf("query asked rounds of case %s: %w", caseID, err)
+	}
+	defer rows.Close()
+
+	asked := map[string]int{}
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, fmt.Errorf("scan asked round: %w", err)
+		}
+		var p struct {
+			Questions []Question `json:"questions"`
+		}
+		if err := json.Unmarshal(payload, &p); err != nil {
+			return nil, fmt.Errorf("decode asked round: %w", err)
+		}
+		for _, q := range p.Questions {
+			asked[q.Key]++
+		}
+	}
+	return asked, rows.Err()
 }
 
 func (c *Cases) lastQuestions(ctx context.Context, caseID string) ([]Question, error) {
