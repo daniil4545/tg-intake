@@ -61,13 +61,15 @@ type Bot struct {
 	pool     *pgxpool.Pool
 	cases    *Cases
 	tickets  *Tickets
+	projects *Projects
 	log      *slog.Logger
 	allowed  []int64
 	maxItems int
 }
 
-func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, log *slog.Logger) (*Bot, error) {
-	b := &Bot{pool: pool, cases: cases, tickets: tickets, log: log, allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems}
+func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, projects *Projects, log *slog.Logger) (*Bot, error) {
+	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
+		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems}
 
 	// Verbose дампит сырые payload Bot API вместе с текстами сообщений, а
 	// стандартный OnError пишет через stdlib log мимо JSON.
@@ -95,6 +97,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle("/done", b.onDone)
 	tb.Handle("/cancel", b.onCancel)
 	tb.Handle("/tickets", b.onTicketList)
+	tb.Handle("/project", b.onProjectAdd)
 
 	tb.Handle(projectBtn, b.onProject)
 	tb.Handle(ticketsBtn, b.onTickets)
@@ -977,4 +980,52 @@ func cardText(t *Ticket) string {
 		text.WriteString("\n" + t.URL)
 	}
 	return text.String()
+}
+
+// projectHelp - подсказка команды. Один пример важнее описания синтаксиса:
+// ссылку копируют со страницы репозитория и присылают как есть.
+const projectHelp = "Пришлите ссылку на репозиторий проекта:\n" +
+	"/project https://github.com/owner/repo\n\n" +
+	"Название и описание я соберу сам по README. Можно задать их явно:\n" +
+	"/project owner/repo Название | Чем занят сервис"
+
+// onProjectAdd заводит проект по ссылке. Заводить может любой из белого списка:
+// ролей в сервисе нет, а токен всё равно ограничен своими репозиториями.
+func (b *Bot) onProjectAdd(c tele.Context) error {
+	args := strings.TrimSpace(c.Message().Payload)
+	if args == "" {
+		return c.Send(projectHelp)
+	}
+
+	// Бюджет с запасом: чтение репозитория, README и ход модели.
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
+	project, err := b.projects.Add(ctx, senderID(c), args)
+	switch {
+	case errors.Is(err, ErrBadProjectRef):
+		return c.Send(projectHelp)
+	case err != nil:
+		b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
+		return c.Send(projectFailText(err))
+	}
+
+	return b.sendLong(c.Recipient(), projectCard(project))
+}
+
+func projectCard(p ProjectConfig) string {
+	return fmt.Sprintf("Проект «%s» заведён и появился в меню.\nРепозиторий: %s/%s\n\n%s\n\n"+
+		"Название и описание можно переписать той же командой:\n/project %s/%s Название | Описание",
+		p.Title, p.Owner, p.Repo, p.Context, p.Owner, p.Repo)
+}
+
+// projectFailText объясняет отказ словами автора, а не статусом API: для
+// fine-grained токена «нет репозитория» и «нет доступа» неразличимы.
+func projectFailText(err error) string {
+	var apiErr *githubError
+	if errors.As(err, &apiErr) && (apiErr.status == http.StatusNotFound || apiErr.status == http.StatusForbidden) {
+		return "Репозиторий недоступен: токен сервиса его не видит либо не может писать в Issues. " +
+			"Проверьте адрес и права токена, потом повторите."
+	}
+	return "Не получилось завести проект. Попробуйте ещё раз, а если повторится - напишите владельцу сервиса."
 }

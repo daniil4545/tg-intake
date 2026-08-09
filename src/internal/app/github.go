@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -582,4 +583,62 @@ func publishedMessage(number int, url string, incomplete bool) string {
 			"пробелы перечислены в теле."
 	}
 	return text
+}
+
+// Repo - репозиторий в том виде, в каком его читает заведение проекта.
+type Repo struct {
+	Name        string `json:"name"`
+	FullName    string `json:"full_name"`
+	Description string `json:"description"`
+	Private     bool   `json:"private"`
+}
+
+// GetRepo читает репозиторий быстрым клиентом: зовут из хендлера, автор ждёт.
+// 404 означает «нет репозитория либо токен его не видит»; для fine-grained PAT
+// это одно и то же, и различать их сервису незачем.
+func (g *GitHub) GetRepo(ctx context.Context, owner, repo string) (Repo, error) {
+	raw, err := g.get(ctx, fmt.Sprintf("/repos/%s/%s", owner, repo), true)
+	if err != nil {
+		return Repo{}, err
+	}
+
+	var out Repo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return Repo{}, fmt.Errorf("decode repo %s/%s: %w", owner, repo, err)
+	}
+	return out, nil
+}
+
+// GetReadme отдаёт текст README. Пустая строка означает, что его нет: контекст
+// проекта тогда соберётся из описания репозитория.
+//
+// Содержимое приходит в base64 внутри JSON - сырой текст потребовал бы своего
+// заголовка Accept, а клиент шлёт один на все запросы.
+func (g *GitHub) GetReadme(ctx context.Context, owner, repo string) (string, error) {
+	raw, err := g.get(ctx, fmt.Sprintf("/repos/%s/%s/readme", owner, repo), true)
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	var out struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("decode readme of %s/%s: %w", owner, repo, err)
+	}
+	if out.Encoding != "base64" {
+		return out.Content, nil
+	}
+
+	// Переносы строк внутри base64 - обычное дело для этого ответа, декодер их
+	// не принимает.
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(out.Content, "\n", ""))
+	if err != nil {
+		return "", fmt.Errorf("decode readme body of %s/%s: %w", owner, repo, err)
+	}
+	return string(decoded), nil
 }
