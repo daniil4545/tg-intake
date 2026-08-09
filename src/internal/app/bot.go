@@ -466,13 +466,12 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 			b.log.Warn("access_denied", "user_id", sender.ID)
 			return refuse(c, "Доступ к боту закрыт. Напишите владельцу сервиса.")
 		}
-		// Ожидание ссылки после «Добавить проект» живёт до первого апдейта:
-		// скрытый режим не должен пережить смену темы. Слова панели пропускаются
-		// к своим хендлерам - нажатие «Меню» не должно разбираться как ссылка.
+		// Ожидание ссылки после «Добавить проект» разбирается до маршрутизации.
+		// Команда, кнопка и слово панели его снимают: скрытый режим не должен
+		// пережить смену темы, а нажатие «Меню» не должно разбираться как ссылка.
 		if since, ok := b.awaitLink[sender.ID]; ok {
 			delete(b.awaitLink, sender.ID)
-			text := strings.TrimSpace(c.Text())
-			if c.Callback() == nil && text != "" && !isCommand(c) && !panelWord(text) &&
+			if c.Callback() == nil && !isCommand(c) && !panelWord(strings.TrimSpace(c.Text())) &&
 				time.Since(since) < linkWait {
 				return b.onProjectLink(c)
 			}
@@ -916,7 +915,7 @@ func itemReply(err error, maxItems int) (text string, internal bool) {
 		// следующее сообщение бот не должен.
 		return "", false
 	case errors.Is(err, ErrUnsupportedItem):
-		return "Пришлите текстом, голосом или скриншотом.", false
+		return "Пришлите текстом, голосовым или скриншотом.", false
 	case errors.Is(err, ErrTooManyItems):
 		return fmt.Sprintf("В обращении уже %d сообщений. Нажмите «Готово».", maxItems), false
 	case errors.Is(err, ErrFileTooBig):
@@ -1219,11 +1218,12 @@ func (b *Bot) onReset(c tele.Context) error {
 		return c.Send("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
 	}
 
-	material, err := b.cases.HasMaterial(ctx, cs.ID)
+	// Пустой сбор сбрасывается без подтверждения: терять нечего.
+	count, err := b.cases.CountItems(ctx, cs.ID)
 	if err != nil {
 		return err
 	}
-	if material {
+	if count > 0 {
 		// Подтверждение привязано к обращению: кнопка живёт в переписке дольше,
 		// чем слот, и без привязки отменяла бы уже другое обращение автора.
 		markup := &tele.ReplyMarkup{}
@@ -1469,7 +1469,7 @@ func (b *Bot) onKill(c tele.Context) error {
 	}
 	// Кнопка отмены снимается сразу: работа уже в очереди, второе нажатие
 	// поставило бы её заново.
-	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу когда закроется.", number),
+	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу, когда закроется.", number),
 		backToList(project.Slug))
 }
 
@@ -1558,7 +1558,7 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 		if errors.Is(err, ErrBadProjectRef) {
 			return c.Send(projectHelp)
 		}
-		return err
+		return b.refuseProject(c, err)
 	}
 	return nil
 }
@@ -1587,37 +1587,43 @@ func (b *Bot) onAddProject(c tele.Context) error {
 // хендлера у него нет, ожидание разбирается до маршрутизации.
 func (b *Bot) onProjectLink(c tele.Context) error {
 	err := b.addProject(c, strings.TrimSpace(c.Text()))
+	if err == nil {
+		return nil
+	}
+	// Обещание ссылки продлевается на любом отказе: автор ошибся, а не
+	// передумал. Только здесь: команда /project с мусором ждать следующее
+	// сообщение не обещала, и её ожидание крало бы сырьё активного сбора.
+	b.awaitLink[senderID(c)] = time.Now()
 	if errors.Is(err, ErrBadProjectRef) {
-		// Обещание ссылки продлевается: автор ошибся, а не передумал. Только
-		// здесь: команда /project с мусором ждать следующее сообщение не
-		// обещала, и взведённое ею ожидание крало бы сырьё активного сбора.
-		b.awaitLink[senderID(c)] = time.Now()
 		return c.Send(projectHelp)
 	}
-	return err
+	return b.refuseProject(c, err)
 }
 
-// addProject заводит проект и отвечает карточкой. ErrBadProjectRef возвращает
-// как есть: подсказку каждый вход даёт свою.
+// addProject заводит проект и отвечает карточкой. Отказы возвращает как есть:
+// ответ на них каждый вход даёт свой.
 func (b *Bot) addProject(c tele.Context, args string) error {
 	// Бюджет с запасом: чтение репозитория, README и ход модели.
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
 	project, source, err := b.projects.Add(ctx, senderID(c), args)
-	switch {
-	case errors.Is(err, ErrBadProjectRef):
+	if err != nil {
 		return err
-	case errors.Is(err, ErrSlugTaken):
-		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
-			"Напишите владельцу сервиса - выключить проект из бота пока можно только через базу.")
-	case err != nil:
-		b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
-		return c.Send(projectFailText(err))
 	}
-
 	_, err = b.sendLong(c.Recipient(), projectCard(project, source))
 	return err
+}
+
+// refuseProject отвечает на отказ заведения проекта; ErrBadProjectRef входы
+// разбирают сами, до этого ответа он не доходит.
+func (b *Bot) refuseProject(c tele.Context, err error) error {
+	if errors.Is(err, ErrSlugTaken) {
+		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
+			"Напишите владельцу сервиса - выключить проект из бота пока можно только через базу.")
+	}
+	b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
+	return c.Send(projectFailText(err))
 }
 
 // projectCard показывает и то, откуда взялось описание: контекст уходит в
