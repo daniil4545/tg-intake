@@ -87,8 +87,9 @@ func main() {
 	checkGitHub(ctx, pool, github, log)
 
 	tickets := app.NewTickets(cases, github, statuses, log)
+	projects := app.NewProjects(cases, github, llm, cfg.ModelDialog, log)
 
-	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, log)
+	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, projects, log)
 	if err != nil {
 		log.Error("bot_failed", "error", err)
 		os.Exit(1)
