@@ -514,8 +514,12 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		}
 		moved = true
 
+		// Текст саммари ложится снимком в событие, а не читается потом из
+		// колонки: колонка держит только последнюю версию, а цепочку правок
+		// модель обязана видеть целиком.
 		if err := addEvent(ctx, tx, cs.ID, "summary_ready", map[string]any{
 			"incomplete": incomplete, "sections": len(out.Sections),
+			"title": title, "body": body,
 		}); err != nil {
 			return err
 		}
@@ -654,11 +658,12 @@ func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Mess
 
 // history восстанавливает разговор из журнала. Отдельной таблицы у него нет:
 // диалог по природе append-only, а case_events уже пишется в тех же
-// транзакциях, что и смена статуса.
+// транзакциях, что и смена статуса. Показанное саммари - такая же реплика бота,
+// как вопрос раунда: автор правит именно его.
 func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 	rows, err := c.pool.Query(ctx, `
 		SELECT kind, payload FROM case_events
-		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given')
+		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given', 'summary_ready')
 		ORDER BY id`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("query history of case %s: %w", caseID, err)
@@ -693,6 +698,23 @@ func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 				return nil, fmt.Errorf("decode given answer: %w", err)
 			}
 			messages = append(messages, Message{Role: "user", Parts: []Part{TextPart(p.Text)}})
+		case "summary_ready":
+			var p struct {
+				Title string `json:"title"`
+				Body  string `json:"body"`
+			}
+			if err := json.Unmarshal(payload, &p); err != nil {
+				return nil, fmt.Errorf("decode shown summary: %w", err)
+			}
+			// Обращение начато до выката: снимка в событии нет, и подставить
+			// вместо него нечего.
+			if p.Body == "" {
+				continue
+			}
+			messages = append(messages, Message{
+				Role:  "assistant",
+				Parts: []Part{TextPart(p.Title + "\n\n" + p.Body)},
+			})
 		}
 	}
 	return messages, rows.Err()

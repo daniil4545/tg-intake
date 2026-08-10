@@ -564,6 +564,61 @@ func TestAnswerAfterSummaryIsFix(t *testing.T) {
 	}
 }
 
+// TestShownSummaryIsInHistory: автор правит текст, который бот ему показал.
+// Саммари обязано лежать в истории репликой бота, иначе правка ссылается в
+// пустоту. Событие без снимка текста (обращение старше выката) пропускается.
+func TestShownSummaryIsInHistory(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6012, 1)
+
+	err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
+		"round": 1, "questions": []Question{{Key: "case", Text: "какой заказ?"}},
+	})
+	if err != nil {
+		t.Fatalf("add round: %v", err)
+	}
+	if err := addEvent(ctx, pool, cs.ID, "answer_given", map[string]any{"text": "заказ 4821"}); err != nil {
+		t.Fatalf("add answer: %v", err)
+	}
+	err = addEvent(ctx, pool, cs.ID, "summary_ready", map[string]any{
+		"title": "Заказ 4821 не уходит в доставку", "body": "## Конкретный случай\n\nЗаказ 4821.",
+	})
+	if err != nil {
+		t.Fatalf("add summary: %v", err)
+	}
+	if err := addEvent(ctx, pool, cs.ID, "answer_given", map[string]any{"text": "заказ 4812"}); err != nil {
+		t.Fatalf("add fix: %v", err)
+	}
+
+	history, err := cases.history(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 4 {
+		t.Fatalf("сообщений в истории: %d, ожидалось 4", len(history))
+	}
+	shown := history[2]
+	if shown.Role != "assistant" {
+		t.Errorf("роль показанного саммари: %s, ожидалась assistant", shown.Role)
+	}
+	if !strings.Contains(shown.Parts[0].text, "Заказ 4821 не уходит в доставку") {
+		t.Errorf("в истории нет текста показанного саммари: %q", shown.Parts[0].text)
+	}
+
+	if err := addEvent(ctx, pool, cs.ID, "summary_ready", map[string]any{"incomplete": false}); err != nil {
+		t.Fatalf("add legacy summary: %v", err)
+	}
+	history, err = cases.history(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("history after legacy: %v", err)
+	}
+	if len(history) != 4 {
+		t.Errorf("событие без текста саммари попало в историю: %d сообщений", len(history))
+	}
+}
+
 // TestStaleTurnIsDropped: пока модель думает, автор дописывает - и его ответ уже
 // поставил свежий ход. Устаревший результат не имеет права лечь поверх: иначе
 // автор получает два раунда вопросов на один свой ответ.
