@@ -9,9 +9,10 @@
   ],
   "feature": [
     { "key": "problem", "title": "Какую задачу это решает", "required": true },
-    { "key": "today", "title": "Как справляются сейчас", "required": true },
+    { "key": "today", "title": "Как это делают сейчас", "required": true },
     { "key": "result", "title": "Каким должен быть результат", "required": true },
     { "key": "done", "title": "Как поймём, что готово", "required": true },
+    { "key": "volume", "title": "Как часто это происходит", "required": false },
     { "key": "edge", "title": "Нестандартные случаи и исключения", "required": false },
     { "key": "who", "title": "Кого это касается", "required": false }
   ],
