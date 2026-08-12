@@ -50,9 +50,9 @@
 - `github.com/pressly/goose/v3` - миграции, бинарь в образе
 - `log/slog` (stdlib) - JSON-логи; OpenRouter и GitHub - свои клиенты на
   `net/http`, SDK не тянем; ffmpeg не нужен - модель принимает ogg/opus
-- Модели: `OPENROUTER_MODEL_MEDIA` (голос и скриншоты,
-  `google/gemini-3.1-flash-lite`), `OPENROUTER_MODEL_DIALOG` (интервью и
-  саммари, `deepseek/deepseek-v4-flash-0731`)
+- Модели: `OPENROUTER_MODEL_MEDIA` (голос и скриншоты) и
+  `OPENROUTER_MODEL_DIALOG` (интервью и саммари) с бюджетом размышлений
+  `OPENROUTER_REASONING_DIALOG` - без предела шаг думает дольше, чем отвечает
 
 ## Структура
 

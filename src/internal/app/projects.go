@@ -35,11 +35,11 @@ type Projects struct {
 	cases *Cases
 	gh    *GitHub
 	llm   *OpenRouter
-	model string
+	model DialogModel
 	log   *slog.Logger
 }
 
-func NewProjects(cases *Cases, gh *GitHub, llm *OpenRouter, model string, log *slog.Logger) *Projects {
+func NewProjects(cases *Cases, gh *GitHub, llm *OpenRouter, model DialogModel, log *slog.Logger) *Projects {
 	return &Projects{cases: cases, gh: gh, llm: llm, model: model, log: log}
 }
 
@@ -203,8 +203,10 @@ func (p *Projects) ask(ctx context.Context, repo Repo, readme string) (projectGu
 	}
 
 	raw, err := p.llm.Complete(ctx, Request{
-		Step:  "project",
-		Model: p.model,
+		Step:      "project",
+		Model:     p.model.Name,
+		Reasoning: p.model.Reasoning,
+		MaxTokens: llmMaxTokens,
 		Messages: []Message{
 			{Role: "system", Parts: []Part{TextPart(mustPrompt("project.md"))}},
 			{Role: "user", Parts: []Part{TextPart(material.String())}},

@@ -47,7 +47,7 @@ type Interview struct {
 	llm    *OpenRouter
 	log    *slog.Logger
 	rules  Contract
-	model  string
+	model  DialogModel
 	rounds int
 
 	// Готовые куски системного сообщения: собираются один раз, потому что
@@ -57,7 +57,7 @@ type Interview struct {
 	turnSchema json.RawMessage
 }
 
-func NewInterview(cases *Cases, llm *OpenRouter, log *slog.Logger, rules Contract, model string, rounds int) *Interview {
+func NewInterview(cases *Cases, llm *OpenRouter, log *slog.Logger, rules Contract, model DialogModel, rounds int) *Interview {
 	return &Interview{
 		cases:      cases,
 		llm:        llm,
@@ -350,7 +350,9 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (interviewTurn, error) {
 	req := Request{
 		Step:       stepInterview,
-		Model:      i.model,
+		Model:      i.model.Name,
+		Reasoning:  i.model.Reasoning,
+		MaxTokens:  llmMaxTokens,
 		Messages:   messages,
 		SchemaName: "interview_turn",
 		Schema:     i.turnSchema,
@@ -435,8 +437,21 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		}
 		seen[q.Key] = true
 	}
-	if turn.Ready && len(turn.Gaps) > 0 {
-		return fmt.Errorf("turn is ready with %d gaps", len(turn.Gaps))
+	// Готовность держат только обязательные пункты. Необязательный остаётся в
+	// gaps и уходит в тикет строкой «не разобрано»: требовать пустой gaps
+	// значило бы либо не давать разговору закончиться, либо заставлять модель
+	// прятать непрочитанное - именно на этом противоречии контур выбрасывал
+	// готовые генерации (наблюдение 2026-08-12).
+	missing := i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn))
+	if turn.Ready && len(missing) > 0 {
+		return fmt.Errorf("turn is ready with %d required gaps", len(missing))
+	}
+	// Готовность обрывает разговор, и заданные тем же ходом вопросы автору уже
+	// не уйдут. Раньше это исключалось само собой (готовность требовала пустых
+	// gaps, а вопрос - ключа из них); теперь необязательный пункт остаётся в
+	// gaps, и модель может спросить про него, объявив разговор законченным.
+	if turn.Ready && len(turn.Questions) > 0 {
+		return fmt.Errorf("turn is ready with %d questions", len(turn.Questions))
 	}
 	// Иначе разговор встаёт: не готово, а спросить нечего.
 	if !turn.Ready && len(turn.Questions) == 0 {
@@ -444,7 +459,7 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	}
 	// Обязательный пункт, не закрытый и не названный пробелом, ушёл бы в тикет
 	// молчанием. Признаваться в непрочитанном модель обязана.
-	for _, key := range i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn)) {
+	for _, key := range missing {
 		if !slices.Contains(turn.Gaps, key) {
 			return fmt.Errorf("required key %q is neither filled nor in gaps", key)
 		}
@@ -488,7 +503,10 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 
 	title := scrubContacts(strings.TrimSpace(out.Title))
 	body := i.renderSections(cs, out.Sections)
-	incomplete := len(cs.Gaps) > 0
+	// Недобран контракт или нет, решают обязательные пункты: необязательный
+	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
+	// иначе её носил бы каждый тикет.
+	incomplete := len(i.rules.Missing(cs.Kind, cs.Filled)) > 0
 	// Ни одной строки ни от модели, ни из контракта: показывать автору нечего,
 	// и работа уходит в повторы, а исчерпав их - скажет ему об этом.
 	if body == "" {
@@ -532,7 +550,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// переписанное саммари упёрлось бы в ключ прошлого - автор не увидел бы
 		// собственную правку.
 		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			summaryMessage(title, body, i.gapTitles(cs)), keysSummary)
+			summaryMessage(title, body, i.gapTitles(cs), incomplete), keysSummary)
 	})
 	if err != nil {
 		return err
@@ -550,7 +568,9 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message) (summaryOut, error) {
 	req := Request{
 		Step:       stepSummary,
-		Model:      i.model,
+		Model:      i.model.Name,
+		Reasoning:  i.model.Reasoning,
+		MaxTokens:  llmMaxTokens,
 		Messages:   messages,
 		SchemaName: "case_summary",
 		Schema:     summarySchema,
@@ -1041,14 +1061,19 @@ func questionList(questions []Question) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func summaryMessage(title, body string, gaps []string) string {
+func summaryMessage(title, body string, gaps []string, incomplete bool) string {
 	var b strings.Builder
 	b.WriteString("Вот что уйдёт в тикет.\n\n")
 	b.WriteString(title + "\n\n")
 	b.WriteString(plainSections(body))
 	if len(gaps) > 0 {
-		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") +
-			". Тикет уйдёт с пометкой о неполноте.")
+		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") + ".")
+		// Пометку о неполноте несёт только незакрытый обязательный пункт:
+		// обещать её на необязательном пробеле значит пугать автора тем, чего
+		// в тикете не будет.
+		if incomplete {
+			b.WriteString(" Тикет уйдёт с пометкой о неполноте.")
+		}
 	}
 	b.WriteString("\n\nГде я ошибся? Напишите правку - или публикуем.")
 	return b.String()
