@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -657,14 +658,45 @@ func itemLine(it Item) string {
 		return label + ": не удалось разобрать: " + oneLine(reason)
 	}
 
-	body := it.Normalized
+	body := strings.TrimSpace(it.Normalized)
+	caption := strings.TrimSpace(it.SourceText)
 	if body == "" {
-		body = it.SourceText
+		body = caption
+		caption = ""
 	}
-	if strings.TrimSpace(body) == "" {
+	if body == "" {
 		return ""
 	}
+	// Подпись под пересланным медиа автор набирает сам, поэтому она идёт
+	// отдельной строкой и как его слова: пометка «не слова автора» относится к
+	// содержимому элемента, а не к тому, что автор написал под ним.
+	if caption != "" {
+		return label + ": " + body + "\n   слова автора: " + caption
+	}
 	return label + ": " + body
+}
+
+// linkRe - адрес в тексте сообщения. Скобки и угловые исключены нарочно: ссылка
+// часто стоит внутри фразы, а хвостовая пунктуация обрезается отдельно.
+var linkRe = regexp.MustCompile(`https?://[^\s<>()]+`)
+
+// collectLinks - адреса из сырья обращения в порядке появления, без дублей.
+// Собираются кодом, а не моделью: адрес обязан попасть в тикет символ в символ,
+// а модель законно сокращает и переписывает текст.
+func collectLinks(items []Item) []string {
+	var links []string
+	seen := map[string]bool{}
+	for _, it := range items {
+		for _, link := range linkRe.FindAllString(it.SourceText, -1) {
+			link = strings.TrimRight(link, ".,;:!?»\"'")
+			if link == "" || seen[link] {
+				continue
+			}
+			seen[link] = true
+			links = append(links, link)
+		}
+	}
+	return links
 }
 
 func oneLine(text string) string {

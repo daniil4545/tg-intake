@@ -70,15 +70,41 @@ func TestBuildProtocol(t *testing.T) {
 		{ID: 2, Kind: "voice", Normalized: "жму сохранить, ничего не происходит", Status: "done"},
 		{ID: 3, Kind: "text", SourceText: "у меня то же самое", Status: "done", Forwarded: true},
 		{ID: 4, Kind: "photo", Status: "failed", Error: "файл не прочитан"},
+		{ID: 5, Kind: "photo", Normalized: "экран заказа 4821", SourceText: "вот тут видно",
+			Status: "done", Forwarded: true},
 	}
 
 	want := "1. текст: форма не сохраняется\n" +
 		"2. голосовое: жму сохранить, ничего не происходит\n" +
 		"3. текст, переслано (не слова автора): у меня то же самое\n" +
-		"4. скриншот: не удалось разобрать: файл не прочитан"
+		"4. скриншот: не удалось разобрать: файл не прочитан\n" +
+		"5. скриншот, переслано (не слова автора): экран заказа 4821\n" +
+		"   слова автора: вот тут видно"
 
 	if got := BuildProtocol(items); got != want {
 		t.Errorf("протокол:\nполучено:\n%s\nожидалось:\n%s", got, want)
+	}
+}
+
+// TestCollectLinks: адрес обязан дойти до тикета целиком и один раз, откуда бы
+// автор его ни прислал - отдельным сообщением или подписью к скриншоту.
+func TestCollectLinks(t *testing.T) {
+	items := []Item{
+		{Kind: "photo", Normalized: "карточка сделки", SourceText: "https://crm.example.com/leads/59630249"},
+		{Kind: "text", SourceText: "то же самое видно тут: https://crm.example.com/leads/59630249."},
+		{Kind: "voice", Normalized: "задача висит в просрочках", SourceText: "и ещё статус менять надо"},
+		{Kind: "link", SourceText: "https://crm.example.com/tasks/12 (там же)"},
+	}
+
+	want := []string{"https://crm.example.com/leads/59630249", "https://crm.example.com/tasks/12"}
+	got := collectLinks(items)
+	if len(got) != len(want) {
+		t.Fatalf("ссылок: %d %v, ожидалось %d %v", len(got), got, len(want), want)
+	}
+	for n := range want {
+		if got[n] != want[n] {
+			t.Errorf("ссылка %d: %q, ожидалась %q", n, got[n], want[n])
+		}
 	}
 }
 
