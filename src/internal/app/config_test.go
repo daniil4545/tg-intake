@@ -16,12 +16,13 @@ func TestLoadConfigReportsEveryProblem(t *testing.T) {
 	// Битый адрес прокси обязан всплыть при старте, а не первым вызовом модели
 	// в середине живого разговора.
 	t.Setenv("OPENROUTER_PROXY", "::not a url::")
+	t.Setenv("ALERT_CHAT_ID", "@my_channel")
 
 	_, err := LoadConfig()
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
-	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "AUDIO_CONVERT", "OPENROUTER_PROXY"} {
+	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "AUDIO_CONVERT", "OPENROUTER_PROXY", "ALERT_CHAT_ID"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error must name %s, got: %v", want, err)
 		}

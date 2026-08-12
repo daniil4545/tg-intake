@@ -80,6 +80,10 @@ type Bot struct {
 	log      *slog.Logger
 	allowed  []int64
 	maxItems int
+	// Отправитель уведомлений владельцу: бот сервиса либо отдельный бот канала
+	// алертов. nil - уведомления выключены конфигом либо отправитель не собрался;
+	// что именно, говорит лог старта.
+	alert *tele.Bot
 	// Когда автору в последний раз отвечали меню на свободное сообщение.
 	// Хендлеры идут последовательно (Synchronous), мьютекс не нужен; потеря
 	// при рестарте безвредна - автор получит меню лишний раз.
@@ -273,6 +277,16 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(tele.OnMedia, b.onItem)
 
 	b.bot = tb
+
+	// Отказ отправителя уведомлений не роняет старт: приём обращений не должен
+	// зависеть от чужого бота - раздел 3 спеки.
+	alert, err := newAlertBot(cfg, tb)
+	if err != nil {
+		log.Error("alert_bot_failed", "error", err)
+	}
+	b.alert = alert
+	log.Info("alerts_enabled", "on", alert != nil, "own_bot", cfg.AlertBotToken != "")
+
 	return b, nil
 }
 
@@ -329,6 +343,20 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	}
 	if p.Text == "" {
 		return fmt.Errorf("notify of case %s has no text", p.CaseID)
+	}
+
+	// Уведомление владельцу: адресат назван в работе, обращение для него не
+	// нужно. Выключенные уведомления гасят уже поставленную работу молча -
+	// иначе она крутилась бы в повторах до провала.
+	if p.ChatID != 0 {
+		if b.alert == nil {
+			b.log.Warn("alert_skipped", "case_id", p.CaseID, "chat_id", p.ChatID)
+			return nil
+		}
+		if _, err := b.alert.Send(&tele.Chat{ID: p.ChatID}, p.Text); err != nil {
+			return fmt.Errorf("send alert: %w", err)
+		}
+		return nil
 	}
 
 	cs, err := b.cases.Load(ctx, p.CaseID)
