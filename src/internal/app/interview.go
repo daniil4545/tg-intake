@@ -274,8 +274,13 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return nil
 	}
 
+	// Ключи пробелов, а не только их число: решение «оставлять ли пункт
+	// обязательным» принимается по тому, какой из них не закрывается чаще
+	// прочих, и по счётчику этого не увидеть. Ключ - имя пункта контракта,
+	// содержимого обращения в нём нет.
 	i.log.Info("interview_round", "case_id", cs.ID, "round", round, "kind", turn.Kind,
-		"questions", len(turn.Questions), "gaps", len(turn.Gaps), "to_summary", toSummary)
+		"questions", len(turn.Questions), "gaps", len(turn.Gaps),
+		"gap_keys", strings.Join(turn.Gaps, ","), "to_summary", toSummary)
 	return nil
 }
 
@@ -537,6 +542,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	}
 
 	i.log.Info("summary_ready", "case_id", cs.ID, "incomplete", incomplete,
+		"gap_keys", strings.Join(cs.Gaps, ","),
 		"sections", len(out.Sections), "chars", utf8.RuneCountInString(body))
 	return nil
 }
