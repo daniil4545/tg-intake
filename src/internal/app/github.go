@@ -456,6 +456,10 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
+	items, err := p.cases.Items(ctx, cs.ID)
+	if err != nil {
+		return err
+	}
 
 	if !project.LabelsReady {
 		if err := p.gh.EnsureLabels(ctx, project); err != nil {
@@ -486,7 +490,8 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		if cs.Incomplete {
 			labels = append(labels, "incomplete")
 		}
-		number, url, err = p.gh.CreateIssue(ctx, project, cs.Title, p.body(cs, author, marker), labels)
+		body := p.body(cs, author, collectLinks(items), marker)
+		number, url, err = p.gh.CreateIssue(ctx, project, cs.Title, body, labels)
 		if err != nil {
 			return err
 		}
@@ -538,10 +543,20 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 //
 // Авторство фиксируется телом, а не полем API: GitHub не даёт создать issue от
 // чужого имени, автором станет владелец токена.
-func (p *Publisher) body(cs *Case, author User, marker string) string {
+func (p *Publisher) body(cs *Case, author User, links []string, marker string) string {
 	var b strings.Builder
 	b.WriteString("Автор: " + authorName(author) + "\n\n")
 	b.WriteString(cs.Summary)
+
+	// Адреса из сырья идут отдельным разделом и целиком: тот, кто возьмёт тикет,
+	// открывает карточку сам, а пересказ модели ведёт в никуда.
+	if len(links) > 0 {
+		b.WriteString("\n\n## Ссылки\n\n")
+		for _, link := range links {
+			b.WriteString("- " + link + "\n")
+		}
+		b.WriteString("\nПрислано автором вместе с материалом обращения.")
+	}
 
 	if len(cs.Gaps) > 0 {
 		b.WriteString("\n\n## Не разобрано\n\n")
