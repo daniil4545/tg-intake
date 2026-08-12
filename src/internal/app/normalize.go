@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -9,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"unicode/utf8"
 
@@ -72,21 +70,13 @@ var (
 // Побочные эффекты выполняет Go: модель возвращает структуру, Go валидирует её
 // и только потом пишет в БД.
 type Normalizer struct {
-	cases   *Cases
-	llm     *OpenRouter
-	log     *slog.Logger
-	convert bool
+	cases *Cases
+	llm   *OpenRouter
+	log   *slog.Logger
 }
 
-// NewNormalizer: audioConvert - значение AUDIO_CONVERT, «always» включает
-// прогон через ffmpeg.
-func NewNormalizer(cases *Cases, llm *OpenRouter, log *slog.Logger, audioConvert string) *Normalizer {
-	return &Normalizer{
-		cases:   cases,
-		llm:     llm,
-		log:     log,
-		convert: audioConvert == "always",
-	}
+func NewNormalizer(cases *Cases, llm *OpenRouter, log *slog.Logger) *Normalizer {
+	return &Normalizer{cases: cases, llm: llm, log: log}
 }
 
 // RunNormalizeVoice расшифровывает одно голосовое. Работа ставится по элементу,
@@ -108,7 +98,7 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 		return n.cases.PutImagesJob(ctx, p.CaseID)
 	}
 
-	audio, format, err := n.readAudio(ctx, *item)
+	audio, format, err := n.readAudio(*item)
 	if err != nil {
 		// Файла нет или он не читается: повтор этого не исправит.
 		n.log.Warn("item_rejected", "case_id", p.CaseID, "item_id", item.ID,
@@ -393,17 +383,7 @@ func hasContent(items []Item) bool {
 }
 
 // readAudio отдаёт байты записи и значение format для input_audio.
-func (n *Normalizer) readAudio(ctx context.Context, item Item) ([]byte, string, error) {
-	if n.convert {
-		data, err := convertToMP3(ctx, item.FilePath)
-		if err != nil {
-			return nil, "", err
-		}
-		// После конвертации format обязан стать mp3: провайдер верит полю, а не
-		// содержимому, и ogg в заголовке при mp3-байтах кончается отказом.
-		return data, "mp3", nil
-	}
-
+func (n *Normalizer) readAudio(item Item) ([]byte, string, error) {
 	data, err := readFile(item.FilePath)
 	if err != nil {
 		return nil, "", err
@@ -422,24 +402,6 @@ func audioFormat(mime string) string {
 	default:
 		return "ogg"
 	}
-}
-
-func convertToMP3(ctx context.Context, path string) ([]byte, error) {
-	if path == "" {
-		return nil, errors.New("item has no file")
-	}
-
-	var out, errOut bytes.Buffer
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path, "-f", "mp3", "-")
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ffmpeg: %w: %s", err, oneLine(errOut.String()))
-	}
-	if out.Len() == 0 {
-		return nil, errors.New("ffmpeg produced no audio")
-	}
-	return out.Bytes(), nil
 }
 
 // readFile отделяет «пути нет в БД» от «файла нет на диске»: после DropFiles
