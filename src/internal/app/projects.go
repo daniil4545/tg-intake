@@ -206,6 +206,7 @@ func (p *Projects) ask(ctx context.Context, repo Repo, readme string) (projectGu
 		Step:      "project",
 		Model:     p.model.Name,
 		Reasoning: p.model.Reasoning,
+		MaxTokens: llmMaxTokens,
 		Messages: []Message{
 			{Role: "system", Parts: []Part{TextPart(mustPrompt("project.md"))}},
 			{Role: "user", Parts: []Part{TextPart(material.String())}},

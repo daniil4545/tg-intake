@@ -31,9 +31,13 @@ const (
 	llmMinBudget = 30 * time.Second
 	llmRetries   = 3
 	llmBodyLimit = 1 << 20
-	// Потолок ответа - страховка от генерации без конца, а не тюнинг: обрезанный
-	// ответ ломает JSON схемы, поэтому предел заведомо щедрый.
-	llmMaxTokens = 4000
+	// Потолок ответа диалогового шага - страховка от генерации без конца, а не
+	// тюнинг. Он один на размышления и на сам ответ, а уровень размышлений
+	// меняют переменной контура без релиза: впритык к наблюдавшимся 4476
+	// токенам потолок обрезал бы каждый ход на `medium`, и обрезанный JSON не
+	// разбирается вовсе. Медиа-шаги потолка не ставят: длину транскрипта задаёт
+	// запись, а не модель, и голосовое на десятки минут упрётся в любой предел.
+	llmMaxTokens = 8000
 )
 
 // OpenRouter - клиент chat/completions. Один эндпоинт не оправдывает SDK:
@@ -77,6 +81,11 @@ type Request struct {
 	// параметр вовсе. Требовать его у провайдера без поддержки нельзя:
 	// require_parameters сузит выбор до тех, кто умеет reasoning.
 	Reasoning string
+	// MaxTokens - потолок ответа: ноль означает не передавать параметр вовсе.
+	// Ставят его диалоговые шаги, где длину ответа выбирает модель. Шагу, чья
+	// длина задана материалом (транскрипт записи), потолок обрезал бы ответ на
+	// середине, а обрезанный JSON не разбирается вовсе.
+	MaxTokens int
 }
 
 // DialogModel - модель диалоговых шагов и её бюджет размышлений. Пара едет
@@ -159,7 +168,7 @@ type chatRequest struct {
 	Messages       []Message      `json:"messages"`
 	ResponseFormat responseFormat `json:"response_format"`
 	Provider       providerOpts   `json:"provider"`
-	MaxTokens      int            `json:"max_tokens"`
+	MaxTokens      int            `json:"max_tokens,omitempty"`
 	Reasoning      *reasoningOpts `json:"reasoning,omitempty"`
 }
 
@@ -191,6 +200,10 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		// "length" означает, что ответ упёрся в потолок и оборван на середине.
+		// Без этого признака обрыв виден только ошибкой разбора JSON, а она
+		// читается как «модель не держит схему» - причину искали бы не там.
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
@@ -235,7 +248,7 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 		Messages:       req.Messages,
 		ResponseFormat: responseFormat{Type: "json_schema", JSONSchema: jsonSchema{Name: name, Strict: true, Schema: req.Schema}},
 		Provider:       providerOpts{RequireParameters: true},
-		MaxTokens:      llmMaxTokens,
+		MaxTokens:      req.MaxTokens,
 	}
 	if req.Reasoning != "" {
 		wire.Reasoning = &reasoningOpts{Effort: req.Reasoning}
@@ -329,6 +342,11 @@ func (c *OpenRouter) send(ctx context.Context, body []byte) (llmResult, bool, er
 	}
 	if len(out.Choices) == 0 || strings.TrimSpace(out.Choices[0].Message.Content) == "" {
 		return llmResult{}, false, errors.New("empty content")
+	}
+	// Повтор не поможет: тот же запрос упрётся в тот же потолок. Ошибка названа
+	// прямо, чтобы правка потолка не искалась через разбор JSON.
+	if out.Choices[0].FinishReason == "length" {
+		return llmResult{}, false, fmt.Errorf("response truncated at %d tokens", out.Usage.CompletionTokens)
 	}
 
 	return llmResult{

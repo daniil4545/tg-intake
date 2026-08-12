@@ -352,6 +352,7 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 		Step:       stepInterview,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
+		MaxTokens:  llmMaxTokens,
 		Messages:   messages,
 		SchemaName: "interview_turn",
 		Schema:     i.turnSchema,
@@ -444,6 +445,13 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	missing := i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn))
 	if turn.Ready && len(missing) > 0 {
 		return fmt.Errorf("turn is ready with %d required gaps", len(missing))
+	}
+	// Готовность обрывает разговор, и заданные тем же ходом вопросы автору уже
+	// не уйдут. Раньше это исключалось само собой (готовность требовала пустых
+	// gaps, а вопрос - ключа из них); теперь необязательный пункт остаётся в
+	// gaps, и модель может спросить про него, объявив разговор законченным.
+	if turn.Ready && len(turn.Questions) > 0 {
+		return fmt.Errorf("turn is ready with %d questions", len(turn.Questions))
 	}
 	// Иначе разговор встаёт: не готово, а спросить нечего.
 	if !turn.Ready && len(turn.Questions) == 0 {
@@ -562,6 +570,7 @@ func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message
 		Step:       stepSummary,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
+		MaxTokens:  llmMaxTokens,
 		Messages:   messages,
 		SchemaName: "case_summary",
 		Schema:     summarySchema,

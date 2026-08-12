@@ -174,6 +174,18 @@ func TestCheckTurn(t *testing.T) {
 			turn: interviewTurn{Kind: "bug", Filled: full[:2], Gaps: []string{"actual"}, Ready: true},
 		},
 		{
+			// Готовность обрывает разговор: заданный тем же ходом вопрос автору
+			// уже не уйдёт, и молча потерять его нельзя.
+			name: "готов и всё же спрашивает",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full,
+				Gaps:      []string{"where"},
+				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
+				Ready:     true,
+			},
+		},
+		{
 			name: "обязательный пункт не закрыт и не назван пробелом",
 			turn: interviewTurn{
 				Kind:      "bug",

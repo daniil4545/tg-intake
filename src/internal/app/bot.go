@@ -103,9 +103,12 @@ type Bot struct {
 	mu     sync.Mutex
 	tally  map[int64]tele.StoredMessage
 	rounds map[int64]roundState
-	// Раунд, о задержке которого автору уже сказали: ответов подряд бывает
-	// несколько, а предупреждение нужно одно.
-	waited map[int64]int
+	// Ход, о задержке которого автору уже сказали: ответов подряд бывает
+	// несколько, а предупреждение нужно одно. Ход - это обращение вместе с
+	// номером раунда: по одному номеру следующее обращение автора считалось бы
+	// тем же ходом и осталось бы без предупреждения (раунд нового обращения
+	// снова нулевой).
+	waited map[int64]string
 	// Экран, с которого запустили отмену тикета, по обращению: исход приходит
 	// очередью и правит то же сообщение.
 	kills map[string]killScreen
@@ -199,7 +202,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
 		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
 		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{},
-		waited: map[int64]int{}, kills: map[string]killScreen{}}
+		waited: map[int64]string{}, kills: map[string]killScreen{}}
 
 	// Verbose дампит сырые payload Bot API с текстами сообщений, а стандартный
 	// OnError пишет через stdlib log мимо JSON. Synchronous обязателен:
@@ -1050,7 +1053,7 @@ func (b *Bot) waitFor(cs *Case) {
 		// закрыто. Предупреждать не о чем.
 		waiting := fresh != nil && fresh.Round == round &&
 			(fresh.Status == statusNormalizing || fresh.Status == statusInterview)
-		if !waiting || !b.markWaited(user, round) {
+		if !waiting || !b.markWaited(user, caseID, round) {
 			return
 		}
 		if _, err := b.bot.Send(&tele.User{ID: user}, "Всё ещё разбираю, это иногда занимает минуту. Отвечу, как закончу."); err != nil {
@@ -1060,15 +1063,16 @@ func (b *Bot) waitFor(cs *Case) {
 	})
 }
 
-// markWaited: одно предупреждение на раунд. Автор отвечает несколькими
+// markWaited: одно предупреждение на ход. Автор отвечает несколькими
 // сообщениями подряд, и каждое заводит свой таймер.
-func (b *Bot) markWaited(user int64, round int) bool {
+func (b *Bot) markWaited(user int64, caseID string, round int) bool {
+	turn := caseID + "/" + strconv.Itoa(round)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if last, ok := b.waited[user]; ok && last == round {
+	if b.waited[user] == turn {
 		return false
 	}
-	b.waited[user] = round
+	b.waited[user] = turn
 	return true
 }
 
