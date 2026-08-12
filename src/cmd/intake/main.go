@@ -78,16 +78,18 @@ func main() {
 
 	cases := app.NewCases(pool, media, log, cfg.MaxItems)
 	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, cfg.OpenRouterProxy, log)
-	log.Info("openrouter_ready", "proxy", cfg.OpenRouterProxy != "")
+	log.Info("openrouter_ready", "proxy", cfg.OpenRouterProxy != "",
+		"model_dialog", cfg.ModelDialog, "reasoning", cfg.ReasoningDialog)
 	normalizer := app.NewNormalizer(cases, llm, log)
-	interview := app.NewInterview(cases, llm, log, rules, cfg.ModelDialog, cfg.InterviewRounds)
+	dialog := app.DialogModel{Name: cfg.ModelDialog, Reasoning: cfg.ReasoningDialog}
+	interview := app.NewInterview(cases, llm, log, rules, dialog, cfg.InterviewRounds)
 	github := app.NewGitHub(cfg.GitHubToken, app.GitHubAPI, statuses, log)
 	publisher := app.NewPublisher(cases, github, rules, log, cfg.AlertChatID)
 
 	checkGitHub(ctx, pool, github, log)
 
 	tickets := app.NewTickets(cases, github, statuses, log, cfg.AlertChatID)
-	projects := app.NewProjects(cases, github, llm, cfg.ModelDialog, log)
+	projects := app.NewProjects(cases, github, llm, dialog, log)
 
 	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, projects, log)
 	if err != nil {

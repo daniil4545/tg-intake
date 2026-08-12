@@ -38,6 +38,10 @@ const (
 	// Пачка пересылок без активного обращения приходит за секунды; меню в
 	// ответ на неё должно быть одно, а не по числу сообщений.
 	menuRepeat = 10 * time.Second
+	// Через сколько молчания бот говорит автору, что ещё работает. Ход модели
+	// обычно занимает секунды, но провайдер иногда отвечает дольше, и тишина
+	// читается как «бот завис» - именно с этим приходят жалобы.
+	waitNotice = 40 * time.Second
 	// Сколько живёт обещание «пришлю ссылку» после «Добавить проект».
 	linkWait = 10 * time.Minute
 	// Начальный экран: один текст и для первого показа, и для возврата, иначе
@@ -99,6 +103,9 @@ type Bot struct {
 	mu     sync.Mutex
 	tally  map[int64]tele.StoredMessage
 	rounds map[int64]roundState
+	// Раунд, о задержке которого автору уже сказали: ответов подряд бывает
+	// несколько, а предупреждение нужно одно.
+	waited map[int64]int
 	// Экран, с которого запустили отмену тикета, по обращению: исход приходит
 	// очередью и правит то же сообщение.
 	kills map[string]killScreen
@@ -192,7 +199,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
 		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
 		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{},
-		kills: map[string]killScreen{}}
+		waited: map[int64]int{}, kills: map[string]killScreen{}}
 
 	// Verbose дампит сырые payload Bot API с текстами сообщений, а стандартный
 	// OnError пишет через stdlib log мимо JSON. Synchronous обязателен:
@@ -978,6 +985,7 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 			}
 			return err
 		}
+		b.waitFor(cs)
 		return c.Send("Расшифровываю ответ.")
 	case strings.TrimSpace(msg.Text) != "":
 		if err := b.cases.AddAnswer(ctx, cs, msg.Text); err != nil {
@@ -986,6 +994,7 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 			}
 			return err
 		}
+		b.waitFor(cs)
 		// До следующего раунда - секунды работы модели. Правим сообщение с
 		// вопросами: кнопка «Всё так» снимается (ответ уже дан), и видно, что
 		// ответ принят. Править нечего - отвечаем словами, молчания быть не
@@ -1019,6 +1028,47 @@ func (b *Bot) markRound(cs *Case) bool {
 		b.log.Warn("round_mark_failed", "case_id", cs.ID, "error", err)
 		return false
 	}
+	return true
+}
+
+// waitFor обещает автору отклик и предупреждает, если ход затянулся. Таймер, а
+// не работа очереди: очередь занята ровно тем ходом, о задержке которого идёт
+// речь, и сигнал через неё опоздал бы именно тогда, когда он нужен. Потеря
+// таймера при рестарте безвредна - это уведомление, а не побочный эффект.
+func (b *Bot) waitFor(cs *Case) {
+	user, caseID, round := cs.UserID, cs.ID, cs.Round
+	time.AfterFunc(waitNotice, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+		defer cancel()
+
+		fresh, err := b.cases.Load(ctx, caseID)
+		if err != nil {
+			b.log.Warn("wait_notice_failed", "case_id", caseID, "error", err)
+			return
+		}
+		// Разговор ушёл дальше: вопрос показан, саммари собрано или обращение
+		// закрыто. Предупреждать не о чем.
+		waiting := fresh != nil && fresh.Round == round &&
+			(fresh.Status == statusNormalizing || fresh.Status == statusInterview)
+		if !waiting || !b.markWaited(user, round) {
+			return
+		}
+		if _, err := b.bot.Send(&tele.User{ID: user}, "Всё ещё разбираю, это иногда занимает минуту. Отвечу, как закончу."); err != nil {
+			b.log.Warn("wait_notice_failed", "case_id", caseID, "error", err)
+		}
+		b.log.Info("wait_notice", "case_id", caseID, "round", round)
+	})
+}
+
+// markWaited: одно предупреждение на раунд. Автор отвечает несколькими
+// сообщениями подряд, и каждое заводит свой таймер.
+func (b *Bot) markWaited(user int64, round int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if last, ok := b.waited[user]; ok && last == round {
+		return false
+	}
+	b.waited[user] = round
 	return true
 }
 
@@ -1062,6 +1112,7 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 	// Раунд помечен вручную, и запись о нём больше не нужна: следующий ответ
 	// автора относится уже к другому сообщению.
 	b.dropRound(senderID(c))
+	b.waitFor(cs)
 	return b.screen(c, markAnswered(c, "Принято: всё так. Думаю дальше."), nil)
 }
 
@@ -1171,6 +1222,7 @@ func (b *Bot) onDone(c tele.Context) error {
 	}
 	// Сбор закрыт: счётчик отработал, следующее обращение заведёт свой.
 	b.dropTally(senderID(c))
+	b.waitFor(cs)
 	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", homeKeyboard())
 }
 

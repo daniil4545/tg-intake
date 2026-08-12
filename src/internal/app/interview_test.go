@@ -30,7 +30,7 @@ func newTestInterview(t *testing.T, cases *Cases, rounds int) *Interview {
 	t.Helper()
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewInterview(cases, nil, log, testRules(t), "test-model", rounds)
+	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds)
 }
 
 // TestLoadContract: правила едут в бинарь и обязаны быть рабочими. Тип без
@@ -163,8 +163,15 @@ func TestCheckTurn(t *testing.T) {
 			},
 		},
 		{
-			name: "готов при незакрытых пробелах",
+			// Тот самый ход, который контур выбрасывал до 0.1.6: обязательные
+			// закрыты, необязательный честно назван пробелом.
+			name: "готов при незакрытом необязательном пункте",
 			turn: interviewTurn{Kind: "bug", Filled: full, Gaps: []string{"where"}, Ready: true},
+			ok:   true,
+		},
+		{
+			name: "готов при незакрытом обязательном пункте",
+			turn: interviewTurn{Kind: "bug", Filled: full[:2], Gaps: []string{"actual"}, Ready: true},
 		},
 		{
 			name: "обязательный пункт не закрыт и не назван пробелом",

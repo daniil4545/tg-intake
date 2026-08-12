@@ -77,6 +77,44 @@ func TestRetryRunsWithBudget(t *testing.T) {
 	}
 }
 
+// TestRequestLimitsGeneration: размышления модели считаются выходными токенами
+// и занимают больше времени, чем сам ответ. Уровень уходит в запрос только
+// заданным: требовать поддержку reasoning у провайдера, которому она не нужна,
+// значит сузить выбор без причины.
+func TestRequestLimitsGeneration(t *testing.T) {
+	var body string
+	llm := NewOpenRouter("key", "model", "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	llm.http = &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		body = string(raw)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+			`{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`))}, nil
+	})}
+
+	req := Request{
+		Step:     "interview",
+		Messages: []Message{{Role: "user", Parts: []Part{TextPart("привет")}}},
+		Schema:   []byte(`{"type":"object"}`),
+	}
+	if _, err := llm.Complete(context.Background(), req); err != nil {
+		t.Fatalf("вызов без уровня размышлений: %v", err)
+	}
+	if strings.Contains(body, "reasoning") {
+		t.Errorf("пустой уровень ушёл в запрос: %s", body)
+	}
+	if !strings.Contains(body, `"max_tokens"`) {
+		t.Errorf("в запросе нет потолка ответа: %s", body)
+	}
+
+	req.Reasoning = "low"
+	if _, err := llm.Complete(context.Background(), req); err != nil {
+		t.Fatalf("вызов с уровнем размышлений: %v", err)
+	}
+	if !strings.Contains(body, `"reasoning":{"effort":"low"}`) {
+		t.Errorf("уровень размышлений не ушёл в запрос: %s", body)
+	}
+}
+
 // TestRetryFitsJob: в бюджет работы обязаны укладываться попытка и повтор -
 // иначе проверка остатка гасит вторую попытку всегда, и повторов нет вовсе.
 func TestRetryFitsJob(t *testing.T) {
