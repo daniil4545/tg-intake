@@ -17,9 +17,20 @@ import (
 
 const (
 	openRouterURL = "https://openrouter.ai/api/v1/chat/completions"
-	llmTimeout    = 60 * time.Second
-	llmRetries    = 3
-	llmBodyLimit  = 1 << 20
+	// Бюджет одной попытки. Шаг интервью в контуре укладывается в 50 секунд, и
+	// прежние 60 срезали обычный разброс: готовая генерация выбрасывалась
+	// целиком, автор ждал три прохода вместо одного, а токены списывались за
+	// каждый (наблюдение 2026-08-12, issue 39 в qualifier).
+	llmTimeout = 2 * time.Minute
+	// Остаток дедлайна, меньше которого повтор не начинаем. Считается по той же
+	// длительности шага: пускать генерацию под остаток в полминуты значит
+	// повторить ту же потерю, только на границе работы, а не попытки. Следствие
+	// для синхронного пути (`/project`, бюджет 20 секунд): повтора там нет
+	// вовсе - за это время модель всё равно не отвечает, и команда быстрее
+	// уходит в свой фолбэк.
+	llmMinBudget = time.Minute
+	llmRetries   = 3
+	llmBodyLimit = 1 << 20
 )
 
 // OpenRouter - клиент chat/completions. Один эндпоинт не оправдывает SDK:
@@ -36,10 +47,10 @@ type OpenRouter struct {
 // OpenRouter закрыт, а Telegram и GitHub с него доступны напрямую, и уводить их
 // в тот же туннель значит менять то, что работает.
 func NewOpenRouter(key, model, proxy string, log *slog.Logger) *OpenRouter {
-	// Таймаут на попытку, а не на вызов целиком: общий предел задаёт ctx
-	// вызывающего, иначе три повтора незаметно растянулись бы на четыре минуты
-	// внутри одного дедлайна.
-	client := &http.Client{Timeout: llmTimeout}
+	// Без таймаута клиента: бюджет попытки ставит send через ctx, и там же
+	// действует дедлайн работы. Два независимых предела на одно соединение
+	// разошлись бы, и виновника обрыва пришлось бы угадывать по логу.
+	client := &http.Client{}
 	if proxy != "" {
 		// Адрес разобран и проверен при загрузке конфига.
 		parsed, _ := url.Parse(proxy)
@@ -200,14 +211,18 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 		return nil, fmt.Errorf("openrouter %s: build request: %w", req.Step, err)
 	}
 
-	start := time.Now()
 	for attempt := 0; ; attempt++ {
+		start := time.Now()
 		out, retry, err := c.send(ctx, body)
+		// Время попытки, а не всей цепочки: сумма прячет как раз то, ради чего
+		// метрику читают - сколько занимает один проход модели.
+		spent := time.Since(start)
 		if err == nil {
 			c.log.Info("llm_call",
 				"step", req.Step,
 				"model", model,
-				"ms", time.Since(start).Milliseconds(),
+				"ms", spent.Milliseconds(),
+				"attempt", attempt+1,
 				"tokens_in", out.tokensIn,
 				"tokens_out", out.tokensOut)
 			return out.content, nil
@@ -215,11 +230,18 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 		if !retry || attempt == llmRetries {
 			return nil, fmt.Errorf("openrouter %s: %w", req.Step, err)
 		}
+		// Повтор генерирует ответ заново и стоит как первая попытка: начинать
+		// его на исходе дедлайна значит списать токены за работу, которую всё
+		// равно оборвут.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < llmMinBudget {
+			return nil, fmt.Errorf("openrouter %s: no budget for attempt %d: %w", req.Step, attempt+2, err)
+		}
 
-		c.log.Warn("llm_retry", "step", req.Step, "model", model, "attempt", attempt+1, "error", err)
+		c.log.Warn("llm_retry", "step", req.Step, "model", model, "attempt", attempt+1,
+			"ms", spent.Milliseconds(), "error", err)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("openrouter %s: %w", req.Step, ctx.Err())
 		case <-time.After(time.Duration(1<<attempt) * time.Second):
 		}
 	}
@@ -228,6 +250,11 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 // send делает одну попытку. Второе значение - повторять ли: 429 и 5xx да, 4xx
 // нет, разбитое соединение да - ответа не было, значит и запрос не отработал.
 func (c *OpenRouter) send(ctx context.Context, body []byte) (llmResult, bool, error) {
+	// Бюджет попытки. Дедлайн работы из ctx остаётся главным: если его осталось
+	// меньше, победит он, и попытка оборвётся раньше своего предела.
+	ctx, cancel := context.WithTimeout(ctx, llmTimeout)
+	defer cancel()
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, openRouterURL, bytes.NewReader(body))
 	if err != nil {
 		return llmResult{}, false, fmt.Errorf("build http request: %w", err)
