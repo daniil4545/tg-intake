@@ -4,12 +4,15 @@
     { "key": "expected", "title": "Что должно было произойти", "required": true },
     { "key": "actual", "title": "Что произошло на самом деле", "required": true },
     { "key": "where", "title": "Где это видно", "required": false },
+    { "key": "when", "title": "Когда повторяется, а когда нет", "required": false },
     { "key": "impact", "title": "Чем это мешает работе", "required": false }
   ],
   "feature": [
     { "key": "problem", "title": "Какую задачу это решает", "required": true },
     { "key": "today", "title": "Как справляются сейчас", "required": true },
     { "key": "result", "title": "Каким должен быть результат", "required": true },
+    { "key": "done", "title": "Как поймём, что готово", "required": true },
+    { "key": "edge", "title": "Нестандартные случаи и исключения", "required": false },
     { "key": "who", "title": "Кого это касается", "required": false }
   ],
   "question": [
