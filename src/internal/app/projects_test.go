@@ -175,7 +175,7 @@ func newTestProjects(t *testing.T, cases *Cases, api, llmProxy string) *Projects
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	gh := NewGitHub("token", api, testStatuses, log)
 	llm := NewOpenRouter("key", "model", llmProxy, log)
-	return NewProjects(cases, gh, llm, "model", log)
+	return NewProjects(cases, gh, llm, DialogModel{Name: "model"}, log)
 }
 
 // cleanupProject убирает проект за тестом: testPool чистит обращения, но не

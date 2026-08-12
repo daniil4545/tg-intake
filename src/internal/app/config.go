@@ -24,6 +24,10 @@ type Config struct {
 	TelegramProxy   string
 	ModelMedia      string
 	ModelDialog     string
+	// Уровень размышлений диалоговых шагов. Пусто - параметр не передаётся
+	// вовсе: модели без reasoning он не нужен, а требование его поддержки сузило
+	// бы выбор провайдеров.
+	ReasoningDialog string
 	GitHubToken     string
 	MediaDir        string
 	MaxItems        int
@@ -72,8 +76,11 @@ func LoadConfig() (Config, error) {
 		ModelMedia:    valueOr(os.Getenv("OPENROUTER_MODEL_MEDIA"), "google/gemini-3.1-flash-lite"),
 		ModelDialog:   valueOr(os.Getenv("OPENROUTER_MODEL_DIALOG"), "deepseek/deepseek-v4-flash-0731"),
 		GitHubToken:   os.Getenv("GITHUB_TOKEN"),
-		MediaDir:      valueOr(os.Getenv("MEDIA_DIR"), "/tmp/intake"),
-		AlertBotToken: os.Getenv("ALERT_BOT_TOKEN"),
+		// Дефолт низкий, а не выключенный: интервью выигрывает от короткого
+		// раздумья, но не от того, которое дольше самого ответа.
+		ReasoningDialog: valueOr(os.Getenv("OPENROUTER_REASONING_DIALOG"), "low"),
+		MediaDir:        valueOr(os.Getenv("MEDIA_DIR"), "/tmp/intake"),
+		AlertBotToken:   os.Getenv("ALERT_BOT_TOKEN"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -127,6 +134,12 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.Projects = projects
 
+	reasoning, err := parseReasoning(cfg.ReasoningDialog)
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.ReasoningDialog = reasoning
+
 	// Разбираем при старте: битый адрес прокси иначе всплыл бы первым вызовом
 	// наружу, то есть в середине живого разговора.
 	for name, value := range map[string]string{
@@ -163,6 +176,20 @@ func parseIDs(raw string) ([]int64, error) {
 		return nil, errors.New("TELEGRAM_ALLOWED_IDS is empty")
 	}
 	return ids, nil
+}
+
+// parseReasoning разбирает уровень размышлений. `off` означает не передавать
+// параметр вовсе и отличается от `none`: `none` просит модель не думать, а это
+// требование к провайдеру, которое он должен уметь исполнить.
+func parseReasoning(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "off":
+		return "", nil
+	case "none", "minimal", "low", "medium", "high":
+		return value, nil
+	}
+	return "", fmt.Errorf("OPENROUTER_REASONING_DIALOG is %q, want off, none, minimal, low, medium or high", raw)
 }
 
 // parseChatID разбирает чат уведомлений. Пусто - уведомления выключены, это не

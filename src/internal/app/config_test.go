@@ -42,6 +42,7 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	t.Setenv("MEDIA_DIR", "")
 	t.Setenv("MAX_ITEMS", "")
 	t.Setenv("INTERVIEW_ROUNDS", "")
+	t.Setenv("OPENROUTER_REASONING_DIALOG", "")
 	t.Setenv("PROJECTS", "")
 
 	cfg, err := LoadConfig()
@@ -68,6 +69,25 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	}
 	if cfg.InterviewRounds != 3 {
 		t.Errorf("interview rounds fallback: got %d", cfg.InterviewRounds)
+	}
+	if cfg.ReasoningDialog != "low" {
+		t.Errorf("reasoning fallback: got %q", cfg.ReasoningDialog)
+	}
+}
+
+// TestParseReasoning: уровень едет в запрос к провайдеру, и опечатка в нём
+// обязана всплыть при старте - иначе разговор упрётся в отказ по каждому ходу.
+func TestParseReasoning(t *testing.T) {
+	// off - единственный способ не передавать параметр вовсе: none просит
+	// модель не думать и всё же требует от провайдера поддержки reasoning.
+	if got, err := parseReasoning(" OFF "); err != nil || got != "" {
+		t.Errorf("off: got %q, %v", got, err)
+	}
+	if got, err := parseReasoning("Low"); err != nil || got != "low" {
+		t.Errorf("low: got %q, %v", got, err)
+	}
+	if _, err := parseReasoning("fast"); err == nil {
+		t.Error("неизвестный уровень принят молча")
 	}
 }
 

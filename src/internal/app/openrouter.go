@@ -17,20 +17,27 @@ import (
 
 const (
 	openRouterURL = "https://openrouter.ai/api/v1/chat/completions"
-	// Бюджет одной попытки. Шаг интервью в контуре укладывается в 50 секунд, и
-	// прежние 60 срезали обычный разброс: готовая генерация выбрасывалась
-	// целиком, автор ждал три прохода вместо одного, а токены списывались за
-	// каждый (наблюдение 2026-08-12, issue 39 в qualifier).
-	llmTimeout = 2 * time.Minute
-	// Остаток дедлайна, меньше которого повтор не начинаем. Считается по той же
-	// длительности шага: пускать генерацию под остаток в полминуты значит
-	// повторить ту же потерю, только на границе работы, а не попытки. Следствие
-	// для синхронного пути (`/project`, бюджет 20 секунд): повтора там нет
-	// вовсе - за это время модель всё равно не отвечает, и команда быстрее
-	// уходит в свой фолбэк.
-	llmMinBudget = time.Minute
+	// Бюджет одной попытки. Прежние две минуты держались за шаг, который думал
+	// без предела: генерация уходила в размышления на 110 секунд, вторая попытка
+	// в бюджет работы уже не влезала, и автор ждал повторов очереди по пять
+	// минут (наблюдение 2026-08-12). С ограниченными размышлениями шаг
+	// укладывается в полминуты, и минута - это запас на разброс, а не на новую
+	// такую же потерю.
+	llmTimeout = time.Minute
+	// Остаток дедлайна, меньше которого повтор не начинаем: генерация под
+	// остаток короче собственной длительности только спишет токены за работу,
+	// которую оборвут. Следствие для синхронного пути (`/project`, бюджет 20
+	// секунд): повтора там нет вовсе, команда быстрее уходит в свой фолбэк.
+	llmMinBudget = 30 * time.Second
 	llmRetries   = 3
 	llmBodyLimit = 1 << 20
+	// Потолок ответа диалогового шага - страховка от генерации без конца, а не
+	// тюнинг. Он один на размышления и на сам ответ, а уровень размышлений
+	// меняют переменной контура без релиза: впритык к наблюдавшимся 4476
+	// токенам потолок обрезал бы каждый ход на `medium`, и обрезанный JSON не
+	// разбирается вовсе. Медиа-шаги потолка не ставят: длину транскрипта задаёт
+	// запись, а не модель, и голосовое на десятки минут упрётся в любой предел.
+	llmMaxTokens = 8000
 )
 
 // OpenRouter - клиент chat/completions. Один эндпоинт не оправдывает SDK:
@@ -70,6 +77,23 @@ type Request struct {
 	Messages   []Message       // префикс первым, волатильное последним
 	SchemaName string          // имя схемы в response_format, пусто - "response"
 	Schema     json.RawMessage // тело JSON Schema ответа
+	// Reasoning - уровень размышлений модели: пусто означает не передавать
+	// параметр вовсе. Требовать его у провайдера без поддержки нельзя:
+	// require_parameters сузит выбор до тех, кто умеет reasoning.
+	Reasoning string
+	// MaxTokens - потолок ответа: ноль означает не передавать параметр вовсе.
+	// Ставят его диалоговые шаги, где длину ответа выбирает модель. Шагу, чья
+	// длина задана материалом (транскрипт записи), потолок обрезал бы ответ на
+	// середине, а обрезанный JSON не разбирается вовсе.
+	MaxTokens int
+}
+
+// DialogModel - модель диалоговых шагов и её бюджет размышлений. Пара едет
+// вместе: уровень размышлений имеет смысл только рядом с моделью, которой он
+// адресован, и меняется тем же решением контура.
+type DialogModel struct {
+	Name      string
+	Reasoning string
 }
 
 type Message struct {
@@ -144,6 +168,14 @@ type chatRequest struct {
 	Messages       []Message      `json:"messages"`
 	ResponseFormat responseFormat `json:"response_format"`
 	Provider       providerOpts   `json:"provider"`
+	MaxTokens      int            `json:"max_tokens,omitempty"`
+	Reasoning      *reasoningOpts `json:"reasoning,omitempty"`
+}
+
+// reasoningOpts: размышления модели считаются выходными токенами и оплачиваются
+// как они же, а времени занимают больше самого ответа.
+type reasoningOpts struct {
+	Effort string `json:"effort"`
 }
 
 type responseFormat struct {
@@ -168,10 +200,19 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		// "length" означает, что ответ упёрся в потолок и оборван на середине.
+		// Без этого признака обрыв виден только ошибкой разбора JSON, а она
+		// читается как «модель не держит схему» - причину искали бы не там.
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		// Размышления входят в completion_tokens; отдельным числом видно, чем
+		// занят шаг - генерацией ответа или раздумьем перед ним.
+		CompletionDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 	Error *struct {
 		Code    int    `json:"code"`
@@ -180,9 +221,10 @@ type chatResponse struct {
 }
 
 type llmResult struct {
-	content   json.RawMessage
-	tokensIn  int
-	tokensOut int
+	content     json.RawMessage
+	tokensIn    int
+	tokensOut   int
+	tokensThink int
 }
 
 // Complete возвращает content первого choice сырым: в схему его разбирает
@@ -201,12 +243,18 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 		name = "response"
 	}
 
-	body, err := json.Marshal(chatRequest{
+	wire := chatRequest{
 		Model:          model,
 		Messages:       req.Messages,
 		ResponseFormat: responseFormat{Type: "json_schema", JSONSchema: jsonSchema{Name: name, Strict: true, Schema: req.Schema}},
 		Provider:       providerOpts{RequireParameters: true},
-	})
+		MaxTokens:      req.MaxTokens,
+	}
+	if req.Reasoning != "" {
+		wire.Reasoning = &reasoningOpts{Effort: req.Reasoning}
+	}
+
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, fmt.Errorf("openrouter %s: build request: %w", req.Step, err)
 	}
@@ -224,7 +272,8 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 				"ms", spent.Milliseconds(),
 				"attempt", attempt+1,
 				"tokens_in", out.tokensIn,
-				"tokens_out", out.tokensOut)
+				"tokens_out", out.tokensOut,
+				"tokens_think", out.tokensThink)
 			return out.content, nil
 		}
 		if !retry || attempt == llmRetries {
@@ -294,11 +343,17 @@ func (c *OpenRouter) send(ctx context.Context, body []byte) (llmResult, bool, er
 	if len(out.Choices) == 0 || strings.TrimSpace(out.Choices[0].Message.Content) == "" {
 		return llmResult{}, false, errors.New("empty content")
 	}
+	// Повтор не поможет: тот же запрос упрётся в тот же потолок. Ошибка названа
+	// прямо, чтобы правка потолка не искалась через разбор JSON.
+	if out.Choices[0].FinishReason == "length" {
+		return llmResult{}, false, fmt.Errorf("response truncated at %d tokens", out.Usage.CompletionTokens)
+	}
 
 	return llmResult{
-		content:   json.RawMessage(out.Choices[0].Message.Content),
-		tokensIn:  out.Usage.PromptTokens,
-		tokensOut: out.Usage.CompletionTokens,
+		content:     json.RawMessage(out.Choices[0].Message.Content),
+		tokensIn:    out.Usage.PromptTokens,
+		tokensOut:   out.Usage.CompletionTokens,
+		tokensThink: out.Usage.CompletionDetails.ReasoningTokens,
 	}, false, nil
 }
 
