@@ -28,7 +28,6 @@ type Config struct {
 	MediaDir        string
 	MaxItems        int
 	InterviewRounds int
-	AudioConvert    string
 	Projects        []ProjectConfig
 	// Чат уведомлений владельца и токен бота, которым туда пишут. Пустой чат
 	// выключает уведомления целиком, пустой токен отдаёт отправку боту сервиса.
@@ -115,12 +114,6 @@ func LoadConfig() (Config, error) {
 		problems = append(problems, err.Error())
 	}
 	cfg.InterviewRounds = rounds
-
-	audioConvert, err := parseAudioConvert(valueOr(os.Getenv("AUDIO_CONVERT"), "auto"))
-	if err != nil {
-		problems = append(problems, err.Error())
-	}
-	cfg.AudioConvert = audioConvert
 
 	chat, err := parseChatID(os.Getenv("ALERT_CHAT_ID"))
 	if err != nil {
@@ -260,17 +253,6 @@ func checkProxy(name, raw string) error {
 		return fmt.Errorf("%s %q is not a proxy url like http://host:port", name, raw)
 	}
 	return nil
-}
-
-func parseAudioConvert(raw string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "auto":
-		return "auto", nil
-	case "always":
-		return "always", nil
-	default:
-		return "", fmt.Errorf("AUDIO_CONVERT %q is not auto or always", raw)
-	}
 }
 
 func valueOr(value, fallback string) string {

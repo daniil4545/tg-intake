@@ -113,7 +113,7 @@ func TestFailedItemMovesOn(t *testing.T) {
 		t.Fatal("normalize_images не поставлен: цепочка встала на провале голосового")
 	}
 
-	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "auto")
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	imagesJob := Job{
 		ID:      imagesID,
 		Kind:    JobNormalizeImages,
@@ -141,7 +141,7 @@ func TestReopenedCaseStartsSecondRound(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
-	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), "auto")
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cs, _, err := cases.StartCase(ctx, User{ID: 5004, First: "Тест"}, "tg-intake")
 	if err != nil {
