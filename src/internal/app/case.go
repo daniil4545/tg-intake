@@ -833,10 +833,13 @@ type itemPayload struct {
 // notifyPayload - сообщение автору, порождённое фоновой работой. Buttons
 // называет набор кнопок, а не рисует их: разметку строит bot.go, и он же знает
 // текущий раунд.
+// Непустой ChatID означает уведомление владельцу: адресат назван явно, кнопок и
+// экранов у него нет.
 type notifyPayload struct {
 	CaseID  string `json:"case_id"`
 	Text    string `json:"text"`
 	Buttons string `json:"buttons,omitempty"`
+	ChatID  int64  `json:"chat_id,omitempty"`
 }
 
 // Наборы кнопок под сообщением из очереди.
@@ -960,6 +963,14 @@ func putNotify(ctx context.Context, db Runner, caseID string, jobID int64, text 
 func putNotifyKey(ctx context.Context, db Runner, caseID, suffix, text, buttons string) error {
 	key := fmt.Sprintf("%s:%s:%s", JobNotify, caseID, suffix)
 	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons})
+}
+
+// putAlert ставит уведомление владельцу. Работа того же вида, что и сообщение
+// автору: механика захвата, повторов и идемпотентности у них совпадает, а
+// адресата называет ChatID.
+func putAlert(ctx context.Context, db Runner, caseID, suffix, text string, chatID int64) error {
+	key := fmt.Sprintf("%s:%s:%s", JobNotify, caseID, suffix)
+	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, ChatID: chatID})
 }
 
 // replaceJob - единственный способ поставить работу обращения: работа каждого

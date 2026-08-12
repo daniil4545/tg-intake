@@ -58,10 +58,12 @@ type Tickets struct {
 	gh       *GitHub
 	statuses Statuses
 	log      *slog.Logger
+	// Чат уведомлений владельца; 0 - уведомления выключены.
+	alertChat int64
 }
 
-func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger) *Tickets {
-	return &Tickets{cases: cases, gh: gh, statuses: statuses, log: log}
+func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger, alertChat int64) *Tickets {
+	return &Tickets{cases: cases, gh: gh, statuses: statuses, log: log, alertChat: alertChat}
 }
 
 // List - последние тикеты проекта. Номера и заголовки из своей базы, статусы
@@ -239,6 +241,14 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
+	// Автор нужен только уведомлению владельца, и читается до первой мутации в
+	// GitHub: отказ базы после закрытия issue стоил бы лишнего круга повторов.
+	var author User
+	if t.alertChat != 0 {
+		if author, err = LoadUser(ctx, t.cases.pool, cs.UserID); err != nil {
+			return err
+		}
+	}
 
 	issue, err := t.gh.GetIssue(ctx, project, cs.IssueNumber, false)
 	if err != nil {
@@ -300,8 +310,15 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 			return nil
 		}
 		recorded = true
-		return putNotifyKey(ctx, tx, cs.ID, "cancelled",
-			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), keysCancel)
+		if err := putNotifyKey(ctx, tx, cs.ID, "cancelled",
+			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), keysCancel); err != nil {
+			return err
+		}
+		if t.alertChat == 0 {
+			return nil
+		}
+		return putAlert(ctx, tx, cs.ID, "alert-cancel",
+			alertCancelled(project, cs, author, cs.IssueNumber, issue.HTMLURL), t.alertChat)
 	})
 	if err != nil {
 		return err

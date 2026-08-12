@@ -30,6 +30,10 @@ type Config struct {
 	InterviewRounds int
 	AudioConvert    string
 	Projects        []ProjectConfig
+	// Чат уведомлений владельца и токен бота, которым туда пишут. Пустой чат
+	// выключает уведомления целиком, пустой токен отдаёт отправку боту сервиса.
+	AlertBotToken string
+	AlertChatID   int64
 }
 
 // ProjectConfig - проект из переменной окружения. Список живёт в конфиге
@@ -70,6 +74,7 @@ func LoadConfig() (Config, error) {
 		ModelDialog:   valueOr(os.Getenv("OPENROUTER_MODEL_DIALOG"), "deepseek/deepseek-v4-flash-0731"),
 		GitHubToken:   os.Getenv("GITHUB_TOKEN"),
 		MediaDir:      valueOr(os.Getenv("MEDIA_DIR"), "/tmp/intake"),
+		AlertBotToken: os.Getenv("ALERT_BOT_TOKEN"),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -117,6 +122,12 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.AudioConvert = audioConvert
 
+	chat, err := parseChatID(os.Getenv("ALERT_CHAT_ID"))
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.AlertChatID = chat
+
 	projects, err := ParseProjects(os.Getenv("PROJECTS"))
 	if err != nil {
 		problems = append(problems, err.Error())
@@ -159,6 +170,20 @@ func parseIDs(raw string) ([]int64, error) {
 		return nil, errors.New("TELEGRAM_ALLOWED_IDS is empty")
 	}
 	return ids, nil
+}
+
+// parseChatID разбирает чат уведомлений. Пусто - уведомления выключены, это не
+// ошибка. Знаковый разбор обязателен: у группы и канала chat_id отрицательный.
+func parseChatID(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ALERT_CHAT_ID is not a number: %q", raw)
+	}
+	return id, nil
 }
 
 // projectSlug повторяет CHECK из схемы: slug уезжает в callback_data, где всего

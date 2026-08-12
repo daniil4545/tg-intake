@@ -421,10 +421,12 @@ type Publisher struct {
 	gh    *GitHub
 	rules Contract
 	log   *slog.Logger
+	// Чат уведомлений владельца; 0 - уведомления выключены.
+	alertChat int64
 }
 
-func NewPublisher(cases *Cases, gh *GitHub, rules Contract, log *slog.Logger) *Publisher {
-	return &Publisher{cases: cases, gh: gh, rules: rules, log: log}
+func NewPublisher(cases *Cases, gh *GitHub, rules Contract, log *slog.Logger, alertChat int64) *Publisher {
+	return &Publisher{cases: cases, gh: gh, rules: rules, log: log, alertChat: alertChat}
 }
 
 // Run создаёт issue по обращению. Идемпотентен трижды: по ключу работы, по уже
@@ -512,8 +514,15 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		}
 		// Панель возвращается в исходное состояние тем же сообщением: обращение
 		// доиграно, «Готово» больше не по чему нажимать.
-		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			publishedMessage(number, url, cs.Incomplete), keysHome)
+		if err := putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
+			publishedMessage(number, url, cs.Incomplete), keysHome); err != nil {
+			return err
+		}
+		if p.alertChat == 0 {
+			return nil
+		}
+		return putAlert(ctx, tx, cs.ID, "alert",
+			alertPublished(project, cs, author, number, url), p.alertChat)
 	})
 	if err != nil {
 		return err
