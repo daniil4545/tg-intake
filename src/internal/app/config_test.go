@@ -12,7 +12,6 @@ func TestLoadConfigReportsEveryProblem(t *testing.T) {
 	t.Setenv("TELEGRAM_ALLOWED_IDS", "123,not-a-number")
 	t.Setenv("OPENROUTER_API_KEY", "")
 	t.Setenv("GITHUB_TOKEN", "")
-	t.Setenv("AUDIO_CONVERT", "sometimes")
 	// Битый адрес прокси обязан всплыть при старте, а не первым вызовом модели
 	// в середине живого разговора.
 	t.Setenv("OPENROUTER_PROXY", "::not a url::")
@@ -22,7 +21,7 @@ func TestLoadConfigReportsEveryProblem(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
-	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "AUDIO_CONVERT", "OPENROUTER_PROXY", "ALERT_CHAT_ID"} {
+	for _, want := range []string{"DATABASE_URL", "TELEGRAM_ALLOWED_IDS", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "OPENROUTER_PROXY", "ALERT_CHAT_ID"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error must name %s, got: %v", want, err)
 		}
@@ -43,7 +42,6 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	t.Setenv("MEDIA_DIR", "")
 	t.Setenv("MAX_ITEMS", "")
 	t.Setenv("INTERVIEW_ROUNDS", "")
-	t.Setenv("AUDIO_CONVERT", "")
 	t.Setenv("PROJECTS", "")
 
 	cfg, err := LoadConfig()
@@ -70,9 +68,6 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	}
 	if cfg.InterviewRounds != 3 {
 		t.Errorf("interview rounds fallback: got %d", cfg.InterviewRounds)
-	}
-	if cfg.AudioConvert != "auto" {
-		t.Errorf("audio convert fallback: got %q", cfg.AudioConvert)
 	}
 }
 
