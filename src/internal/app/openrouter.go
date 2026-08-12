@@ -22,8 +22,13 @@ const (
 	// целиком, автор ждал три прохода вместо одного, а токены списывались за
 	// каждый (наблюдение 2026-08-12, issue 39 в qualifier).
 	llmTimeout = 2 * time.Minute
-	// Остаток дедлайна, меньше которого повтор не начинаем: он не успеет.
-	llmMinBudget = 20 * time.Second
+	// Остаток дедлайна, меньше которого повтор не начинаем. Считается по той же
+	// длительности шага: пускать генерацию под остаток в полминуты значит
+	// повторить ту же потерю, только на границе работы, а не попытки. Следствие
+	// для синхронного пути (`/project`, бюджет 20 секунд): повтора там нет
+	// вовсе - за это время модель всё равно не отвечает, и команда быстрее
+	// уходит в свой фолбэк.
+	llmMinBudget = time.Minute
 	llmRetries   = 3
 	llmBodyLimit = 1 << 20
 )
@@ -236,7 +241,7 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 			"ms", spent.Milliseconds(), "error", err)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, fmt.Errorf("openrouter %s: %w", req.Step, ctx.Err())
 		case <-time.After(time.Duration(1<<attempt) * time.Second):
 		}
 	}
