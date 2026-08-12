@@ -225,7 +225,7 @@ func TestCancelTwiceOneEvent(t *testing.T) {
 func newTestTickets(t *testing.T, cases *Cases, api string) *Tickets {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewTickets(cases, NewGitHub("token", api, testStatuses, log), testStatuses, log)
+	return NewTickets(cases, NewGitHub("token", api, testStatuses, log), testStatuses, log, 0)
 }
 
 // publishCase доводит обращение до опубликованного тикета: просмотр работает

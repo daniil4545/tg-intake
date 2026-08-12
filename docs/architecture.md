@@ -177,7 +177,7 @@ publish уже в очереди и могла создать issue) и `publish
 | `kind` | `normalize_voice`, `normalize_images`, `interview`, `summarize`, `publish`, `notify`, `cancel_issue` |
 | `key` | уникальный ключ идемпотентности, например `publish:<case_id>` или `interview:<case_id>`. Напоминание о брошенном черновике - обычная работа `notify` с суффиксом ключа `remind`, отдельного вида нет |
 | `status`, `attempts`, `run_after`, `locked_at`, `last_error` | захват через `FOR UPDATE SKIP LOCKED`, экспоненциальная отсрочка |
-| `payload` | параметры шага |
+| `payload` | параметры шага. У `notify` непустой `chat_id` означает уведомление владельцу: адресат назван явно, кнопок и экранов у него нет |
 
 Работа каждого вида существует у обращения в единственном экземпляре и
 ставится заменой прежней (`replaceJob`). Отсюда второе «Готово» перезапускает
@@ -423,7 +423,8 @@ PublishIssue(ctx, job) error
   5. при неизвестном результате (таймаут, 5xx) перед повтором - поиск маркера
      сканом последних issue репозитория (не search API: его индекс отстаёт)
   6. записать issue_number и issue_url, статус published, событие published
-  7. поставить job notify с номером и ссылкой
+  7. поставить job notify с номером и ссылкой, при заданном ALERT_CHAT_ID -
+     второй job notify шапкой в чат владельца
   8. удалить файлы обращения, обнулить file_path
   выход: issue в GitHub, автор уведомлён, медиа на диске нет
 ```

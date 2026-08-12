@@ -82,11 +82,11 @@ func main() {
 	normalizer := app.NewNormalizer(cases, llm, log, cfg.AudioConvert)
 	interview := app.NewInterview(cases, llm, log, rules, cfg.ModelDialog, cfg.InterviewRounds)
 	github := app.NewGitHub(cfg.GitHubToken, app.GitHubAPI, statuses, log)
-	publisher := app.NewPublisher(cases, github, rules, log)
+	publisher := app.NewPublisher(cases, github, rules, log, cfg.AlertChatID)
 
 	checkGitHub(ctx, pool, github, log)
 
-	tickets := app.NewTickets(cases, github, statuses, log)
+	tickets := app.NewTickets(cases, github, statuses, log, cfg.AlertChatID)
 	projects := app.NewProjects(cases, github, llm, cfg.ModelDialog, log)
 
 	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, projects, log)
