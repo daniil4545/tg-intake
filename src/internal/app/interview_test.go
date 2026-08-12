@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -58,6 +59,32 @@ func TestLoadContract(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("повтор ключа принят, ожидался отказ")
+	}
+}
+
+// TestContractHoldsReadiness: состав пунктов правится данными, и правка легко
+// отменяет смысл среза. Признак готовности обязан держать готовность пожелания,
+// иначе тикет снова описывает желание без границы сделанного; необязательный
+// пункт держать её не имеет права - иначе незнание автора станет неполнотой.
+func TestContractHoldsReadiness(t *testing.T) {
+	rules := testRules(t)
+
+	wish := map[string]string{
+		"problem": "выгрузку собирают руками",
+		"today":   "копируют строки в таблицу",
+		"result":  "кнопка «выгрузить» в списке",
+	}
+	if gaps := rules.Missing("feature", wish); !slices.Contains(gaps, "done") {
+		t.Errorf("пожелание без признака готовности считается готовым, пробелы: %v", gaps)
+	}
+
+	bug := map[string]string{
+		"case":     "заказ 4821",
+		"expected": "статус меняется",
+		"actual":   "статус прежний",
+	}
+	if gaps := rules.Missing("bug", bug); len(gaps) != 0 {
+		t.Errorf("необязательный пункт держит готовность бага, пробелы: %v", gaps)
 	}
 }
 
