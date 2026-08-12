@@ -74,8 +74,14 @@ func TestContractHoldsReadiness(t *testing.T) {
 		"today":   "копируют строки в таблицу",
 		"result":  "кнопка «выгрузить» в списке",
 	}
-	if gaps := rules.Missing("feature", wish); !slices.Contains(gaps, "done") {
+	gaps := rules.Missing("feature", wish)
+	if !slices.Contains(gaps, "done") {
 		t.Errorf("пожелание без признака готовности считается готовым, пробелы: %v", gaps)
+	}
+	// Частота нужна для решения «стоит ли автоматизировать», но незнание её не
+	// делает обращение неполным: пункт необязателен и в пробелы не попадает.
+	if slices.Contains(gaps, "volume") {
+		t.Errorf("частота попала в пробелы: %v", gaps)
 	}
 
 	bug := map[string]string{
@@ -85,6 +91,22 @@ func TestContractHoldsReadiness(t *testing.T) {
 	}
 	if gaps := rules.Missing("bug", bug); len(gaps) != 0 {
 		t.Errorf("необязательный пункт держит готовность бага, пробелы: %v", gaps)
+	}
+
+	// Путь до готовности стоит автору вопросов, и правка правил не имеет права
+	// удлинить его молча: раундов три, каждый новый обязательный пункт приближает
+	// метку неполноты. Держим состав, а не длину: счётчик пропустил бы подмену,
+	// снимающую обязательность с «как делают сейчас» ради нового пункта, - а
+	// именно эта пара с «каким должен быть результат» и делает тикет исполнимым.
+	var required []string
+	for _, it := range rules.Items("feature") {
+		if it.Required {
+			required = append(required, it.Key)
+		}
+	}
+	want := []string{"problem", "today", "result", "done"}
+	if !slices.Equal(required, want) {
+		t.Errorf("обязательные пункты пожелания: %v, ожидались %v", required, want)
 	}
 }
 
