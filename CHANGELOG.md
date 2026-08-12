@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-13
+
 ### Removed
 
 - Режим `AUDIO_CONVERT=always` и перекодировка голосового через ffmpeg. Ветка
