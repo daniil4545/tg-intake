@@ -47,7 +47,7 @@ func newTestCases(t *testing.T, pool *pgxpool.Pool, root string) *Cases {
 	if err != nil {
 		t.Fatalf("new media: %v", err)
 	}
-	return NewCases(pool, media, log, 30)
+	return NewCases(pool, media, log, 30, 0)
 }
 
 func insertItem(t *testing.T, pool *pgxpool.Pool, caseID, kind, tgFileID, filePath string) int64 {

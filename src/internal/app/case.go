@@ -17,10 +17,14 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
-// Виды работ очереди.
+// Виды работ очереди. Нормализация идёт по элементу - запись и скриншот
+// получают свою работу, - а закрывает её отдельная finish_normalize: бюджет
+// работы принадлежит одному вызову модели, и повтор трогает только сорвавшийся
+// элемент.
 const (
 	JobNormalizeVoice  = "normalize_voice"
-	JobNormalizeImages = "normalize_images"
+	JobNormalizeImage  = "normalize_image"
+	JobFinishNormalize = "finish_normalize"
 	JobInterview       = "interview"
 	JobSummarize       = "summarize"
 	JobPublish         = "publish"
@@ -31,7 +35,7 @@ const (
 // caseJobKinds - работы, которые принадлежат разговору и гасятся вместе с ним.
 // publish не входит: отмена из publishing запрещена, к этому моменту автор уже
 // подтвердил публикацию.
-var caseJobKinds = []string{JobNormalizeVoice, JobNormalizeImages, JobInterview, JobSummarize}
+var caseJobKinds = []string{JobNormalizeVoice, JobNormalizeImage, JobFinishNormalize, JobInterview, JobSummarize}
 
 const (
 	statusCollecting  = "collecting"
@@ -100,22 +104,26 @@ type Item struct {
 }
 
 // Cases - жизненный цикл обращения: состояние в БД, файлы и постановка работ.
+// alertChat нужен одному исходу - потерянному уведомлению: сообщение, которое
+// не дошло до автора, обязан увидеть хоть кто-то.
 type Cases struct {
-	pool     *pgxpool.Pool
-	media    *Media
-	log      *slog.Logger
-	maxItems int
+	pool      *pgxpool.Pool
+	media     *Media
+	log       *slog.Logger
+	maxItems  int
+	alertChat int64
 }
 
-func NewCases(pool *pgxpool.Pool, media *Media, log *slog.Logger, maxItems int) *Cases {
-	return &Cases{pool: pool, media: media, log: log, maxItems: maxItems}
+func NewCases(pool *pgxpool.Pool, media *Media, log *slog.Logger, maxItems int, alertChat int64) *Cases {
+	return &Cases{pool: pool, media: media, log: log, maxItems: maxItems, alertChat: alertChat}
 }
 
 // txRunner - пул и транзакция разом. Постановка работы обязана идти в той же
-// транзакции, что и смена статуса, а счётчик голосовых - читаться там же.
+// транзакции, что и смена статуса, а неразобранное сырьё - читаться там же.
 type txRunner interface {
 	Runner
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 const caseColumns = `id, user_id, project_id, status, protocol, COALESCE(kind, ''),
@@ -479,32 +487,23 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 			return ErrNotCollecting
 		}
 
-		// Работы обращения заменяются при постановке, а расшифровка привязана к
-		// элементу: её ключ несёт item_id, и работа прошлого захода молча съела
-		// бы новую через ON CONFLICT DO NOTHING. Снимаем их здесь, чтобы
-		// возвращённое в сбор обращение снова дошло до конца. Аудит остаётся в
-		// case_events.
+		// Работы нормализации привязаны к элементу: их ключ несёт item_id, и
+		// работа прошлого захода молча съела бы новую через ON CONFLICT DO
+		// NOTHING. Снимаем их здесь, чтобы возвращённое в сбор обращение снова
+		// дошло до конца. Аудит остаётся в case_events.
 		_, err = tx.Exec(ctx, `
-			DELETE FROM jobs WHERE kind = $2 AND payload->>'case_id' = $1`,
-			cs.ID, JobNormalizeVoice)
+			DELETE FROM jobs WHERE kind = ANY($2) AND payload->>'case_id' = $1`,
+			cs.ID, []string{JobNormalizeVoice, JobNormalizeImage})
 		if err != nil {
-			return fmt.Errorf("clear voice jobs of case %s: %w", cs.ID, err)
+			return fmt.Errorf("clear normalize jobs of case %s: %w", cs.ID, err)
 		}
 
-		ids, err := pendingVoice(ctx, tx, cs.ID)
+		ids, err := pendingItems(ctx, tx, cs.ID, "voice")
 		if err != nil {
 			return err
 		}
 		voice = len(ids)
-		for _, id := range ids {
-			key := fmt.Sprintf("%s:%s:%d", JobNormalizeVoice, cs.ID, id)
-			if err := PutJob(ctx, tx, JobNormalizeVoice, key, itemPayload{CaseID: cs.ID, ItemID: id}); err != nil {
-				return err
-			}
-		}
-		// Голосовых нет - разбор скриншотов стартует сразу: протокол строит
-		// именно он, и без него обращение осталось бы с пустым protocol.
-		if err := putImagesJob(ctx, tx, cs.ID); err != nil {
+		if err := advanceNormalize(ctx, tx, cs.ID); err != nil {
 			return err
 		}
 		return addEvent(ctx, tx, cs.ID, "collect_finished", map[string]any{"items": count})
@@ -518,12 +517,12 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 	return nil
 }
 
-func pendingVoice(ctx context.Context, tx pgx.Tx, caseID string) ([]int64, error) {
-	rows, err := tx.Query(ctx, `
+func pendingItems(ctx context.Context, db txRunner, caseID, kind string) ([]int64, error) {
+	rows, err := db.Query(ctx, `
 		SELECT id FROM case_items
-		WHERE case_id = $1 AND kind = 'voice' AND status = 'pending' ORDER BY id`, caseID)
+		WHERE case_id = $1 AND kind = $2 AND status = 'pending' ORDER BY id`, caseID, kind)
 	if err != nil {
-		return nil, fmt.Errorf("query pending voice of case %s: %w", caseID, err)
+		return nil, fmt.Errorf("query pending %s of case %s: %w", kind, caseID, err)
 	}
 	defer rows.Close()
 
@@ -531,32 +530,48 @@ func pendingVoice(ctx context.Context, tx pgx.Tx, caseID string) ([]int64, error
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan pending voice: %w", err)
+			return nil, fmt.Errorf("scan pending %s: %w", kind, err)
 		}
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
 }
 
-// PutImagesJob двигает цепочку после голосового - и после успеха, и после
-// окончательного провала. Смотрит на статус элементов, а не на счётчик работ:
-// битое голосовое не имеет права держать обращение в normalizing навсегда.
-func (c *Cases) PutImagesJob(ctx context.Context, caseID string) error {
-	return putImagesJob(ctx, c.pool, caseID)
+// AdvanceNormalize двигает цепочку нормализации - и после успеха элемента, и
+// после его окончательного провала.
+func (c *Cases) AdvanceNormalize(ctx context.Context, caseID string) error {
+	return advanceNormalize(ctx, c.pool, caseID)
 }
 
-func putImagesJob(ctx context.Context, db txRunner, caseID string) error {
-	var left int
-	err := db.QueryRow(ctx, `
-		SELECT count(*) FROM case_items
-		WHERE case_id = $1 AND kind = 'voice' AND status = 'pending'`, caseID).Scan(&left)
-	if err != nil {
-		return fmt.Errorf("count pending voice of case %s: %w", caseID, err)
-	}
-	if left > 0 {
+// advanceNormalize - единственная точка выбора следующего шага нормализации.
+// Смотрит на статус элементов, а не на счётчик работ: битая запись не имеет
+// права держать обращение в normalizing навсегда.
+//
+// Записи идут раньше скриншотов: разбор экрана требует контекста жалобы, и
+// протокол на этот момент обязан быть собран. Разобрано всё - нормализацию
+// закрывает finish_normalize, единственный шаг, который знает, что сырья
+// больше нет.
+func advanceNormalize(ctx context.Context, db txRunner, caseID string) error {
+	for _, kind := range []struct{ item, job string }{
+		{"voice", JobNormalizeVoice},
+		{"photo", JobNormalizeImage},
+	} {
+		ids, err := pendingItems(ctx, db, caseID, kind.item)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		for _, id := range ids {
+			key := fmt.Sprintf("%s:%s:%d", kind.job, caseID, id)
+			if err := PutJob(ctx, db, kind.job, key, itemPayload{CaseID: caseID, ItemID: id}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
-	return replaceJob(ctx, db, JobNormalizeImages, caseID, casePayload{CaseID: caseID})
+	return replaceJob(ctx, db, JobFinishNormalize, caseID, casePayload{CaseID: caseID})
 }
 
 // CancelCase - один путь для «Отмены», /cancel и «начать заново»: слот
@@ -789,15 +804,20 @@ func (c *Cases) RecoverStuck(ctx context.Context) error {
 	}
 
 	for _, s := range cases {
-		kind := JobPublish
-		if s.status == statusNormalizing {
-			kind = JobNormalizeImages
+		// Нормализация восстанавливается тем же выбором шага, что и в обычном
+		// ходе: сорвалась она на записи, на скриншоте или перед закрытием -
+		// решают статусы элементов, а не догадка о том, где всё встало.
+		recover := func() error {
+			if s.status == statusNormalizing {
+				return advanceNormalize(ctx, c.pool, s.id)
+			}
+			return replaceJob(ctx, c.pool, JobPublish, s.id, casePayload{CaseID: s.id})
 		}
-		if err := replaceJob(ctx, c.pool, kind, s.id, casePayload{CaseID: s.id}); err != nil {
+		if err := recover(); err != nil {
 			c.log.Error("recover_failed", "case_id", s.id, "status", s.status, "error", err)
 			continue
 		}
-		c.log.Warn("case_recovered", "case_id", s.id, "status", s.status, "job", kind)
+		c.log.Warn("case_recovered", "case_id", s.id, "status", s.status)
 	}
 	return nil
 }
@@ -908,11 +928,13 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 		}
 
 		switch job.Kind {
-		case JobNormalizeVoice:
-			if err := putImagesJob(ctx, tx, p.CaseID); err != nil {
+		case JobNormalizeVoice, JobNormalizeImage:
+			// Элемент погашен выше, цепочка идёт дальше: провал одной записи или
+			// одного экрана не отменяет остального сырья.
+			if err := advanceNormalize(ctx, tx, p.CaseID); err != nil {
 				return err
 			}
-		case JobNormalizeImages:
+		case JobFinishNormalize:
 			var err error
 			reopened, err = reopenCase(ctx, tx, p.CaseID)
 			if err != nil {
@@ -943,6 +965,22 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				publishFailedText(cause), keysSummary); err != nil {
 				return err
 			}
+		case JobNotify:
+			// Сообщение автору доставить не удалось, и следа у него нет: вопрос
+			// раунда или номер тикета исчезли бы вместе с работой. Владелец
+			// получает текст потери и разбирается вручную.
+			// Алерт, потерянный сам, второго алерта не порождает: недоступный
+			// Telegram кормил бы очередь собственными провалами.
+			var n notifyPayload
+			if err := json.Unmarshal(job.Payload, &n); err != nil {
+				return fmt.Errorf("payload of %s: %w", job.Kind, err)
+			}
+			if n.ChatID == 0 && c.alertChat != 0 {
+				if err := putAlert(ctx, tx, p.CaseID, "lost:"+strconv.FormatInt(job.ID, 10),
+					lostNotifyText(p.CaseID, n.Text), c.alertChat); err != nil {
+					return err
+				}
+			}
 		case JobCancelIssue:
 			// Автору уже ответили «отменяю», и молчание оставило бы его в
 			// уверенности, что тикет закрыт: метка могла успеть встать, а
@@ -970,6 +1008,16 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 	if job.Kind == JobCancelIssue {
 		c.log.Warn("cancel_failed", "case_id", p.CaseID, "error", oneLine(cause.Error()))
 	}
+	if job.Kind == JobNotify {
+		c.log.Error("notify_lost", "case_id", p.CaseID, "job_id", job.ID,
+			"error", oneLine(cause.Error()))
+	}
+}
+
+// lostNotifyText - шапка алерта о недоставленном сообщении. Текст потери идёт
+// целиком: владелец должен видеть, что именно не дошло до автора.
+func lostNotifyText(caseID, text string) string {
+	return "Сообщение автору не доставлено, обращение " + caseID + ":\n\n" + text
 }
 
 // reopenCase возвращает обращение в сбор. Два пути возврата - «разобрать не
@@ -1016,24 +1064,16 @@ func replaceJob(ctx context.Context, db Runner, kind, caseID string, payload any
 	return PutJob(ctx, db, kind, kind+":"+caseID, payload)
 }
 
-// SaveNormalized и SaveProtocol - переходы, которые оставляет после себя шаг
-// нормализации. Живут здесь: единственный владелец состояния обращения - этот
-// файл, normalize.go зовёт его, а не пишет свой SQL.
+// SaveNormalized - переход, который оставляет после себя разбор одного
+// элемента. Живёт здесь: единственный владелец состояния обращения - этот файл,
+// normalize.go зовёт его, а не пишет свой SQL. Протокол в базу кладёт шаг
+// закрытия нормализации, он же переводит обращение в интервью.
 func (c *Cases) SaveNormalized(ctx context.Context, itemID int64, text string) error {
 	_, err := c.pool.Exec(ctx, `
 		UPDATE case_items SET normalized = $2, status = 'done', updated_at = now()
 		WHERE id = $1 AND status = 'pending'`, itemID, text)
 	if err != nil {
 		return fmt.Errorf("save normalized item %d: %w", itemID, err)
-	}
-	return nil
-}
-
-func (c *Cases) SaveProtocol(ctx context.Context, caseID, protocol string) error {
-	_, err := c.pool.Exec(ctx, `
-		UPDATE cases SET protocol = $2, updated_at = now() WHERE id = $1`, caseID, protocol)
-	if err != nil {
-		return fmt.Errorf("save protocol of case %s: %w", caseID, err)
 	}
 	return nil
 }

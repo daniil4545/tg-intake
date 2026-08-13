@@ -29,6 +29,10 @@ const (
 	// воркеру работу, которая ещё выполняется.
 	jobTimeout = 4 * time.Minute
 	lockStale  = 5 * time.Minute
+	// Срок жизни отработавшей работы. Неделя с запасом переживает разбор
+	// инцидента, а обращение к этому сроку давно опубликовано или отменено, и
+	// работу с тем же ключом ему уже не поставить.
+	jobTTL = 7 * 24 * time.Hour
 )
 
 // JobHandler выполняет работу одного вида. Ошибка означает повтор, nil - done.
@@ -99,15 +103,19 @@ func ClaimJobs(ctx context.Context, pool *pgxpool.Pool, limit int) ([]Job, error
 	return jobs, rows.Err()
 }
 
-func FinishJob(ctx context.Context, pool *pgxpool.Pool, id int64) error {
-	_, err := pool.Exec(ctx, `
+// FinishJob гасит отработавшую работу. Признак в ответе - строки уже нет:
+// работу сняли из-под воркера, пока он её выполнял (обращение двинулось дальше
+// и заменило её новой). Исход при этом уже записан обработчиком, но сам факт
+// обязан быть виден: незамеченным он выглядит как случайная потеря аудита.
+func FinishJob(ctx context.Context, pool *pgxpool.Pool, id int64) (bool, error) {
+	tag, err := pool.Exec(ctx, `
 		UPDATE jobs SET status = 'done', locked_at = NULL, last_error = NULL,
 		                updated_at = now()
 		WHERE id = $1`, id)
 	if err != nil {
-		return fmt.Errorf("finish job %d: %w", id, err)
+		return false, fmt.Errorf("finish job %d: %w", id, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // Exhausted - повторы кончились: следующий шаг не отсрочка, а исход провала.
@@ -138,6 +146,21 @@ func FailJob(ctx context.Context, db Runner, job Job, cause error) (bool, error)
 		return false, fmt.Errorf("retry job %d: %w", job.ID, err)
 	}
 	return false, nil
+}
+
+// SweepJobs убирает отработавшие работы. Держать их вечно незачем: аудит живёт
+// в case_events, а идемпотентность по ключу нужна ровно до тех пор, пока
+// обращение может поставить работу заново. Провалы остаются: по ним разбирают
+// инциденты.
+func SweepJobs(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+		DELETE FROM jobs
+		WHERE status = 'done' AND updated_at < now() - $1::int * interval '1 second'`,
+		int(jobTTL.Seconds()))
+	if err != nil {
+		return fmt.Errorf("sweep done jobs: %w", err)
+	}
+	return nil
 }
 
 // RunWorker держит два обработчика и уборщик локов, возвращается по ctx.
@@ -215,9 +238,13 @@ func (w *worker) run(ctx context.Context, job Job) {
 		w.fail(ctx, job, err)
 		return
 	}
-	if err := FinishJob(ctx, w.pool, job.ID); err != nil {
+	finished, err := FinishJob(ctx, w.pool, job.ID)
+	if err != nil {
 		w.log.Error("job_finish_failed", "kind", job.Kind, "error", err)
 		return
+	}
+	if !finished {
+		w.log.Warn("job_replaced_running", "kind", job.Kind, "job_id", job.ID)
 	}
 	w.log.Info("job_done", "kind", job.Kind, "ms", time.Since(start).Milliseconds())
 }

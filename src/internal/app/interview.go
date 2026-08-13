@@ -1023,7 +1023,7 @@ func (c *Cases) AfterVoice(ctx context.Context, caseID, text string) error {
 	if cs.Status == statusInterview || cs.Status == statusSummary {
 		return c.AddAnswer(ctx, cs, text)
 	}
-	return c.PutImagesJob(ctx, caseID)
+	return c.AdvanceNormalize(ctx, caseID)
 }
 
 // AfterVoiceFail - та же развилка для нераспознанной записи. В сборе провал
@@ -1041,7 +1041,7 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 		return putNotifyKey(ctx, c.pool, caseID, fmt.Sprintf("voicefail-%d", itemID),
 			"Не разобрал голосовое. Повторите, пожалуйста, текстом или запишите ещё раз.", "")
 	}
-	return c.PutImagesJob(ctx, caseID)
+	return c.AdvanceNormalize(ctx, caseID)
 }
 
 func roundMessage(questions []Question) string {
