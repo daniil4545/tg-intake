@@ -285,6 +285,14 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 		log.Warn("set_commands_failed", "error", err)
 	}
 
+	// Правка уже отправленного сообщения: сырьё дописывается, а не
+	// переписывается, поэтому учесть её нечем. Без хендлера апдейт не доходит
+	// никуда, и автор считает, что бот прочитал исправленное.
+	tb.Handle(tele.OnEdited, func(c tele.Context) error {
+		return c.Send("Правку прежнего сообщения я не вижу. Пришлите исправленное " +
+			"отдельным сообщением - оно добавится к обращению.")
+	})
+
 	tb.Handle(tele.OnText, b.onItem)
 	tb.Handle(tele.OnVoice, b.onItem)
 	tb.Handle(tele.OnPhoto, b.onItem)
@@ -936,15 +944,38 @@ func (b *Bot) onContinue(c tele.Context) error {
 
 	// Автор пришёл из меню конкретного проекта, значит продолжать надо в нём:
 	// проект можно менять до «Готово», источник истины - строка в cases.
+	// Кнопка живёт в чужом сообщении дольше экрана, поэтому смена проекта
+	// молча запрещена: обращение уехало бы в чужой репозиторий, и автор узнал
+	// бы об этом из готового тикета.
 	if slug := c.Data(); slug != "" {
-		if err := b.cases.SetProject(ctx, cs, slug); err != nil && !errors.Is(err, ErrUnknownProject) {
+		switch known, err := b.projectOf(ctx, cs); {
+		case err != nil:
 			return err
+		case known != nil && known.Slug != slug:
+			return b.screen(c, "Это обращение уже собирается в проекте «"+known.Title+"». "+
+				"Продолжайте его или нажмите «Сброс», чтобы завести новое.", nil)
+		case known == nil:
+			if err := b.cases.SetProject(ctx, cs, slug); err != nil && !errors.Is(err, ErrUnknownProject) {
+				return err
+			}
 		}
 	}
 	if err := b.screen(c, "Продолжаем прежнее обращение.", nil); err != nil {
 		return err
 	}
 	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
+}
+
+// projectOf - проект обращения либо nil, если он ещё не выбран.
+func (b *Bot) projectOf(ctx context.Context, cs *Case) (*Project, error) {
+	if cs.ProjectID == nil {
+		return nil, nil
+	}
+	project, err := LoadProject(ctx, b.pool, *cs.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	return &project, nil
 }
 
 // onItem принимает любое сообщение автора; куда оно пойдёт, решает состояние
@@ -961,8 +992,10 @@ func (b *Bot) onItem(c tele.Context) error {
 	}
 	if cs == nil {
 		// Одно меню на пачку: пересылка десяти сообщений дала бы десять меню
-		// подряд. Апдейты идут последовательно, карта без мьютекса.
-		if time.Since(b.menuAt[senderID(c)]) < menuRepeat {
+		// подряд. Апдейты идут последовательно, карта без мьютекса. Молчание
+		// достаётся только пачке: набранное руками сообщение приходит по
+		// одному, и тишина в ответ на него читается как «бот принял».
+		if inBatch(c.Message()) && time.Since(b.menuAt[senderID(c)]) < menuRepeat {
 			return nil
 		}
 		b.menuAt[senderID(c)] = time.Now()
@@ -976,6 +1009,12 @@ func (b *Bot) onItem(c tele.Context) error {
 		return b.sendState(c, cs)
 	}
 	return b.collect(ctx, c, cs)
+}
+
+// inBatch - сообщение пришло пачкой: пересылка или альбом. Bot API отдаёт их
+// отдельными апдейтами за секунды, и отвечать на каждое незачем.
+func inBatch(msg *tele.Message) bool {
+	return msg != nil && (msg.IsForwarded() || msg.AlbumID != "")
 }
 
 // collect кладёт сообщение сырьём в обращение. Отдельно от onItem, потому что
@@ -1218,6 +1257,10 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		// Кнопка прошлого раунда осталась в чате: закрывать ею текущие вопросы
 		// нельзя, автор подтвердил бы не то, что видит.
 		return c.Send("Это кнопка от прошлого вопроса. Ответьте на последний - текстом или голосовым.")
+	case errors.Is(err, ErrRoundAnswered):
+		// Вопрос тот же самый, и ответ по нему уже принят: говорить про прошлый
+		// вопрос здесь значит спорить с тем, что автор видит на экране.
+		return c.Send("Ответ уже принят, готовлю следующий вопрос.")
 	case errors.Is(err, ErrNotInterview):
 		return c.Send("Обращение уже ушло дальше.")
 	case errors.Is(err, ErrNoSuggestion):
@@ -1580,7 +1623,7 @@ func (b *Bot) onCard(c tele.Context) error {
 
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
-	if ticket.UserID == senderID(c) && !ticket.Status.Final {
+	if cancelOffered(ticket, senderID(c)) {
 		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
 			cardData(project.Slug, number))))
 	}
@@ -1691,6 +1734,13 @@ func statusTitle(s Status) string {
 		return "статус недоступен"
 	}
 	return s.Title
+}
+
+// cancelOffered - показывать ли кнопку отмены. Отменяет только автор и только
+// пока статус прочитан: при молчащем GitHub «не доигран» - это незнание, а не
+// факт, и кнопка звала бы отменять давно закрытый тикет.
+func cancelOffered(t *Ticket, userID int64) bool {
+	return t.UserID == userID && !t.Unavailable && !t.Status.Final
 }
 
 func cardText(t *Ticket) string {
