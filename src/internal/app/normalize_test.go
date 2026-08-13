@@ -69,9 +69,9 @@ func TestFailedItemMovesOn(t *testing.T) {
 	if err := cases.FinishCollect(ctx, cs); err != nil {
 		t.Fatalf("finish collect: %v", err)
 	}
-	imagesKey := JobNormalizeImages + ":" + cs.ID
-	if jobID(t, pool, imagesKey) != 0 {
-		t.Fatal("normalize_images поставлен, пока голосовые не разобраны")
+	finishKey := JobFinishNormalize + ":" + cs.ID
+	if jobID(t, pool, finishKey) != 0 {
+		t.Fatal("finish_normalize поставлен, пока голосовые не разобраны")
 	}
 
 	_, err = pool.Exec(ctx, `
@@ -80,11 +80,11 @@ func TestFailedItemMovesOn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize live item: %v", err)
 	}
-	if err := cases.PutImagesJob(ctx, cs.ID); err != nil {
-		t.Fatalf("put images job: %v", err)
+	if err := cases.AdvanceNormalize(ctx, cs.ID); err != nil {
+		t.Fatalf("advance normalize: %v", err)
 	}
-	if jobID(t, pool, imagesKey) != 0 {
-		t.Fatal("normalize_images поставлен, пока битое голосовое ещё pending")
+	if jobID(t, pool, finishKey) != 0 {
+		t.Fatal("finish_normalize поставлен, пока битое голосовое ещё pending")
 	}
 
 	voiceKey := fmt.Sprintf("%s:%s:%d", JobNormalizeVoice, cs.ID, broken)
@@ -108,20 +108,20 @@ func TestFailedItemMovesOn(t *testing.T) {
 	if got := itemStatus(t, pool, broken); got != "failed" {
 		t.Errorf("статус битого элемента: %s, ожидался failed", got)
 	}
-	imagesID := jobID(t, pool, imagesKey)
-	if imagesID == 0 {
-		t.Fatal("normalize_images не поставлен: цепочка встала на провале голосового")
+	finishID := jobID(t, pool, finishKey)
+	if finishID == 0 {
+		t.Fatal("finish_normalize не поставлен: цепочка встала на провале голосового")
 	}
 
 	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	imagesJob := Job{
-		ID:      imagesID,
-		Kind:    JobNormalizeImages,
-		Key:     imagesKey,
+	finishJob := Job{
+		ID:      finishID,
+		Kind:    JobFinishNormalize,
+		Key:     finishKey,
 		Payload: json.RawMessage(fmt.Sprintf(`{"case_id":%q}`, cs.ID)),
 	}
-	if err := normalizer.RunNormalizeImages(ctx, imagesJob); err != nil {
-		t.Fatalf("run normalize images: %v", err)
+	if err := normalizer.RunFinishNormalize(ctx, finishJob); err != nil {
+		t.Fatalf("run finish normalize: %v", err)
 	}
 
 	done := reload(t, cases, cs.ID)
@@ -154,24 +154,7 @@ func TestReopenedCaseStartsSecondRound(t *testing.T) {
 	if err := cases.FinishCollect(ctx, cs); err != nil {
 		t.Fatalf("finish collect: %v", err)
 	}
-	imagesKey := JobNormalizeImages + ":" + cs.ID
-	firstJob := jobID(t, pool, imagesKey)
-	if firstJob == 0 {
-		t.Fatal("normalize_images не поставлен на первом «Готово»")
-	}
-	err = normalizer.RunNormalizeImages(ctx, Job{
-		ID:      firstJob,
-		Kind:    JobNormalizeImages,
-		Key:     imagesKey,
-		Payload: json.RawMessage(fmt.Sprintf(`{"case_id":%q}`, cs.ID)),
-	})
-	if err != nil {
-		t.Fatalf("run normalize images: %v", err)
-	}
-	// Воркер гасит успешно вернувшую nil работу как done.
-	if err := FinishJob(ctx, pool, firstJob); err != nil {
-		t.Fatalf("finish job: %v", err)
-	}
+	runChain(t, normalizer, pool, cs.ID)
 
 	cs = reload(t, cases, cs.ID)
 	if cs.Status != statusCollecting {
@@ -185,20 +168,13 @@ func TestReopenedCaseStartsSecondRound(t *testing.T) {
 		t.Fatalf("второе «Готово»: %v", err)
 	}
 
-	secondJob := jobID(t, pool, imagesKey)
+	// Скриншот первого захода погашен, разбирать во втором нечего: цепочка идёт
+	// сразу к закрытию нормализации, и её работа обязана быть новой.
+	secondJob := jobID(t, pool, JobFinishNormalize+":"+cs.ID)
 	if secondJob == 0 || jobStatus(t, pool, secondJob) != "pending" {
 		t.Fatalf("второе «Готово» не поставило работу: id %d", secondJob)
 	}
-
-	err = normalizer.RunNormalizeImages(ctx, Job{
-		ID:      secondJob,
-		Kind:    JobNormalizeImages,
-		Key:     imagesKey,
-		Payload: json.RawMessage(fmt.Sprintf(`{"case_id":%q}`, cs.ID)),
-	})
-	if err != nil {
-		t.Fatalf("run normalize images again: %v", err)
-	}
+	runChain(t, normalizer, pool, cs.ID)
 
 	done := reload(t, cases, cs.ID)
 	if done.Status != "interview" {
@@ -207,6 +183,120 @@ func TestReopenedCaseStartsSecondRound(t *testing.T) {
 	if !strings.Contains(done.Protocol, "форма не сохраняется") {
 		t.Errorf("материал второго захода не попал в протокол:\n%s", done.Protocol)
 	}
+}
+
+// TestScreenshotJobPerItem: каждый скриншот получает свою работу, и провал
+// одного разбора не мешает следующему дойти до конца. Пачкой в одной работе они
+// делили бюджет: первый же зависший экран уводил в повтор всю нормализацию.
+func TestScreenshotJobPerItem(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5005, First: "Тест"}, "tg-intake")
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "заявка не сохраняется"}); err != nil {
+		t.Fatalf("collect text: %v", err)
+	}
+	// Оба без файла: разбор гаснет до вызова модели, а проверяется здесь не он,
+	// а то, что работы идут по элементу и цепочка доходит до конца.
+	first := insertItem(t, pool, cs.ID, "photo", "tg-shot-1", "")
+	second := insertItem(t, pool, cs.ID, "photo", "tg-shot-2", "")
+
+	if err := cases.FinishCollect(ctx, cs); err != nil {
+		t.Fatalf("finish collect: %v", err)
+	}
+	firstKey := fmt.Sprintf("%s:%s:%d", JobNormalizeImage, cs.ID, first)
+	secondKey := fmt.Sprintf("%s:%s:%d", JobNormalizeImage, cs.ID, second)
+	firstJob := jobID(t, pool, firstKey)
+	if firstJob == 0 || jobID(t, pool, secondKey) == 0 {
+		t.Fatal("скриншоты не получили по своей работе")
+	}
+	if jobID(t, pool, JobFinishNormalize+":"+cs.ID) != 0 {
+		t.Fatal("finish_normalize поставлен, пока скриншоты не разобраны")
+	}
+
+	err = normalizer.RunNormalizeImage(ctx, Job{
+		ID:      firstJob,
+		Kind:    JobNormalizeImage,
+		Key:     firstKey,
+		Payload: json.RawMessage(fmt.Sprintf(`{"case_id":%q,"item_id":%d}`, cs.ID, first)),
+	})
+	if err != nil {
+		t.Fatalf("run normalize image: %v", err)
+	}
+	if got := itemStatus(t, pool, first); got != "failed" {
+		t.Errorf("статус первого скриншота: %s, ожидался failed", got)
+	}
+	if jobID(t, pool, secondKey) == 0 {
+		t.Fatal("работа второго скриншота снята провалом первого")
+	}
+	if jobID(t, pool, JobFinishNormalize+":"+cs.ID) != 0 {
+		t.Fatal("finish_normalize поставлен, пока второй скриншот ещё pending")
+	}
+
+	runChain(t, normalizer, pool, cs.ID)
+
+	done := reload(t, cases, cs.ID)
+	if done.Status != statusInterview {
+		t.Fatalf("статус после разбора: %s, ожидался %s", done.Status, statusInterview)
+	}
+	if !strings.Contains(done.Protocol, "заявка не сохраняется") {
+		t.Errorf("текст обращения не попал в протокол:\n%s", done.Protocol)
+	}
+}
+
+// runChain доигрывает цепочку нормализации так, как её выполнял бы воркер:
+// работа по элементу, следом закрывающая. Расшифровка сюда не попадает - ей
+// нужна модель, и её проверяют отдельно.
+func runChain(t *testing.T, n *Normalizer, pool *pgxpool.Pool, caseID string) {
+	t.Helper()
+	ctx := context.Background()
+
+	for range 10 {
+		job, ok := nextJob(t, pool, caseID)
+		if !ok {
+			return
+		}
+		var err error
+		switch job.Kind {
+		case JobNormalizeImage:
+			err = n.RunNormalizeImage(ctx, job)
+		default:
+			err = n.RunFinishNormalize(ctx, job)
+		}
+		if err != nil {
+			t.Fatalf("run %s: %v", job.Kind, err)
+		}
+		if _, err := FinishJob(ctx, pool, job.ID); err != nil {
+			t.Fatalf("finish %s: %v", job.Kind, err)
+		}
+	}
+	t.Fatal("цепочка нормализации не сошлась за десять шагов")
+}
+
+func nextJob(t *testing.T, pool *pgxpool.Pool, caseID string) (Job, bool) {
+	t.Helper()
+
+	var job Job
+	// Только работы нормализации: уведомления автору в этих тестах доставлять
+	// некому, и они остаются в очереди как есть.
+	err := pool.QueryRow(context.Background(), `
+		SELECT id, kind, key, payload FROM jobs
+		WHERE status = 'pending' AND payload->>'case_id' = $1
+		  AND kind IN ($2, $3)
+		ORDER BY id LIMIT 1`, caseID, JobNormalizeImage, JobFinishNormalize).
+		Scan(&job.ID, &job.Kind, &job.Key, &job.Payload)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, false
+	}
+	if err != nil {
+		t.Fatalf("next job of case %s: %v", caseID, err)
+	}
+	return job, true
 }
 
 // jobID отдаёт 0, если работы с таким ключом нет: «не поставлена» - такой же

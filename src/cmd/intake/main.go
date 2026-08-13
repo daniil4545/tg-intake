@@ -76,7 +76,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	cases := app.NewCases(pool, media, log, cfg.MaxItems)
+	cases := app.NewCases(pool, media, log, cfg.MaxItems, cfg.AlertChatID)
 	llm := app.NewOpenRouter(cfg.OpenRouterKey, cfg.ModelMedia, cfg.OpenRouterProxy, log)
 	log.Info("openrouter_ready", "proxy", cfg.OpenRouterProxy != "",
 		"model_dialog", cfg.ModelDialog, "reasoning", cfg.ReasoningDialog)
@@ -99,7 +99,8 @@ func main() {
 
 	handlers := map[string]app.JobHandler{
 		app.JobNormalizeVoice:  normalizer.RunNormalizeVoice,
-		app.JobNormalizeImages: normalizer.RunNormalizeImages,
+		app.JobNormalizeImage:  normalizer.RunNormalizeImage,
+		app.JobFinishNormalize: normalizer.RunFinishNormalize,
 		app.JobInterview:       interview.Run,
 		app.JobSummarize:       interview.Summarize,
 		app.JobPublish:         publisher.Run,
@@ -121,7 +122,7 @@ func main() {
 	}()
 	go func() {
 		defer background.Done()
-		sweepDrafts(ctx, cases, log)
+		sweepDrafts(ctx, pool, cases, log)
 	}()
 
 	go bot.Start()
@@ -136,10 +137,11 @@ func main() {
 	background.Wait()
 }
 
-// sweepDrafts раз в час стирает файлы черновиков старше суток и напоминает про
-// брошенные обращения: медиа не переживает обращение, а автор, забывший про
-// разговор, получает ровно одно напоминание.
-func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
+// sweepDrafts раз в час стирает файлы черновиков старше суток, убирает
+// отработавшую очередь и напоминает про брошенные обращения: медиа не
+// переживает обращение, а автор, забывший про разговор, получает ровно одно
+// напоминание.
+func sweepDrafts(ctx context.Context, pool *pgxpool.Pool, cases *app.Cases, log *slog.Logger) {
 	ticker := time.NewTicker(sweepPeriod)
 	defer ticker.Stop()
 
@@ -158,6 +160,9 @@ func sweepDrafts(ctx context.Context, cases *app.Cases, log *slog.Logger) {
 			}
 			if err := cases.SweepDrafts(ctx); err != nil {
 				log.Error("sweep_failed", "error", err)
+			}
+			if err := app.SweepJobs(ctx, pool); err != nil {
+				log.Error("sweep_jobs_failed", "error", err)
 			}
 		}
 	}
@@ -197,5 +202,10 @@ func healthcheck(cfg app.Config) int {
 		return 1
 	}
 	pool.Close()
+	// Живая база при молчащем опросе Telegram - тот самый случай, когда
+	// контейнер выглядел здоровым, а обращения уходили второму поллеру.
+	if !app.PollerAlive(cfg.MediaDir) {
+		return 1
+	}
 	return 0
 }

@@ -40,8 +40,9 @@ services:
 
   app:
     build: .
-    # Ключ OpenRouter, модель, MAX_ITEMS и AUDIO_CONVERT приезжают из .env
-    # вместе с токеном бота; MEDIA_DIR задаём здесь, чтобы он совпал с tmpfs.
+    # Ключ OpenRouter, модель и MAX_ITEMS приезжают из .env вместе с токеном
+    # бота; MEDIA_DIR задаём здесь, чтобы он совпал с tmpfs: там же лежит
+    # отметка живости опроса, которую читает healthcheck.
     env_file: .env
     environment:
       DATABASE_URL: postgres://intake:intake@postgres:5432/intake?sslmode=disable
@@ -58,11 +59,14 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
+      # Проверяет базу и свежесть отметки опроса Telegram: контейнер с живой
+      # базой и молчащим поллером здоровым не считается. Запас на старт больше
+      # цикла опроса - первая отметка появляется только после getUpdates.
       test: ["CMD", "/app", "healthcheck"]
       interval: 15s
       timeout: 7s
       retries: 3
-      start_period: 15s
+      start_period: 45s
 
 volumes:
   postgres_data:
