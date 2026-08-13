@@ -202,5 +202,10 @@ func healthcheck(cfg app.Config) int {
 		return 1
 	}
 	pool.Close()
+	// Живая база при молчащем опросе Telegram - тот самый случай, когда
+	// контейнер выглядел здоровым, а обращения уходили второму поллеру.
+	if !app.PollerAlive(cfg.MediaDir) {
+		return 1
+	}
 	return 0
 }
