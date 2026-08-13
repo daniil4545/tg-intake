@@ -40,15 +40,19 @@ var (
 // карточка: в списке они пусты, и второй тип ради трёх пустых строк не стоит
 // пересечения в шести полях.
 type Ticket struct {
-	CaseID  string
-	Number  int
-	URL     string
-	Title   string
-	UserID  int64
-	Status  Status
-	Author  string
-	Body    string
-	Comment string
+	CaseID string
+	Number int
+	URL    string
+	Title  string
+	UserID int64
+	Status Status
+	// Unavailable - GitHub не ответил, и статус не прочитан вовсе. От
+	// нераспознанной метки отличается тем, что про тикет не известно ничего:
+	// закрытому предлагать отмену нельзя.
+	Unavailable bool
+	Author      string
+	Body        string
+	Comment     string
 }
 
 // Tickets - просмотр тикетов и отмена. Владелец состояния обращения по-прежнему
@@ -166,6 +170,7 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 		}
 		// Карточка переживает отказ так же, как список: без статуса, но с телом.
 		t.log.Warn("issue_unavailable", "project", project.Slug, "issue", number, "error", err)
+		ticket.Unavailable = true
 		return &ticket, nil
 	}
 

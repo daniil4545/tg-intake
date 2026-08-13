@@ -207,6 +207,28 @@ func TestCheckTurn(t *testing.T) {
 				Questions: []Question{{Key: "case", Text: "а какой заказ?"}},
 			},
 		},
+		{
+			// Отписка вместо догадки обесценивает кнопку «Всё так»: автор
+			// читает «Предполагаю: не указано» и перестаёт ей верить. Ловить
+			// это на нажатии поздно - текст он уже увидел.
+			name: "отписка вместо предположения",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[:1],
+				Gaps:      []string{"expected", "actual"},
+				Questions: []Question{{Key: "expected", Text: "что ожидалось?", Suggested: "не указано"}},
+			},
+		},
+		{
+			name: "предположение без догадки допустимо пустым",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full,
+				Gaps:      []string{"where"},
+				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
+			},
+			ok: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -262,6 +284,66 @@ func TestScrubContacts(t *testing.T) {
 		if !strings.Contains(got, keep) {
 			t.Errorf("нужное вырезано: %q пропал из %q", keep, got)
 		}
+	}
+}
+
+// TestSummaryTitle: заголовок держит форму, по которой автор узнаёт свой тикет
+// в списке. Служебное слово в начале тратит место на то, что и так видно по
+// метке типа.
+func TestSummaryTitle(t *testing.T) {
+	i := newTestInterview(t, nil, 3)
+	cs := &Case{Kind: "bug"}
+
+	if err := i.checkSummary(cs, summaryOut{Title: "Заявка не сохраняется"}); err != nil {
+		t.Errorf("годный заголовок отклонён: %v", err)
+	}
+	for _, title := range []string{"Проблема: заявка не сохраняется", "Баг в форме заявки",
+		"просьба добавить фильтр"} {
+		if err := i.checkSummary(cs, summaryOut{Title: title}); err == nil {
+			t.Errorf("заголовок %q принят", title)
+		}
+	}
+	if err := i.checkSummary(cs, summaryOut{Title: "   "}); err == nil {
+		t.Error("пустой заголовок принят")
+	}
+}
+
+// TestScrubbedTranscript: обезличивание не держится на одном промте. Расшифровка
+// и разбор экрана уходят автору протоколом раньше саммари, и промах модели
+// показал бы телефон клиента в чате.
+func TestScrubbedTranscript(t *testing.T) {
+	spoken := "клиент Пётр звонил с +7 916 123-45-67, заказ 4821000123 не оплачен"
+	got := scrubContacts(spoken)
+	if strings.Contains(got, "916 123-45-67") {
+		t.Errorf("телефон остался в расшифровке: %q", got)
+	}
+	if !strings.Contains(got, "4821000123") {
+		t.Errorf("номер заказа вырезан вместе с телефоном: %q", got)
+	}
+
+	extract := screenshotExtract{
+		Screen:     "карточка клиента",
+		Facts:      []screenshotFact{{Label: "почта", Value: "ivan@example.com"}},
+		Relevant:   "та самая карточка",
+		Unreadable: &[]string{},
+	}
+	if card := scrubContacts(formatExtract(extract)); strings.Contains(card, "ivan@example.com") {
+		t.Errorf("почта осталась в разборе экрана: %q", card)
+	}
+}
+
+// TestLostKeys: смена типа обращения уносит собранные ответы, и увидеть это
+// нужно по именам пунктов - иначе разговор необъяснимо спрашивает заново.
+func TestLostKeys(t *testing.T) {
+	prior := map[string]string{"case": "заказ 4821", "expected": "статус меняется"}
+	filled := map[string]string{"case": "заказ 4821"}
+
+	got := lostKeys(prior, filled)
+	if len(got) != 1 || got[0] != "expected" {
+		t.Errorf("потерянные пункты: %v, ожидался [expected]", got)
+	}
+	if n := len(lostKeys(prior, prior)); n != 0 {
+		t.Errorf("без смены типа потеряно %d пунктов", n)
 	}
 }
 
@@ -404,9 +486,11 @@ func TestAcceptRound(t *testing.T) {
 	}
 
 	// Следующий ход идёт секунды, и человек жмёт кнопку ещё раз. Второе нажатие
-	// не должно давать ни второго ответа в истории, ни второго хода модели.
-	if err := cases.AcceptRound(ctx, reload(t, cases, cs.ID), 1); !errors.Is(err, ErrStaleRound) {
-		t.Fatalf("повторное «Всё так»: получено %v, ожидалось ErrStaleRound", err)
+	// не должно давать ни второго ответа в истории, ни второго хода модели. И
+	// это не устаревшая кнопка: вопрос тот же, ответ по нему уже принят - автору
+	// про «прошлый вопрос» говорить неправда.
+	if err := cases.AcceptRound(ctx, reload(t, cases, cs.ID), 1); !errors.Is(err, ErrRoundAnswered) {
+		t.Fatalf("повторное «Всё так»: получено %v, ожидалось ErrRoundAnswered", err)
 	}
 	if n := countJobs(t, pool, JobInterview, cs.ID); n != 1 {
 		t.Errorf("повтор нажатия добавил работу: работ %d, ожидалась 1", n)
