@@ -198,21 +198,29 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 // очередью, и бот правит им тот экран, с которого отмену запустили.
 func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64) (string, error) {
 	var caseID string
-	var owner int64
-	row := t.cases.pool.QueryRow(ctx,
-		`SELECT id, user_id FROM cases WHERE project_id = $1 AND issue_number = $2`,
-		project.ID, number)
-	if err := row.Scan(&caseID, &owner); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrIssueGone
+	// Чтение и постановка одной транзакцией: между ними обращение может уйти в
+	// отмену вторым нажатием, и работа встала бы поверх уже закрытого тикета.
+	err := t.cases.inTx(ctx, func(tx pgx.Tx) error {
+		var owner int64
+		row := tx.QueryRow(ctx,
+			`SELECT id, user_id FROM cases WHERE project_id = $1 AND issue_number = $2 FOR UPDATE`,
+			project.ID, number)
+		if err := row.Scan(&caseID, &owner); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrIssueGone
+			}
+			return fmt.Errorf("load case of issue %d: %w", number, err)
 		}
-		return "", fmt.Errorf("load case of issue %d: %w", number, err)
+		if owner != userID {
+			return ErrNotAuthor
+		}
+		return replaceJob(ctx, tx, JobCancelIssue, caseID,
+			cancelPayload{CaseID: caseID, UserID: userID})
+	})
+	if err != nil {
+		return "", err
 	}
-	if owner != userID {
-		return "", ErrNotAuthor
-	}
-	return caseID, replaceJob(ctx, t.cases.pool, JobCancelIssue, caseID,
-		cancelPayload{CaseID: caseID, UserID: userID})
+	return caseID, nil
 }
 
 // RunCancel закрывает тикет в GitHub. Порядок вызовов важен: метка ставится до
@@ -295,13 +303,13 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 
 	recorded := false
 	err = t.cases.inTx(ctx, func(tx pgx.Tx) error {
-		// Условие обязательно: повтор работы после падения между закрытием issue
-		// и гашением работы записал бы второе событие в журнал.
+		// Единственность держит уникальный индекс, а не проверка перед вставкой:
+		// повтор работы после падения между закрытием issue и её гашением, как и
+		// вторая работа отмены рядом, обязаны дать одно событие.
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO case_events (case_id, kind, payload)
-			SELECT $1, 'cancelled_by_author', $2::jsonb
-			WHERE NOT EXISTS (
-			    SELECT 1 FROM case_events WHERE case_id = $1 AND kind = 'cancelled_by_author')`,
+			VALUES ($1, 'cancelled_by_author', $2::jsonb)
+			ON CONFLICT DO NOTHING`,
 			cs.ID, fmt.Sprintf(`{"issue": %d}`, cs.IssueNumber))
 		if err != nil {
 			return fmt.Errorf("record cancel of case %s: %w", cs.ID, err)

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -47,6 +49,14 @@ const (
 	// Начальный экран: один текст и для первого показа, и для возврата, иначе
 	// правка сообщения даёт другой заголовок на том же месте.
 	homeText = "Выберите проект или добавьте новый:"
+	// Сколько getUpdates держит соединение, пауза после отказа опроса и шаг
+	// записи отметки живости.
+	pollTimeout = 10 * time.Second
+	pollRetry   = 5 * time.Second
+	aliveTick   = 30 * time.Second
+	// Возраст отметки, после которого контейнер считается нездоровым. С запасом
+	// над циклом опроса: одиночный отказ Bot API не повод для перезапуска.
+	aliveTTL = 3 * time.Minute
 )
 
 // Инлайн-кнопки: telebot маршрутизирует callback по Unique и кодирует кнопку
@@ -209,7 +219,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	// параллельные хендлеры ломают одно обращение - раздел 5 architecture.md.
 	tb, err := startBot(ctx, tele.Settings{
 		Token:       cfg.BotToken,
-		Poller:      &tele.LongPoller{Timeout: 10 * time.Second},
+		Poller:      &poller{log: log, alivePath: alivePath(cfg.MediaDir)},
 		Client:      proxyClient(cfg.TelegramProxy),
 		Verbose:     false,
 		Synchronous: true,
@@ -318,6 +328,113 @@ func proxyClient(proxy string) *http.Client {
 
 // startBot повторяет getMe с отсрочкой: егресс к Telegram нестабилен даже с
 // закреплённым DC, но пятый подряд отказ остаётся падением.
+// poller - long polling со следом в логе и с отметкой живости. Свой вместо
+// tele.LongPoller: тот отдаёт ошибку опроса в debug, который молчит без
+// Verbose, а Verbose дампит сырые payload Bot API с текстами обращений.
+// Из-за этого 409 Conflict от второго поллера с тем же токеном не виден ни в
+// логе, ни снаружи, а цикл опроса при постоянной ошибке крутится без паузы.
+type poller struct {
+	log       *slog.Logger
+	alivePath string
+	lastID    int
+	marked    time.Time
+}
+
+func (p *poller) Poll(b *tele.Bot, dest chan tele.Update, stop chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		updates, err := p.fetch(b)
+		if err != nil {
+			p.log.Error("poll_failed", "error", err)
+			// Пауза обязательна: отказ возвращается сразу, и цикл без неё жарит
+			// Bot API отказами.
+			if !sleepOrStop(stop, pollRetry) {
+				return
+			}
+			continue
+		}
+		p.mark()
+
+		for _, update := range updates {
+			p.lastID = update.ID
+			select {
+			case dest <- update:
+			case <-stop:
+				return
+			}
+		}
+	}
+}
+
+// fetch разбирает ответ сам: Raw отдаёт тело как есть, и отказ Bot API
+// (`ok: false`) без этой проверки выглядел бы пустой пачкой апдейтов - ровно
+// тот случай, ради которого поллер и переписан.
+func (p *poller) fetch(b *tele.Bot) ([]tele.Update, error) {
+	data, err := b.Raw("getUpdates", map[string]any{
+		"offset":  p.lastID + 1,
+		"timeout": int(pollTimeout.Seconds()),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		OK          bool          `json:"ok"`
+		Result      []tele.Update `json:"result"`
+		ErrorCode   int           `json:"error_code"`
+		Description string        `json:"description"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode updates: %w", err)
+	}
+	if !resp.OK {
+		return nil, fmt.Errorf("getUpdates: %d %s", resp.ErrorCode, resp.Description)
+	}
+	return resp.Result, nil
+}
+
+// mark обновляет отметку живости. Не чаще одного раза в aliveTick: опрос
+// возвращается каждые десять секунд, и запись на диск на каждый круг не нужна.
+func (p *poller) mark() {
+	if time.Since(p.marked) < aliveTick {
+		return
+	}
+	now := time.Now()
+	if err := os.WriteFile(p.alivePath, []byte(now.Format(time.RFC3339)), 0o600); err != nil {
+		p.log.Error("alive_mark_failed", "error", err)
+		return
+	}
+	p.marked = now
+}
+
+// PollerAlive - идёт ли опрос Telegram. Отметку обновляет успешный getUpdates,
+// и её возраст - единственный признак, отличающий работающий поллер от
+// молчащего: healthcheck запускается отдельным процессом и памяти сервиса не
+// видит.
+func PollerAlive(mediaDir string) bool {
+	info, err := os.Stat(alivePath(mediaDir))
+	return err == nil && time.Since(info.ModTime()) < aliveTTL
+}
+
+func alivePath(mediaDir string) string { return filepath.Join(mediaDir, "poller.alive") }
+
+// sleepOrStop возвращает false, если бот остановлен и ждать больше незачем.
+func sleepOrStop(stop chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func startBot(ctx context.Context, settings tele.Settings, log *slog.Logger) (*tele.Bot, error) {
 	var err error
 	for attempt := range startAttempts {

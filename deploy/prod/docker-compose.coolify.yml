@@ -91,11 +91,14 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
+      # Проверяет базу и свежесть отметки опроса Telegram: контейнер с живой
+      # базой и молчащим поллером здоровым не считается. Запас на старт больше
+      # цикла опроса - первая отметка появляется только после getUpdates.
       test: ["CMD", "/app", "healthcheck"]
       interval: 15s
       timeout: 7s
       retries: 3
-      start_period: 15s
+      start_period: 45s
     restart: unless-stopped
     logging:
       driver: journald

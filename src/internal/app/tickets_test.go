@@ -398,6 +398,40 @@ func TestCancelResumesAfterPartialFailure(t *testing.T) {
 	}
 }
 
+// TestCancelRecordedOnce: отмена записывается один раз, и держит это база.
+// Проверка перед вставкой пропускала второе событие, когда две работы отмены
+// шли одновременно: каждая видела пустой журнал до чужого коммита.
+func TestCancelRecordedOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := publishCase(t, cases, 7120, 71)
+
+	record := func() error {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO case_events (case_id, kind, payload)
+			VALUES ($1, 'cancelled_by_author', '{}'::jsonb)`, cs.ID)
+		return err
+	}
+	if err := record(); err != nil {
+		t.Fatalf("первая запись отмены: %v", err)
+	}
+	if err := record(); err == nil {
+		t.Fatal("вторая запись отмены прошла: тикет закрылся бы дважды")
+	}
+
+	var n int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM case_events WHERE case_id = $1 AND kind = 'cancelled_by_author'`,
+		cs.ID).Scan(&n)
+	if err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("событий отмены: %d, ожидалось 1", n)
+	}
+}
+
 // addProject заводит проект и убирает его за собой: testPool чистит обращения,
 // но не проекты, и мусор утёк бы в соседние тесты.
 func addProject(t *testing.T, pool *pgxpool.Pool, slug string) ProjectConfig {

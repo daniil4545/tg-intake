@@ -95,7 +95,7 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 	// Элемент уже разобран или погашен: повтор работы не переделывает сделанное,
 	// но цепочку двинуть обязан - иначе обращение зависнет в normalizing.
 	if item == nil || item.Status != "pending" {
-		return n.cases.PutImagesJob(ctx, p.CaseID)
+		return n.cases.AdvanceNormalize(ctx, p.CaseID)
 	}
 
 	audio, format, err := n.readAudio(*item)
@@ -143,11 +143,11 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 	return n.cases.AfterVoice(ctx, p.CaseID, text)
 }
 
-// RunNormalizeImages строит протокол сырья, дописывает в него разбор скриншотов
-// и закрывает нормализацию. Ставится всегда, даже без единого фото: протокол
-// строит именно этот шаг.
-func (n *Normalizer) RunNormalizeImages(ctx context.Context, job Job) error {
-	var p casePayload
+// RunNormalizeImage разбирает один скриншот. Работа ставится по элементу, как и
+// расшифровка: бюджет работы принадлежит одному вызову модели, и деградация
+// провайдера на первом экране не оставляет следующие без времени.
+func (n *Normalizer) RunNormalizeImage(ctx context.Context, job Job) error {
+	var p itemPayload
 	if err := json.Unmarshal(job.Payload, &p); err != nil {
 		return fmt.Errorf("payload of %s: %w", job.Kind, err)
 	}
@@ -165,26 +165,37 @@ func (n *Normalizer) RunNormalizeImages(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
-
-	// Протокол пишется до разбора скриншотов: он же их контекст, и он переживёт
-	// провал шага.
-	protocol := BuildProtocol(items)
-	if err := n.cases.SaveProtocol(ctx, p.CaseID, protocol); err != nil {
-		return err
-	}
-
-	for _, it := range items {
-		if it.Kind != "photo" || it.Status != "pending" {
-			continue
-		}
-		if err := n.readScreenshot(ctx, protocol, it); err != nil {
-			// Сорвался вызов, а не ответ: работа уйдёт в повтор целиком, но
-			// разобранные скриншоты уже done и второй раз в модель не пойдут.
+	item := findItem(items, p.ItemID)
+	// Элемент уже разобран или погашен: повтор работы не переделывает сделанное,
+	// но цепочку двинуть обязан - иначе обращение зависнет в normalizing.
+	if item != nil && item.Status == "pending" {
+		// Протокол здесь контекст, а не результат: в базу его кладёт шаг
+		// закрытия нормализации, когда разбирать больше нечего.
+		if err := n.readScreenshot(ctx, BuildProtocol(items), *item); err != nil {
 			return err
 		}
 	}
+	return n.cases.AdvanceNormalize(ctx, p.CaseID)
+}
 
-	items, err = n.cases.Items(ctx, p.CaseID)
+// RunFinishNormalize закрывает нормализацию: сырья не осталось, протокол
+// собран целиком. Ставится всегда, даже без единого вложения - обращение из
+// одного текста проходит тем же путём.
+func (n *Normalizer) RunFinishNormalize(ctx context.Context, job Job) error {
+	var p casePayload
+	if err := json.Unmarshal(job.Payload, &p); err != nil {
+		return fmt.Errorf("payload of %s: %w", job.Kind, err)
+	}
+
+	cs, err := n.cases.Load(ctx, p.CaseID)
+	if err != nil {
+		return err
+	}
+	if cs == nil || cs.Status != statusNormalizing {
+		return nil
+	}
+
+	items, err := n.cases.Items(ctx, p.CaseID)
 	if err != nil {
 		return err
 	}
