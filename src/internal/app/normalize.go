@@ -126,7 +126,10 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 		return fmt.Errorf("decode transcript: %w", err)
 	}
 
-	text := strings.TrimSpace(out.Text)
+	// Обезличивание перестаёт держаться на одном промте: расшифровка идёт и в
+	// протокол, который сразу показывают автору, и ответом в интервью. Промт
+	// остаётся первой линией, регулярка - второй.
+	text := scrubContacts(strings.TrimSpace(out.Text))
 	if text == "" {
 		// О нераспознанной речи надо сказать прямо: пустота, ушедшая дальше,
 		// читается моделью как «человек ничего не сказал».
@@ -243,7 +246,7 @@ func (n *Normalizer) readScreenshot(ctx context.Context, protocol string, item I
 		}
 		extract, err := parseExtract(raw)
 		if err == nil {
-			return n.cases.SaveNormalized(ctx, item.ID, formatExtract(extract))
+			return n.cases.SaveNormalized(ctx, item.ID, scrubContacts(formatExtract(extract)))
 		}
 		n.log.Warn("llm_invalid", "step", stepScreenshot, "item_id", item.ID,
 			"attempt", attempt+1, "error", err)

@@ -35,8 +35,11 @@ var (
 
 	ErrNotInterview = errors.New("case is not in interview")
 	ErrStaleRound   = errors.New("round is not current")
-	ErrNoSummary    = errors.New("case has no summary to confirm")
-	ErrNoSuggestion = errors.New("round has no suggestions to accept")
+	// Ответ по текущему раунду уже принят: кнопку нажали второй раз, пока ход
+	// ещё думает. Для автора это не «прошлый вопрос», а тот же самый.
+	ErrRoundAnswered = errors.New("round is already answered")
+	ErrNoSummary     = errors.New("case has no summary to confirm")
+	ErrNoSuggestion  = errors.New("round has no suggestions to accept")
 )
 
 // Interview - шаги разговора: добивание контракта раундами вопросов и сборка
@@ -262,6 +265,14 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		round++
 	}
 	filled := i.mergeFilled(cs.Filled, turn)
+	// Смена типа обращения снимает ключи чужого контракта: собранные ответы
+	// исчезают из состояния. Промт менять тип без повода запрещает, но проверить
+	// повод нечем, а вот увидеть саму пропажу обязаны - иначе разговор
+	// необъяснимо начинает спрашивать заново.
+	if cs.Kind != "" && cs.Kind != turn.Kind {
+		i.log.Warn("case_kind_changed", "case_id", cs.ID, "from", cs.Kind, "to", turn.Kind,
+			"lost_keys", strings.Join(lostKeys(cs.Filled, filled), ","))
+	}
 
 	saved, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
 	if err != nil {
@@ -398,6 +409,19 @@ func (i *Interview) mergeFilled(prior map[string]string, turn interviewTurn) map
 	return filled
 }
 
+// lostKeys - пункты, которые были закрыты и после хода закрытыми быть
+// перестали. Имена пунктов контракта, содержимого обращения в них нет.
+func lostKeys(prior, filled map[string]string) []string {
+	var lost []string
+	for key := range prior {
+		if _, ok := filled[key]; !ok {
+			lost = append(lost, key)
+		}
+	}
+	slices.Sort(lost)
+	return lost
+}
+
 // checkTurn - проверки недоверенного вывода модели. Схема гарантирует форму, а
 // смысл проверяет Go: ключи вне контракта, вопрос про закрытый пункт и
 // готовность при незакрытых обязательных пунктах прошли бы схему насквозь.
@@ -434,6 +458,12 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		}
 		if seen[q.Key] {
 			return fmt.Errorf("two questions about key %q", q.Key)
+		}
+		// Отписку вместо догадки промт запрещает прямо, а ловил её только
+		// момент нажатия «Всё так» - автор к тому времени уже прочитал
+		// «Предполагаю: не указано» и потерял доверие к кнопке.
+		if strings.TrimSpace(q.Suggested) != "" && isStub(q.Suggested) {
+			return fmt.Errorf("question about %q suggests a stub", q.Key)
 		}
 		seen[q.Key] = true
 	}
@@ -604,6 +634,12 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 	}
 	if utf8.RuneCountInString(title) > maxTitle {
 		return fmt.Errorf("summary title is %d runes long", utf8.RuneCountInString(title))
+	}
+	// Заголовок «Проблема: не сохраняется форма» тратит место списка на слово,
+	// которое и так известно из типа тикета. Промт это запрещает, проверять
+	// было некому.
+	if word := strings.ToLower(strings.Fields(title)[0]); slices.Contains(titleStopWords, strings.Trim(word, ":-")) {
+		return fmt.Errorf("summary title starts with %q", word)
 	}
 
 	for _, s := range out.Sections {
@@ -818,7 +854,7 @@ func (c *Cases) AcceptRound(ctx context.Context, cs *Case, round int) error {
 		return err
 	}
 	if answered {
-		return ErrStaleRound
+		return ErrRoundAnswered
 	}
 
 	questions, err := c.lastQuestions(ctx, cs.ID)
@@ -1106,6 +1142,10 @@ func scrubContacts(text string) string {
 	text = cardRe.ReplaceAllString(text, "[карта]")
 	return phoneRe.ReplaceAllString(text, "[телефон]")
 }
+
+// titleStopWords - служебные слова, с которых заголовок начинать нельзя: тип
+// тикета виден по метке, а в списке видно только заголовок.
+var titleStopWords = []string{"проблема", "баг", "ошибка", "просьба", "вопрос", "запрос"}
 
 func kindList(rules Contract) []string {
 	kinds := make([]string, 0, len(rules))
