@@ -30,12 +30,21 @@ const (
 	JobPublish         = "publish"
 	JobNotify          = "notify"
 	JobCancelIssue     = "cancel_issue"
+	JobLookup          = "lookup"
 )
 
 // caseJobKinds - работы, которые принадлежат разговору и гасятся вместе с ним.
 // publish не входит: отмена из publishing запрещена, к этому моменту автор уже
 // подтвердил публикацию.
-var caseJobKinds = []string{JobNormalizeVoice, JobNormalizeImage, JobFinishNormalize, JobInterview, JobSummarize}
+var caseJobKinds = []string{JobNormalizeVoice, JobNormalizeImage, JobFinishNormalize,
+	JobInterview, JobSummarize, JobLookup}
+
+// Режим разговора. Переход односторонний: вопрос становится тикетом, обратно -
+// нет.
+const (
+	modeTicket = "ticket"
+	modeAsk    = "ask"
+)
 
 const (
 	statusCollecting  = "collecting"
@@ -45,6 +54,8 @@ const (
 	statusPublishing  = "publishing"
 	statusCancelled   = "cancelled"
 	statusPublished   = "published"
+	statusAnswering   = "answering"
+	statusAnswered    = "answered"
 )
 
 // draftTTL - после этого срока черновик считается брошенным и теряет файлы.
@@ -59,6 +70,7 @@ var (
 	ErrUnknownProject  = errors.New("project is unknown or inactive")
 	ErrNoProject       = errors.New("case has no project")
 	ErrNoItems         = errors.New("case has no items")
+	ErrNoNewItems      = errors.New("case has no new items")
 	ErrTooManyItems    = errors.New("case reached item limit")
 	ErrUnsupportedItem = errors.New("message kind is not supported")
 	ErrPublishing      = errors.New("case is already publishing")
@@ -78,6 +90,7 @@ type Case struct {
 	UserID      int64
 	ProjectID   *int64
 	Status      string
+	Mode        string
 	Protocol    string
 	Kind        string
 	Filled      map[string]string
@@ -126,7 +139,7 @@ type txRunner interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-const caseColumns = `id, user_id, project_id, status, protocol, COALESCE(kind, ''),
+const caseColumns = `id, user_id, project_id, status, mode, protocol, COALESCE(kind, ''),
 	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), incomplete,
 	COALESCE(issue_number, 0)`
 
@@ -143,14 +156,14 @@ func (c *Cases) Load(ctx context.Context, caseID string) (*Case, error) {
 func (c *Cases) Active(ctx context.Context, userID int64) (*Case, error) {
 	row := c.pool.QueryRow(ctx, `
 		SELECT `+caseColumns+` FROM cases
-		WHERE user_id = $1 AND status NOT IN ('published', 'cancelled')`, userID)
+		WHERE user_id = $1 AND status NOT IN ('published', 'cancelled', 'answered')`, userID)
 	return scanCase(row)
 }
 
 func scanCase(row pgx.Row) (*Case, error) {
 	var cs Case
 	var filled, gaps []byte
-	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Protocol, &cs.Kind,
+	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Mode, &cs.Protocol, &cs.Kind,
 		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Incomplete,
 		&cs.IssueNumber)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -177,7 +190,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 // Неизвестный slug не отменяет старт: обращение заводится без проекта, и вопрос
 // о проекте задаётся заново. Терять первое сообщение из-за устаревшей кнопки
 // нельзя.
-func (c *Cases) StartCase(ctx context.Context, u User, projectSlug string) (*Case, bool, error) {
+func (c *Cases) StartCase(ctx context.Context, u User, projectSlug, mode string) (*Case, bool, error) {
 	if err := UpsertUser(ctx, c.pool, u); err != nil {
 		return nil, false, err
 	}
@@ -203,21 +216,22 @@ func (c *Cases) StartCase(ctx context.Context, u User, projectSlug string) (*Cas
 		}
 	}
 
-	cs := &Case{UserID: u.ID, ProjectID: projectID, Status: statusCollecting}
+	cs := &Case{UserID: u.ID, ProjectID: projectID, Status: statusCollecting, Mode: mode}
 	err = c.inTx(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
-			INSERT INTO cases (user_id, project_id, status)
-			VALUES ($1, $2, 'collecting') RETURNING id`, u.ID, projectID).Scan(&cs.ID)
+			INSERT INTO cases (user_id, project_id, status, mode)
+			VALUES ($1, $2, 'collecting', $3) RETURNING id`, u.ID, projectID, mode).Scan(&cs.ID)
 		if err != nil {
 			return fmt.Errorf("insert case: %w", err)
 		}
-		return addEvent(ctx, tx, cs.ID, "case_started", map[string]any{"project": projectSlug})
+		return addEvent(ctx, tx, cs.ID, "case_started",
+			map[string]any{"project": projectSlug, "mode": mode})
 	})
 	if err != nil {
 		return nil, false, err
 	}
 
-	c.log.Info("case_started", "user_id", u.ID, "case_id", cs.ID, "project", projectSlug)
+	c.log.Info("case_started", "user_id", u.ID, "case_id", cs.ID, "project", projectSlug, "mode", mode)
 	return cs, false, nil
 }
 
@@ -422,7 +436,13 @@ func (c *Cases) CountItems(ctx context.Context, caseID string) (int, error) {
 // Items отдаёт элементы обращения в порядке создания: этот порядок и есть
 // порядок протокола.
 func (c *Cases) Items(ctx context.Context, caseID string) ([]Item, error) {
-	rows, err := c.pool.Query(ctx, `
+	return loadItems(ctx, c.pool, caseID)
+}
+
+// loadItems - те же элементы из чужой транзакции: переход в тикет решает по
+// сырью, чем продолжить разговор, и читать его обязан там же, где меняет статус.
+func loadItems(ctx context.Context, db txRunner, caseID string) ([]Item, error) {
+	rows, err := db.Query(ctx, `
 		SELECT id, kind, source_text, normalized, COALESCE(file_path, ''),
 		       COALESCE(mime, ''), status, COALESCE(error, ''), forwarded
 		FROM case_items WHERE case_id = $1 ORDER BY id`, caseID)
@@ -472,6 +492,18 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 	if cs.ProjectID == nil {
 		return ErrNoProject
 	}
+	// Разговор режима вопроса возвращается в сбор с прежним сырьём, поэтому
+	// счётчика элементов мало: без сверки с разобранным повторное «Готово» гнало
+	// бы модель по тому же вопросу второй раз.
+	if cs.Mode == modeAsk {
+		fresh, err := hasNewRaw(ctx, c.pool, cs.ID, cs.Protocol)
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			return ErrNoNewItems
+		}
+	}
 
 	var voice int
 	err = c.inTx(ctx, func(tx pgx.Tx) error {
@@ -515,6 +547,31 @@ func (c *Cases) FinishCollect(ctx context.Context, cs *Case) error {
 	cs.Status = statusNormalizing
 	c.log.Info("collect_finished", "user_id", cs.UserID, "case_id", cs.ID, "items", count, "voice", voice)
 	return nil
+}
+
+// hasNewRaw - есть ли в обращении содержательное сырьё, не дошедшее до
+// протокола: неразобранное вложение либо материал, добавленный после прошлого
+// разбора. Погибший элемент не в счёт - «не удалось разобрать» это запись о
+// потере, а не вопрос, и гнать по ней ходы модели незачем.
+func hasNewRaw(ctx context.Context, db txRunner, caseID, protocol string) (bool, error) {
+	items, err := loadItems(ctx, db, caseID)
+	if err != nil {
+		return false, err
+	}
+	for _, it := range items {
+		if it.Status == "failed" {
+			continue
+		}
+		if it.Status == "pending" && (it.Kind == "voice" || it.Kind == "photo") {
+			return true, nil
+		}
+		// Строка элемента ищется в разобранном протоколе целиком: он собирается
+		// теми же itemLine, и чего в нём нет - то и есть новое.
+		if line := itemLine(it); line != "" && !strings.Contains(protocol, line) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func pendingItems(ctx context.Context, db txRunner, caseID, kind string) ([]int64, error) {
@@ -580,7 +637,7 @@ func advanceNormalize(ctx context.Context, db txRunner, caseID string) error {
 // Отмена из publishing запрещена: работа publish уже в очереди, и её гашение
 // разошлось бы с ответом GitHub - issue создался бы по отменённому обращению.
 func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
-	if cs.Status == statusCancelled || cs.Status == statusPublished {
+	if cs.Status == statusCancelled || cs.Status == statusPublished || cs.Status == statusAnswered {
 		return nil
 	}
 	if cs.Status == statusPublishing {
@@ -594,7 +651,7 @@ func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 	err := c.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE cases SET status = 'cancelled', updated_at = now()
-			WHERE id = $1 AND status NOT IN ('published', 'cancelled', 'publishing')`, cs.ID)
+			WHERE id = $1 AND status NOT IN ('published', 'cancelled', 'publishing', 'answered')`, cs.ID)
 		if err != nil {
 			return fmt.Errorf("cancel case %s: %w", cs.ID, err)
 		}
@@ -603,15 +660,8 @@ func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 		}
 		cancelled = true
 
-		// Работы разговора: отменённое обращение не должно получить ни вопроса
-		// следующего раунда, ни саммари. Уведомление автору не гасим - оно и
-		// сообщает ему исход.
-		_, err = tx.Exec(ctx, `
-			UPDATE jobs SET status = 'failed', locked_at = NULL, last_error = $3, updated_at = now()
-			WHERE status = 'pending' AND kind = ANY($2)
-			  AND payload->>'case_id' = $1`, cs.ID, caseJobKinds, "case cancelled")
-		if err != nil {
-			return fmt.Errorf("drop jobs of case %s: %w", cs.ID, err)
+		if err := dropCaseJobs(ctx, tx, cs.ID, "case cancelled"); err != nil {
+			return err
 		}
 		return addEvent(ctx, tx, cs.ID, "case_cancelled", map[string]any{"reason": reason})
 	})
@@ -626,6 +676,135 @@ func (c *Cases) CancelCase(ctx context.Context, cs *Case, reason string) error {
 	c.log.Info("case_cancelled", "user_id", cs.UserID, "case_id", cs.ID, "reason", reason)
 	// Файлы отменённого обращения не ждут часового сборщика.
 	return c.DropFiles(ctx, cs.ID)
+}
+
+// dropCaseJobs гасит работы разговора: закрытое обращение не должно получить ни
+// вопроса следующего раунда, ни саммари, ни ответа из документации. Уведомление
+// автору не гасим - оно и сообщает ему исход.
+func dropCaseJobs(ctx context.Context, db Runner, caseID, reason string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE jobs SET status = 'failed', locked_at = NULL, last_error = $3, updated_at = now()
+		WHERE status = 'pending' AND kind = ANY($2)
+		  AND payload->>'case_id' = $1`, caseID, caseJobKinds, reason)
+	if err != nil {
+		return fmt.Errorf("drop jobs of case %s: %w", caseID, err)
+	}
+	return nil
+}
+
+// EndAsk закрывает разговор полученным ответом: слот активного обращения
+// свободен, медиа удалено, работы погашены. Отличается от CancelCase причиной, а
+// не механикой: cancelled - автор отказался, answered - ответ получен, и разница
+// видна владельцу в диагностике.
+func (c *Cases) EndAsk(ctx context.Context, cs *Case) error {
+	ended := false
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET status = 'answered', updated_at = now()
+			WHERE id = $1 AND mode = 'ask'
+			  AND status NOT IN ('published', 'cancelled', 'answered')`, cs.ID)
+		if err != nil {
+			return fmt.Errorf("end ask of case %s: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		ended = true
+
+		if err := dropCaseJobs(ctx, tx, cs.ID, "ask ended"); err != nil {
+			return err
+		}
+		return addEvent(ctx, tx, cs.ID, "ask_ended", nil)
+	})
+	if err != nil {
+		return err
+	}
+	if !ended {
+		return nil
+	}
+
+	cs.Status = statusAnswered
+	c.log.Info("ask_ended", "user_id", cs.UserID, "case_id", cs.ID)
+	return c.DropFiles(ctx, cs.ID)
+}
+
+// SwitchToTicket переводит разговор в тикет по кнопке автора. Второе значение -
+// переход состоялся: из разбора его не берут, и ни лог, ни ответ автору не
+// должны обещать того, чего не было. Состояние перечитывается: перевести мог и
+// ход lookup, распознавший просьбу о правке.
+func (c *Cases) SwitchToTicket(ctx context.Context, cs *Case) (bool, error) {
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		return switchToTicket(ctx, tx, cs.ID)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	fresh, err := c.Load(ctx, cs.ID)
+	if err != nil {
+		return false, err
+	}
+	if fresh == nil {
+		return false, fmt.Errorf("case %s is gone", cs.ID)
+	}
+	was := cs.Mode
+	cs.Mode, cs.Status = fresh.Mode, fresh.Status
+	if was != modeAsk || cs.Mode != modeTicket {
+		return false, nil
+	}
+	c.log.Info("switched_to_ticket", "user_id", cs.UserID, "case_id", cs.ID, "status", cs.Status)
+	return true, nil
+}
+
+// switchToTicket - переход режима из чужой транзакции: статус, журнал и работы
+// живут или не живут вместе. Условие на режим и статус внутри UPDATE: разговор,
+// ушедший дальше или занятый разбором, перевод не трогает.
+func switchToTicket(ctx context.Context, db txRunner, caseID string) error {
+	var status, protocol string
+	// Строка блокируется до конца транзакции: между выбором следующего шага и
+	// сменой статуса разговор не должен уехать.
+	err := db.QueryRow(ctx, `SELECT status, protocol FROM cases WHERE id = $1 FOR UPDATE`,
+		caseID).Scan(&status, &protocol)
+	if err != nil {
+		return fmt.Errorf("read case %s: %w", caseID, err)
+	}
+
+	next := statusInterview
+	if status == statusCollecting {
+		fresh, err := hasNewRaw(ctx, db, caseID, protocol)
+		if err != nil {
+			return err
+		}
+		if fresh {
+			next = statusNormalizing
+		}
+	}
+
+	tag, err := db.Exec(ctx, `
+		UPDATE cases SET mode = 'ticket', status = $2, updated_at = now()
+		WHERE id = $1 AND mode = 'ask' AND status IN ('collecting', 'answering')`, caseID, next)
+	if err != nil {
+		return fmt.Errorf("switch case %s to ticket: %w", caseID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if err := addEvent(ctx, db, caseID, "switched_to_ticket", nil); err != nil {
+		return err
+	}
+	// Сообщение снимает панель сбора одинаково на обоих путях перехода - и по
+	// кнопке, и по реплике, распознанной ходом lookup: в разборе «Готово» с этой
+	// панели ушло бы ответом автора, а не командой.
+	if err := putNotifyKey(ctx, db, caseID, "to-ticket",
+		"Перевожу в тикет: спрошу недостающее по тому, что уже сказано.", keysHome); err != nil {
+		return err
+	}
+	if next == statusNormalizing {
+		// Интервью поставит закрытие нормализации: в режиме тикета это её
+		// обычный исход, и своей развилки здесь не нужно.
+		return advanceNormalize(ctx, db, caseID)
+	}
+	return replaceJob(ctx, db, JobInterview, caseID, casePayload{CaseID: caseID})
 }
 
 // BuildProtocol склеивает сырьё в один текст - вход медиа-модели на скриншотах
@@ -742,7 +921,7 @@ func (c *Cases) SweepDrafts(ctx context.Context) error {
 		SELECT DISTINCT c.id FROM cases c
 		JOIN case_items i ON i.case_id = c.id
 		WHERE i.file_path IS NOT NULL
-		  AND (c.status IN ('published', 'cancelled')
+		  AND (c.status IN ('published', 'cancelled', 'answered')
 		       OR (c.status IN ('collecting', 'interview', 'summary')
 		           AND c.updated_at < now() - $1::int * interval '1 second'))`,
 		int(draftTTL.Seconds()))
@@ -779,7 +958,7 @@ func (c *Cases) SweepDrafts(ctx context.Context) error {
 func (c *Cases) RecoverStuck(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
 		SELECT c.id, c.status FROM cases c
-		WHERE c.status IN ('normalizing', 'publishing')
+		WHERE c.status IN ('normalizing', 'publishing', 'answering')
 		  AND NOT EXISTS (
 		      SELECT 1 FROM jobs j
 		      WHERE j.status IN ('pending', 'running')
@@ -808,8 +987,11 @@ func (c *Cases) RecoverStuck(ctx context.Context) error {
 		// ходе: сорвалась она на записи, на скриншоте или перед закрытием -
 		// решают статусы элементов, а не догадка о том, где всё встало.
 		recover := func() error {
-			if s.status == statusNormalizing {
+			switch s.status {
+			case statusNormalizing:
 				return advanceNormalize(ctx, c.pool, s.id)
+			case statusAnswering:
+				return replaceJob(ctx, c.pool, JobLookup, s.id, casePayload{CaseID: s.id})
 			}
 			return replaceJob(ctx, c.pool, JobPublish, s.id, casePayload{CaseID: s.id})
 		}
@@ -825,10 +1007,14 @@ func (c *Cases) RecoverStuck(ctx context.Context) error {
 // RemindDrafts напоминает про обращение, брошенное на сутки. Ровно один раз:
 // признак - отметка reminded_at, и второго напоминания не будет, потому что
 // бот, пишущий раз в сутки, из помощника становится спамом.
+//
+// Разговор режима ask напоминания не получает вовсе: вопрос, на который автору
+// уже ответили, не черновик и доводить его не надо.
 func (c *Cases) RemindDrafts(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
 		UPDATE cases SET reminded_at = now()
 		WHERE status IN ('collecting', 'interview', 'summary')
+		  AND mode = 'ticket'
 		  AND reminded_at IS NULL
 		  AND updated_at < now() - $1::int * interval '1 second'
 		RETURNING id, status`, int(draftTTL.Seconds()))
@@ -901,6 +1087,7 @@ const (
 	keysSummary = "summary" // «Публикую», «Поправить»
 	keysHome    = "home"    // панель «Меню | Сброс»: обращение доиграно
 	keysCancel  = "cancel"  // исход отмены тикета: правит экран, а не шлёт новое
+	keysAnswer  = "answer"  // ответ из документации: «Создать тикет», «Закончить разговор»
 )
 
 // HandleFailedJob - исход работы, исчерпавшей повторы; воркер зовёт её через
@@ -945,6 +1132,20 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			// строкой протокола, а вот вставшую цепочку заметить нечем.
 			if err := putNotify(ctx, tx, p.CaseID, job.ID,
 				"Не смог обработать обращение. Пришлите материал иначе и нажмите «Готово» ещё раз."); err != nil {
+				return err
+			}
+		case JobLookup:
+			// Разговор возвращается в сбор: работы не осталось, и без возврата он
+			// висел бы в answering молча. Следующая реплика автора поставит новый
+			// поход в документацию.
+			if _, err := tx.Exec(ctx, `
+				UPDATE cases SET status = 'collecting', updated_at = now()
+				WHERE id = $1 AND status = 'answering'`, p.CaseID); err != nil {
+				return fmt.Errorf("return case %s to collecting: %w", p.CaseID, err)
+			}
+			if err := putNotify(ctx, tx, p.CaseID, job.ID,
+				"Не смог посмотреть документацию. Спросите ещё раз своими словами - "+
+					"или нажмите «Создать тикет»."); err != nil {
 				return err
 			}
 		case JobInterview, JobSummarize:

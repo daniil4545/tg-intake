@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -619,9 +621,10 @@ func publishedMessage(number int, url string, incomplete bool) string {
 
 // Repo - репозиторий в том виде, в каком его читает заведение проекта.
 type Repo struct {
-	Name        string `json:"name"`
-	FullName    string `json:"full_name"`
-	Description string `json:"description"`
+	Name          string `json:"name"`
+	FullName      string `json:"full_name"`
+	Description   string `json:"description"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 // GetRepo читает репозиторий быстрым клиентом: зовут из хендлера, автор ждёт.
@@ -672,4 +675,128 @@ func (g *GitHub) GetReadme(ctx context.Context, owner, repo string) (string, err
 		return "", fmt.Errorf("decode readme body of %s/%s: %w", owner, repo, err)
 	}
 	return string(decoded), nil
+}
+
+// DocFile - md-файл дерева репозитория: путь и размер, дальше их читает
+// Lookup, решая, какие скачивать.
+type DocFile struct {
+	Path string
+	Size int
+}
+
+// TreeDocs читает дерево репозитория по ref и оставляет только md-файлы:
+// каталоги и файлы прочих расширений отбору Lookup не нужны. Рабочий клиент -
+// зовут из работы очереди, не из обработчика сообщения.
+func (g *GitHub) TreeDocs(ctx context.Context, p Project, ref string) ([]DocFile, error) {
+	path := fmt.Sprintf("/repos/%s/%s/git/trees/%s?recursive=1", p.Owner, p.Repo, url.PathEscape(ref))
+	raw, err := g.call(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var out struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			Size int    `json:"size"`
+		} `json:"tree"`
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode tree of %s/%s: %w", p.Owner, p.Repo, err)
+	}
+	if out.Truncated {
+		// GitHub режет большие деревья молча: без предупреждения отбор Lookup
+		// решил бы, что видел все md-файлы репозитория, хотя часть отсутствует.
+		g.log.Warn("tree_truncated", "project", p.Slug)
+	}
+
+	docs := make([]DocFile, 0, len(out.Tree))
+	for _, item := range out.Tree {
+		if item.Type != "blob" || !strings.HasSuffix(strings.ToLower(item.Path), ".md") {
+			continue
+		}
+		docs = append(docs, DocFile{Path: item.Path, Size: item.Size})
+	}
+	return docs, nil
+}
+
+// File читает содержимое одного файла по ref. Рабочий клиент - зовут из
+// работы очереди, не из обработчика сообщения.
+//
+// Содержимое приходит в base64 внутри JSON - тем же приёмом, что и в
+// GetReadme: сырой текст потребовал бы своего заголовка Accept, а клиент шлёт
+// один на все запросы.
+func (g *GitHub) File(ctx context.Context, p Project, path, ref string) (string, error) {
+	if err := validateDocPath(path); err != nil {
+		return "", err
+	}
+
+	reqPath := fmt.Sprintf("/repos/%s/%s/contents/%s?ref=%s",
+		p.Owner, p.Repo, escapeDocPath(path), url.QueryEscape(ref))
+	raw, err := g.call(ctx, http.MethodGet, reqPath, nil)
+	if err != nil {
+		if isNotFound(err) {
+			return "", fmt.Errorf("doc file not found: %s@%s", path, ref)
+		}
+		return "", err
+	}
+
+	var out struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("decode file %s: %w", path, err)
+	}
+	// Файлы больше 1 МБ Contents API отдаёт без содержимого: пустая строка
+	// читалась бы дальше по потоку как «файл пустой», а не как отказ.
+	if out.Encoding == "none" {
+		return "", fmt.Errorf("doc file too large for contents api: %s", path)
+	}
+	if out.Encoding != "base64" {
+		return out.Content, nil
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(out.Content, "\n", ""))
+	if err != nil {
+		return "", fmt.Errorf("decode file body %s: %w", path, err)
+	}
+	if !utf8.Valid(decoded) {
+		return "", fmt.Errorf("doc file is not valid utf-8: %s", path)
+	}
+	return string(decoded), nil
+}
+
+// validateDocPath отвергает путь до похода в сеть: имя называет модель, а не
+// человек, и путь с ".." или ведущим "/" мог бы уйти за пределы репозитория.
+func validateDocPath(path string) error {
+	if path == "" {
+		return errors.New("doc path is empty")
+	}
+	if strings.HasPrefix(path, "/") {
+		return fmt.Errorf("doc path is absolute: %s", path)
+	}
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("doc path contains ..: %s", path)
+	}
+	if !utf8.ValidString(path) {
+		return fmt.Errorf("doc path is not valid utf-8: %q", path)
+	}
+	for _, r := range path {
+		if !unicode.IsPrint(r) {
+			return fmt.Errorf("doc path contains non-printable characters: %q", path)
+		}
+	}
+	return nil
+}
+
+// escapeDocPath экранирует каждый сегмент пути отдельно: PathEscape целиком
+// закодировал бы разделитель "/" и сломал бы адрес.
+func escapeDocPath(path string) string {
+	segments := strings.Split(path, "/")
+	for i, s := range segments {
+		segments[i] = url.PathEscape(s)
+	}
+	return strings.Join(segments, "/")
 }

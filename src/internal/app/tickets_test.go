@@ -239,7 +239,7 @@ func publishCaseIn(t *testing.T, cases *Cases, userID int64, issue int, slug str
 	t.Helper()
 	ctx := context.Background()
 
-	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, slug)
+	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, slug, modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestListByProject(t *testing.T) {
 	publishCase(t, cases, 7006, 60)
 	publishCaseIn(t, cases, 7007, 61, other.Slug)
 	// Черновик без issue_number: собран, но до тикета не дошёл.
-	if _, _, err := cases.StartCase(context.Background(), User{ID: 7008, First: "Тест"}, "tg-intake"); err != nil {
+	if _, _, err := cases.StartCase(context.Background(), User{ID: 7008, First: "Тест"}, "tg-intake", modeTicket); err != nil {
 		t.Fatalf("start draft: %v", err)
 	}
 

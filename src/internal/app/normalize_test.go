@@ -59,7 +59,7 @@ func TestFailedItemMovesOn(t *testing.T) {
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 5003, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: 5003, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestReopenedCaseStartsSecondRound(t *testing.T) {
 	cases := newTestCases(t, pool, t.TempDir())
 	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 5004, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: 5004, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestScreenshotJobPerItem(t *testing.T) {
 	cases := newTestCases(t, pool, t.TempDir())
 	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 5005, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: 5005, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -247,6 +247,92 @@ func TestScreenshotJobPerItem(t *testing.T) {
 	if !strings.Contains(done.Protocol, "заявка не сохраняется") {
 		t.Errorf("текст обращения не попал в протокол:\n%s", done.Protocol)
 	}
+}
+
+// TestAskModeGoesToLookup: режим разговора выбирает следующий шаг, и вопрос
+// уходит в документацию, а не в интервью тикета.
+func TestAskModeGoesToLookup(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5006, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "через сколько срабатывает опрос"}); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if err := cases.FinishCollect(ctx, cs); err != nil {
+		t.Fatalf("finish collect: %v", err)
+	}
+	runChain(t, normalizer, pool, cs.ID)
+
+	if got := reload(t, cases, cs.ID).Status; got != statusAnswering {
+		t.Errorf("статус после разбора вопроса: %s, ожидался %s", got, statusAnswering)
+	}
+	if jobID(t, pool, JobLookup+":"+cs.ID) == 0 {
+		t.Error("поход в документацию не поставлен")
+	}
+	if jobID(t, pool, JobInterview+":"+cs.ID) != 0 {
+		t.Error("вопрос ушёл в интервью тикета")
+	}
+}
+
+// TestQuestionDeltaSkipsPrevious: в историю разговора идёт только новая часть
+// протокола. Иначе прошлые вопросы придут в контекст модели дважды.
+func TestQuestionDeltaSkipsPrevious(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5007, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	ask := func(id int, text string) {
+		t.Helper()
+		fresh := reload(t, cases, cs.ID)
+		if _, err := cases.CollectItem(ctx, nil, fresh, &tele.Message{ID: id, Text: text}); err != nil {
+			t.Fatalf("collect %q: %v", text, err)
+		}
+		if err := cases.FinishCollect(ctx, fresh); err != nil {
+			t.Fatalf("finish collect %q: %v", text, err)
+		}
+		runChain(t, normalizer, pool, cs.ID)
+	}
+
+	ask(1, "через сколько срабатывает опрос")
+	// Ответ показан, разговор снова ждёт реплики автора: так его возвращает шаг
+	// похода в документацию.
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'collecting' WHERE id = $1`, cs.ID); err != nil {
+		t.Fatalf("return to collecting: %v", err)
+	}
+	ask(2, "а можно раз в двенадцать часов")
+
+	last := lastQuestion(t, pool, cs.ID)
+	if !strings.Contains(last, "двенадцать часов") {
+		t.Errorf("новый вопрос не попал в историю: %q", last)
+	}
+	if strings.Contains(last, "срабатывает опрос") {
+		t.Errorf("прошлый вопрос повторён в истории: %q", last)
+	}
+}
+
+// lastQuestion - текст последней реплики автора в журнале разговора.
+func lastQuestion(t *testing.T, pool *pgxpool.Pool, caseID string) string {
+	t.Helper()
+
+	var text string
+	err := pool.QueryRow(context.Background(), `
+		SELECT payload->>'text' FROM case_events
+		WHERE case_id = $1 AND kind = 'question_asked' ORDER BY id DESC LIMIT 1`, caseID).Scan(&text)
+	if err != nil {
+		t.Fatalf("last question of case %s: %v", caseID, err)
+	}
+	return text
 }
 
 // runChain доигрывает цепочку нормализации так, как её выполнял бы воркер:

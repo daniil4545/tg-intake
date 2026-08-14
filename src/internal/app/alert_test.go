@@ -48,7 +48,7 @@ func TestLostNotifyAlertsOwner(t *testing.T) {
 	cases := newTestCases(t, pool, t.TempDir())
 	cases.alertChat = testAlertChat
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 7110, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: 7110, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -153,7 +153,7 @@ func publishThrough(t *testing.T, cases *Cases, userID, alertChat int64) (*Case,
 	t.Helper()
 	ctx := context.Background()
 
-	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
