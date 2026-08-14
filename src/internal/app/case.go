@@ -796,7 +796,7 @@ func switchToTicket(ctx context.Context, db txRunner, caseID string) error {
 	// кнопке, и по реплике, распознанной ходом lookup: в разборе «Готово» с этой
 	// панели ушло бы ответом автора, а не командой.
 	if err := putNotifyKey(ctx, db, caseID, "to-ticket",
-		"Перевожу в тикет: спрошу недостающее по тому, что уже сказано.", keysHome); err != nil {
+		"Что бы вы хотели изменить?", keysHome); err != nil {
 		return err
 	}
 	if next == statusNormalizing {
