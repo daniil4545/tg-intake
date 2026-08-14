@@ -573,6 +573,48 @@ func TestExhaustedQuestionGoesToSummary(t *testing.T) {
 	}
 }
 
+// TestRoundWithoutSuggestionHasNoButton: раунд, где модель не дала ни одной
+// догадки, доходит до автора вопросами, но без кнопки «Всё так» и без обещания
+// подтвердить предположения. Обещание без догадок автор проверяет нажатием и
+// получает отказ - ровно тот случай, что был в контуре 2026-08-14.
+func TestRoundWithoutSuggestionHasNoButton(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6021, 1)
+
+	turn := `{"kind":"bug","filled":[{"key":"case","value":"заказ 4821"}],` +
+		`"gaps":["expected","actual"],"ready":false,` +
+		`"questions":[{"key":"expected","text":"что ожидали?","suggested":""}]}`
+	i := newTestInterview(t, cases, 3)
+	i.llm = fakeLLM(t, turn)
+
+	job := Job{ID: 1, Kind: JobInterview, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := i.Run(ctx, job); err != nil {
+		t.Fatalf("run interview: %v", err)
+	}
+
+	var raw []byte
+	err := pool.QueryRow(ctx, `SELECT payload FROM jobs
+		WHERE kind = $1 AND payload->>'case_id' = $2`, JobNotify, cs.ID).Scan(&raw)
+	if err != nil {
+		t.Fatalf("notify job: %v", err)
+	}
+	var p notifyPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.Buttons != keysAsk {
+		t.Errorf("кнопки раунда без догадок: %q, ожидалось %q", p.Buttons, keysAsk)
+	}
+	if strings.Contains(p.Text, "Всё так") {
+		t.Errorf("обещание кнопки без догадок: %q", p.Text)
+	}
+	if !strings.Contains(p.Text, "что ожидали?") {
+		t.Errorf("вопрос потерян: %q", p.Text)
+	}
+}
+
 // fakeLLM подменяет транспорт клиента: ответ модели приходит из теста, сеть не
 // нужна. Тест в том же пакете, поэтому обходится без параметра адреса.
 func fakeLLM(t *testing.T, content string) *OpenRouter {

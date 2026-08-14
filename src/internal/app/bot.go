@@ -532,8 +532,9 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	}
 	switch {
 	// Сообщение раунда запоминается: ответ автора пометит его принятым и снимет
-	// кнопку «Всё так».
-	case p.Buttons == keysRound && sent != nil:
+	// кнопку «Всё так». Раунд без кнопки помечается тем же способом: автору важно
+	// видеть, на какие вопросы его ответ уже принят.
+	case (p.Buttons == keysRound || p.Buttons == keysAsk) && sent != nil:
 		b.setRound(cs.UserID, roundState{
 			StoredMessage: tele.StoredMessage{
 				MessageID: strconv.Itoa(sent.ID), ChatID: sent.Chat.ID,

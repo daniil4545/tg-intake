@@ -349,8 +349,14 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		}); err != nil {
 			return err
 		}
+		// Кнопка идёт только под раундом, где есть догадки: обещание подтвердить
+		// их одним нажатием обязано совпадать с тем, что автор видит в тексте.
+		keys := keysAsk
+		if hasSuggestion(turn.Questions) {
+			keys = keysRound
+		}
 		return putNotifyKey(ctx, tx, cs.ID, fmt.Sprintf("round-%d", round),
-			roundMessage(turn.Questions), keysRound)
+			roundMessage(turn.Questions), keys)
 	})
 	return saved, err
 }
@@ -370,6 +376,11 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 	}
 
 	var lastErr error
+	// Ход без единой догадки годен, но стоит автору лишних минут: кнопке нечего
+	// подтверждать. Тратим на догадки первую попытку из двух, а ход держим:
+	// второй заход может кончиться и невалидным ответом, и терять из-за этого
+	// готовые вопросы дороже, чем отдать раунд без кнопки.
+	var noSuggestion *interviewTurn
 	for attempt := 0; attempt < 2; attempt++ {
 		raw, err := i.llm.Complete(ctx, req)
 		if err != nil {
@@ -381,13 +392,28 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 			lastErr = fmt.Errorf("decode turn: %w", err)
 		} else if err := i.checkTurn(cs.Filled, turn); err != nil {
 			lastErr = err
+		} else if attempt == 0 && len(turn.Questions) > 0 && !hasSuggestion(turn.Questions) {
+			i.log.Warn("turn_without_suggestion", "step", stepInterview, "case_id", cs.ID,
+				"questions", len(turn.Questions))
+			noSuggestion = &turn
+			continue
 		} else {
 			return turn, nil
 		}
 		i.log.Warn("llm_invalid", "step", stepInterview, "case_id", cs.ID,
 			"attempt", attempt+1, "error", lastErr)
 	}
+	if noSuggestion != nil {
+		return *noSuggestion, nil
+	}
 	return interviewTurn{}, fmt.Errorf("interview turn of case %s: %w", cs.ID, lastErr)
+}
+
+// hasSuggestion - в раунде есть что подтверждать кнопкой. Вопрос без догадки
+// кнопка не закрывает (AcceptRound его пропускает), поэтому раунд из одних
+// таких вопросов не должен ни обещать подтверждение, ни показывать кнопку.
+func hasSuggestion(questions []Question) bool {
+	return slices.ContainsFunc(questions, func(q Question) bool { return !isStub(q.Suggested) })
 }
 
 // mergeFilled - состояние контракта после хода: накопленное прошлыми раундами
@@ -1081,9 +1107,11 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 }
 
 func roundMessage(questions []Question) string {
-	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) +
-		"\n\nОтветьте своими словами - текстом или голосовым. Если предположения верны, " +
-		"нажмите «Всё так»."
+	tail := "\n\nОтветьте своими словами - текстом или голосовым."
+	if hasSuggestion(questions) {
+		tail += " Если предположения верны, нажмите «Всё так»."
+	}
+	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) + tail
 }
 
 func questionList(questions []Question) string {
