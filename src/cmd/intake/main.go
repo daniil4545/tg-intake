@@ -90,6 +90,7 @@ func main() {
 
 	tickets := app.NewTickets(cases, github, statuses, log, cfg.AlertChatID)
 	projects := app.NewProjects(cases, github, llm, dialog, log)
+	lookup := app.NewLookup(cases, github, llm, log, dialog)
 
 	bot, err := app.NewBot(ctx, cfg, pool, cases, tickets, projects, log)
 	if err != nil {
@@ -106,6 +107,7 @@ func main() {
 		app.JobPublish:         publisher.Run,
 		app.JobNotify:          bot.Notify,
 		app.JobCancelIssue:     tickets.RunCancel,
+		app.JobLookup:          lookup.Run,
 	}
 
 	// Первым делом после старта: обращение, потерявшее свою работу, не

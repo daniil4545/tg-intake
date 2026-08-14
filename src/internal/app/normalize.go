@@ -303,14 +303,27 @@ func formatExtract(e screenshotExtract) string {
 
 // finish закрывает нормализацию: протокол, статус, событие и уведомление автору
 // живут или не живут вместе, файлы уходят следом.
+//
+// Здесь единственная развилка по режиму: сырьё превращается в текст одинаково
+// для любого разговора, а следующий шаг выбирает режим. Разговор начинает
+// работа, а не этот шаг, - это и делает второй режим бота наслаиванием, а не
+// переписью.
 func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol string, items int) error {
 	chars := utf8.RuneCountInString(protocol)
+
+	status, job := statusInterview, JobInterview
+	text := protocolMessage(protocol)
+	if cs.Mode == modeAsk {
+		// Сказать автору тут нечего: «смотрю документацию» он получил на «Готово»,
+		// а следующее слово бота - сам ответ.
+		status, job, text = statusAnswering, JobLookup, ""
+	}
 
 	moved := false
 	err := n.cases.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			UPDATE cases SET status = 'interview', protocol = $2, updated_at = now()
-			WHERE id = $1 AND status = 'normalizing'`, cs.ID, protocol)
+			UPDATE cases SET status = $3, protocol = $2, updated_at = now()
+			WHERE id = $1 AND status = 'normalizing'`, cs.ID, protocol, status)
 		if err != nil {
 			return fmt.Errorf("finish normalize of case %s: %w", cs.ID, err)
 		}
@@ -324,13 +337,21 @@ func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol
 		}); err != nil {
 			return err
 		}
-		if err := putNotify(ctx, tx, cs.ID, jobID, protocolMessage(protocol)); err != nil {
-			return err
+		if cs.Mode == modeAsk {
+			// Реплика автора для истории разговора: в журнал идёт только новая
+			// часть протокола, иначе прошлые вопросы придут в контекст дважды.
+			if err := addEvent(ctx, tx, cs.ID, "question_asked", map[string]any{
+				"text": protocolDelta(cs.Protocol, protocol),
+			}); err != nil {
+				return err
+			}
 		}
-		// Разговор начинает работа, а не этот шаг: нормализация не знает, чем
-		// кончится обращение, и это то, что делает второй режим бота
-		// наслаиванием, а не переписью.
-		return replaceJob(ctx, tx, JobInterview, cs.ID, casePayload{CaseID: cs.ID})
+		if text != "" {
+			if err := putNotify(ctx, tx, cs.ID, jobID, text); err != nil {
+				return err
+			}
+		}
+		return replaceJob(ctx, tx, job, cs.ID, casePayload{CaseID: cs.ID})
 	})
 	if err != nil {
 		return err
@@ -339,11 +360,18 @@ func (n *Normalizer) finish(ctx context.Context, cs *Case, jobID int64, protocol
 		return nil
 	}
 
-	cs.Status = statusInterview
-	n.log.Info("normalized", "case_id", cs.ID, "items", items, "chars", chars)
+	cs.Status = status
+	n.log.Info("normalized", "case_id", cs.ID, "items", items, "chars", chars, "mode", cs.Mode)
 	// Файлы живут до публикации: саммари - последняя точка, где автор ловит
 	// неверно прочитанный скриншот, и стирать медиа раньше нельзя.
 	return nil
+}
+
+// protocolDelta - часть протокола, появившаяся с прошлого захода. Протокол
+// собирается append-порядком по id элементов, поэтому прежнее значение всегда
+// его префикс, и вычитание точное.
+func protocolDelta(previous, protocol string) string {
+	return strings.TrimSpace(strings.TrimPrefix(protocol, previous))
 }
 
 // reopen возвращает обращение в сбор, когда разобрать не удалось ничего: иначе

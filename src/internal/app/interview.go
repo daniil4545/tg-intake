@@ -747,11 +747,15 @@ func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Mess
 // history восстанавливает разговор из журнала. Отдельной таблицы у него нет:
 // диалог по природе append-only, а case_events уже пишется в тех же
 // транзакциях, что и смена статуса. Показанное саммари - такая же реплика бота,
-// как вопрос раунда: автор правит именно его.
+// как вопрос раунда: автор правит именно его. Ответ по документации идёт сюда
+// же - разговор, пришедший из режима вопроса, уже установил факты, и
+// переспрашивать их интервью не должно. Вопроса автора здесь нет: его слова
+// целиком лежат в протоколе сырья, который подаётся отдельным сообщением.
 func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 	rows, err := c.pool.Query(ctx, `
 		SELECT kind, payload FROM case_events
-		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given', 'summary_ready')
+		WHERE case_id = $1
+		  AND kind IN ('round_asked', 'answer_given', 'summary_ready', 'answer_ready')
 		ORDER BY id`, caseID)
 	if err != nil {
 		return nil, fmt.Errorf("query history of case %s: %w", caseID, err)
@@ -778,14 +782,21 @@ func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 				Role:  "assistant",
 				Parts: []Part{TextPart(questionList(p.Questions))},
 			})
-		case "answer_given":
+		case "answer_given", "answer_ready":
 			var p struct {
 				Text string `json:"text"`
 			}
 			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode given answer: %w", err)
+				return nil, fmt.Errorf("decode %s: %w", kind, err)
 			}
-			messages = append(messages, Message{Role: "user", Parts: []Part{TextPart(p.Text)}})
+			if p.Text == "" {
+				continue
+			}
+			role := "user"
+			if kind == "answer_ready" {
+				role = "assistant"
+			}
+			messages = append(messages, Message{Role: role, Parts: []Part{TextPart(p.Text)}})
 		case "summary_ready":
 			var p struct {
 				Title string `json:"title"`

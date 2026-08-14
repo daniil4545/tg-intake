@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -113,7 +114,7 @@ func TestCaseWithoutProject(t *testing.T) {
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
 
-	cs, existed, err := cases.StartCase(ctx, User{ID: 5001, First: "Тест"}, "")
+	cs, existed, err := cases.StartCase(ctx, User{ID: 5001, First: "Тест"}, "", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestCancelWithoutProject(t *testing.T) {
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 5002, First: "Тест"}, "")
+	cs, _, err := cases.StartCase(ctx, User{ID: 5002, First: "Тест"}, "", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -196,7 +197,7 @@ func TestDropFiles(t *testing.T) {
 	root := t.TempDir()
 	cases := newTestCases(t, pool, root)
 
-	cs, _, err := cases.StartCase(ctx, User{ID: 5002, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: 5002, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -239,6 +240,193 @@ func TestDropFiles(t *testing.T) {
 	}
 	if lost > 0 {
 		t.Errorf("tg_file_id потерян у %d элементов", lost)
+	}
+}
+
+// TestEndAskFreesSlot: «Закончить разговор» закрывает вопрос полученным
+// ответом, и слот активного обращения обязан освободиться - иначе следующий
+// вопрос автору некуда завести.
+func TestEndAskFreesSlot(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	author := User{ID: 5006, First: "Тест"}
+	cs, _, err := cases.StartCase(ctx, author, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "через сколько срабатывает опрос"}); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if err := cases.EndAsk(ctx, cs); err != nil {
+		t.Fatalf("end ask: %v", err)
+	}
+	if got := reload(t, cases, cs.ID).Status; got != statusAnswered {
+		t.Errorf("статус после «Закончить разговор»: %s, ожидался %s", got, statusAnswered)
+	}
+
+	active, err := cases.Active(ctx, author.ID)
+	if err != nil {
+		t.Fatalf("active: %v", err)
+	}
+	if active != nil {
+		t.Fatalf("слот держит закрытый разговор %s", active.ID)
+	}
+
+	next, existed, err := cases.StartCase(ctx, author, "tg-intake", modeTicket)
+	if err != nil {
+		t.Fatalf("start next case: %v", err)
+	}
+	if existed || next.ID == cs.ID {
+		t.Error("следующее обращение не завелось: закрытый разговор считается живым")
+	}
+}
+
+// TestRecoverStuckLookup: поход в документацию идёт своим статусом именно
+// потому, что потерянную работу иначе некому поднять - в collecting обращение
+// ждёт человека, а в answering оно висело бы молча.
+func TestRecoverStuckLookup(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5007, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'answering' WHERE id = $1`, cs.ID); err != nil {
+		t.Fatalf("set answering: %v", err)
+	}
+
+	if err := cases.RecoverStuck(ctx); err != nil {
+		t.Fatalf("recover stuck: %v", err)
+	}
+	if jobID(t, pool, JobLookup+":"+cs.ID) == 0 {
+		t.Error("потерянный поход в документацию не поднят")
+	}
+}
+
+// TestSwitchDuringNormalize: «Создать тикет», нажатая во время разбора, разговор
+// не переводит. Иначе цепочка нормализации молча выходит на чужом статусе, и
+// материал последней реплики остаётся неразобранным навсегда.
+func TestSwitchDuringNormalize(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5008, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "а можно раз в двенадцать часов"}); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if err := cases.FinishCollect(ctx, cs); err != nil {
+		t.Fatalf("finish collect: %v", err)
+	}
+
+	switch switched, err := cases.SwitchToTicket(ctx, cs); {
+	case err != nil:
+		t.Fatalf("switch to ticket: %v", err)
+	case switched:
+		t.Fatal("перевод из разбора объявлен состоявшимся")
+	}
+	if got := reload(t, cases, cs.ID).Status; got != statusNormalizing {
+		t.Fatalf("статус после перевода из разбора: %s, ожидался %s", got, statusNormalizing)
+	}
+
+	runChain(t, normalizer, pool, cs.ID)
+	done := reload(t, cases, cs.ID)
+	if done.Status != statusAnswering {
+		t.Errorf("статус после разбора: %s, ожидался %s", done.Status, statusAnswering)
+	}
+	if !strings.Contains(done.Protocol, "двенадцать часов") {
+		t.Errorf("сырьё потеряно, протокол: %q", done.Protocol)
+	}
+}
+
+// TestSwitchKeepsUnfinishedRaw: реплика, набранная после ответа и не
+// подтверждённая «Готово», - это и есть содержание будущего тикета. Переход
+// кнопкой обязан довести её до протокола и до интервью, а не потерять молча.
+func TestSwitchKeepsUnfinishedRaw(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5010, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "через сколько срабатывает опрос"}); err != nil {
+		t.Fatalf("collect question: %v", err)
+	}
+	if err := cases.FinishCollect(ctx, cs); err != nil {
+		t.Fatalf("finish collect: %v", err)
+	}
+	runChain(t, normalizer, pool, cs.ID)
+
+	// Ответ показан: так разговор возвращает шаг похода в документацию. Реплику
+	// автор дописывает и жмёт «Создать тикет», не подтверждая её «Готово».
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'collecting' WHERE id = $1`, cs.ID); err != nil {
+		t.Fatalf("return to collecting: %v", err)
+	}
+	cs = reload(t, cases, cs.ID)
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 2, Text: "давай изменим на 12 часов"}); err != nil {
+		t.Fatalf("collect reply: %v", err)
+	}
+	if _, err := cases.SwitchToTicket(ctx, cs); err != nil {
+		t.Fatalf("switch to ticket: %v", err)
+	}
+	runChain(t, normalizer, pool, cs.ID)
+
+	done := reload(t, cases, cs.ID)
+	if done.Mode != modeTicket || done.Status != statusInterview {
+		t.Errorf("режим %s, статус %s: ожидались %s и %s",
+			done.Mode, done.Status, modeTicket, statusInterview)
+	}
+	if !strings.Contains(done.Protocol, "12 часов") {
+		t.Errorf("реплика не дошла до протокола: %q", done.Protocol)
+	}
+	if jobID(t, pool, JobInterview+":"+cs.ID) == 0 {
+		t.Error("ход интервью не поставлен")
+	}
+}
+
+// TestRepeatedDoneInAsk: после показанного ответа разговор снова стоит в сборе с
+// прежним сырьём. Повторное «Готово» без нового вопроса не имеет права поставить
+// второй поход в документацию за тем же ответом.
+func TestRepeatedDoneInAsk(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	normalizer := NewNormalizer(cases, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 5009, First: "Тест"}, "tg-intake", modeAsk)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	if _, err := cases.CollectItem(ctx, nil, cs, &tele.Message{ID: 1, Text: "через сколько срабатывает опрос"}); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if err := cases.FinishCollect(ctx, cs); err != nil {
+		t.Fatalf("finish collect: %v", err)
+	}
+	runChain(t, normalizer, pool, cs.ID)
+
+	// Ответ показан: так разговор возвращает шаг похода в документацию.
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'collecting' WHERE id = $1`, cs.ID); err != nil {
+		t.Fatalf("return to collecting: %v", err)
+	}
+	again := reload(t, cases, cs.ID)
+	if err := cases.FinishCollect(ctx, again); !errors.Is(err, ErrNoNewItems) {
+		t.Fatalf("повторное «Готово»: получено %v, ожидалось ErrNoNewItems", err)
+	}
+	if got := reload(t, cases, cs.ID).Status; got != statusCollecting {
+		t.Errorf("статус после повторного «Готово»: %s, ожидался %s", got, statusCollecting)
 	}
 }
 
