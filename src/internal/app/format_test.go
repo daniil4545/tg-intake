@@ -49,7 +49,7 @@ func TestItemReply(t *testing.T) {
 func TestStateReply(t *testing.T) {
 	seen := map[string]bool{}
 	for _, status := range []string{statusCollecting, statusInterview, statusSummary,
-		statusPublishing, statusNormalizing} {
+		statusPublishing, statusAnswering, statusNormalizing} {
 		reply := stateReply(status)
 		if reply == "" {
 			t.Fatalf("состояние %s осталось без ответа", status)
@@ -61,6 +61,74 @@ func TestStateReply(t *testing.T) {
 	}
 	if !strings.Contains(stateReply(statusCollecting), "«Готово»") {
 		t.Error("в сборе не сказано, чем его закончить")
+	}
+}
+
+// TestProjectMenu: у проекта два входа в разговор - тикет и вопрос, плюс
+// просмотр тикетов. Без кнопки «Спросить» режим вопроса недостижим.
+func TestProjectMenu(t *testing.T) {
+	want := map[string]string{
+		"Создать тикет":     createBtn.Unique,
+		"Спросить":          askBtn.Unique,
+		"Посмотреть тикеты": ticketsBtn.Unique,
+	}
+	for _, row := range projectMenu("tg-intake").InlineKeyboard {
+		for _, btn := range row {
+			unique, ok := want[btn.Text]
+			if !ok {
+				continue
+			}
+			if btn.Unique != unique || btn.Data != "tg-intake" {
+				t.Errorf("кнопка %q ведёт в %q с данными %q", btn.Text, btn.Unique, btn.Data)
+			}
+			delete(want, btn.Text)
+		}
+	}
+	for text := range want {
+		t.Errorf("в меню проекта нет кнопки %q", text)
+	}
+}
+
+// TestAnswerKeyboard: под ответом из документации два выхода - завести тикет и
+// закончить разговор. Без них автор остаётся с занятым слотом и без пути к
+// правке.
+func TestAnswerKeyboard(t *testing.T) {
+	seen := map[string]string{}
+	for _, row := range answerKeyboard().InlineKeyboard {
+		for _, btn := range row {
+			seen[btn.Unique] = btn.Text
+		}
+	}
+	if seen[toTicketBtn.Unique] != "Создать тикет" {
+		t.Errorf("кнопка перехода в тикет: %q", seen[toTicketBtn.Unique])
+	}
+	if seen[endAskBtn.Unique] != "Закончить разговор" {
+		t.Errorf("кнопка конца разговора: %q", seen[endAskBtn.Unique])
+	}
+}
+
+// TestProjectAsk: в режиме вопроса бот не обещает тикет - тикета там не будет,
+// а обещание автор считает фактом.
+func TestProjectAsk(t *testing.T) {
+	ask := projectAsk(&Case{Mode: modeAsk})
+	if strings.Contains(ask, "тикет") {
+		t.Errorf("вопрос о проекте обещает тикет: %q", ask)
+	}
+	if !strings.Contains(projectAsk(&Case{Mode: modeTicket}), "тикет") {
+		t.Error("в режиме тикета не сказано, зачем нужен проект")
+	}
+}
+
+// TestContinueText: экран продолжения называет жанр живого разговора и выход в
+// нужный автору. Разговор по документации висит в сборе до «Закончить разговор»,
+// и безымянное «Продолжить» увело бы пришедшего за тикетом обратно в вопрос.
+func TestContinueText(t *testing.T) {
+	live := continueText(modeAsk, modeTicket)
+	if !strings.Contains(live, "документации") || !strings.Contains(live, "тикет") {
+		t.Errorf("экран не назвал ни режим, ни выход: %q", live)
+	}
+	if !strings.Contains(continueText(modeTicket, modeAsk), "тикета") {
+		t.Errorf("экран не назвал режим живого обращения: %q", continueText(modeTicket, modeAsk))
 	}
 }
 

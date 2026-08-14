@@ -66,6 +66,9 @@ const (
 var (
 	projectBtn    = &tele.Btn{Unique: "project"}
 	createBtn     = &tele.Btn{Unique: "create"}
+	askBtn        = &tele.Btn{Unique: "ask"}
+	toTicketBtn   = &tele.Btn{Unique: "to_ticket"}
+	endAskBtn     = &tele.Btn{Unique: "end_ask"}
 	continueBtn   = &tele.Btn{Unique: "continue"}
 	allTrueBtn    = &tele.Btn{Unique: "all_true"}
 	publishBtn    = &tele.Btn{Unique: "publish"}
@@ -252,6 +255,9 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(cardBtn, b.onCard)
 	tb.Handle(killBtn, b.onKill)
 	tb.Handle(createBtn, b.onCreate)
+	tb.Handle(askBtn, b.onAsk)
+	tb.Handle(toTicketBtn, b.onToTicket)
+	tb.Handle(endAskBtn, b.onEndAsk)
 	tb.Handle(continueBtn, b.onContinue)
 	tb.Handle(allTrueBtn, b.onAllTrue)
 	tb.Handle(publishBtn, b.onPublish)
@@ -510,6 +516,10 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 
 	var opts []any
 	switch {
+	// Раньше проверки статуса: ответ из документации приходит в сбор, и кнопки
+	// решения по ответу важнее панели - она в режиме вопроса и так на месте.
+	case p.Buttons == keysAnswer:
+		opts = append(opts, answerKeyboard())
 	// Провал нормализации возвращает обращение в сбор, а кнопки сбора сняты
 	// нажатием «Готово»: без них автор не поймёт, чем закончить второй заход.
 	case cs.Status == statusCollecting:
@@ -545,6 +555,10 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	// на которые уже ответили, - иначе пометка садится вверх переписки.
 	case p.Buttons == keysSummary:
 		b.dropRound(cs.UserID)
+	// Ответ показан: счётчик прошлого вопроса остался выше по переписке, и
+	// следующий вопрос заводит свой - под ответом.
+	case p.Buttons == keysAnswer:
+		b.dropTally(cs.UserID)
 	}
 	return nil
 }
@@ -787,6 +801,7 @@ func projectMenu(slug string) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
 		markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
+		markup.Row(markup.Data("Спросить", askBtn.Unique, slug)),
 		markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
 		markup.Row(markup.Data("К проектам", homeBtn.Unique)),
 	)
@@ -893,17 +908,28 @@ func (b *Bot) onProject(c tele.Context) error {
 	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
 }
 
-// onCreate - «Создать тикет». При живом обращении автор выбирает: продолжить
-// его или начать заново. Активное обращение у автора одно, и молча подменять
-// его нельзя - в нём уже лежит сырьё.
-func (b *Bot) onCreate(c tele.Context) error {
-	b.toast(c, "Собираю обращение")
+// onCreate - «Создать тикет», onAsk - «Спросить». Вход один и тот же сбор
+// материала, разный только режим разговора: он выбирает, чем кончится
+// нормализация - интервью или походом в документацию.
+func (b *Bot) onCreate(c tele.Context) error { return b.startCase(c, modeTicket) }
+
+func (b *Bot) onAsk(c tele.Context) error { return b.startCase(c, modeAsk) }
+
+// startCase заводит обращение выбранного режима. При живом обращении автор
+// выбирает: продолжить его или начать заново. Активное обращение у автора одно,
+// и молча подменять его нельзя - в нём уже лежит сырьё.
+func (b *Bot) startCase(c tele.Context, mode string) error {
+	if mode == modeAsk {
+		b.toast(c, "Слушаю вопрос")
+	} else {
+		b.toast(c, "Собираю обращение")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
 	slug := c.Data()
-	cs, existed, err := b.cases.StartCase(ctx, author(c), slug)
+	cs, existed, err := b.cases.StartCase(ctx, author(c), slug, mode)
 	if err != nil {
 		return err
 	}
@@ -917,13 +943,36 @@ func (b *Bot) onCreate(c tele.Context) error {
 		}
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(markup.Row(markup.Data("Продолжить", continueBtn.Unique, slug)))
-		return b.screen(c, "У вас уже есть незакрытое обращение. Продолжайте его "+
-			"или нажмите «Сброс», чтобы начать заново.", markup)
+		return b.screen(c, continueText(cs.Mode, mode), markup)
+	}
+	if mode == modeAsk {
+		if err := b.screen(c, "Отвечаю по документации проекта.", nil); err != nil {
+			return err
+		}
+		return c.Send("Что хотите узнать? Напишите или наговорите вопрос и нажмите «Готово».",
+			collectKeyboard())
 	}
 	if err := b.screen(c, "Собираю обращение.", nil); err != nil {
 		return err
 	}
 	return c.Send("Присылайте текст, голосовые и скриншоты. Когда закончите, нажмите «Готово».", collectKeyboard())
+}
+
+// continueText - экран продолжения при живом обращении. Режим называется вслух,
+// и выход назван по жанру, за которым автор пришёл: разговор по документации
+// висит в сборе до «Закончить разговор», и «Продолжить» продолжает именно его.
+func continueText(live, wanted string) string {
+	now := "У вас уже собирается обращение для тикета."
+	if live == modeAsk {
+		now = "У вас уже идёт разговор по документации."
+	}
+	switch {
+	case live == wanted:
+		return now + " Продолжайте его или нажмите «Сброс», чтобы начать заново."
+	case wanted == modeAsk:
+		return now + " Продолжайте его или нажмите «Сброс», чтобы вместо него спросить по документации."
+	}
+	return now + " Продолжайте его или нажмите «Сброс», чтобы вместо него завести тикет."
 }
 
 func (b *Bot) onContinue(c tele.Context) error {
@@ -1006,7 +1055,7 @@ func (b *Bot) onItem(c tele.Context) error {
 	switch cs.Status {
 	case statusInterview, statusSummary:
 		return b.onAnswer(ctx, c, cs)
-	case statusNormalizing, statusPublishing:
+	case statusNormalizing, statusPublishing, statusAnswering:
 		return b.sendState(c, cs)
 	}
 	return b.collect(ctx, c, cs)
@@ -1034,7 +1083,7 @@ func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	// Вопрос задаётся и при неудачном приёме: строка элемента уже вставлена, и
 	// на следующем сообщении признак вопроса не сработает.
 	if askProject {
-		if askErr := b.askProject(ctx, c, "Принял. Выберите проект, в который заводим тикет."); askErr != nil {
+		if askErr := b.askProject(ctx, c, "Принял. "+projectAsk(cs)); askErr != nil {
 			return askErr
 		}
 	}
@@ -1098,6 +1147,15 @@ func itemReply(err error, maxItems int) (text string, internal bool) {
 	return "Не получилось принять сообщение. Пришлите его иначе.", true
 }
 
+// projectAsk - зачем обращению проект. В режиме вопроса тикет не заводится, и
+// обещать его нельзя: проект нужен ради своей документации.
+func projectAsk(cs *Case) string {
+	if cs.Mode == modeAsk {
+		return "Выберите проект, по документации которого отвечать."
+	}
+	return "Выберите проект, в который заводим тикет."
+}
+
 // sendState объясняет автору, где стоит его обращение и чем оно двигается
 // дальше. Один ответ на все входы, где человек упирается в занятый слот:
 // активное обращение у автора одно, и без объяснения тупик читается как
@@ -1122,6 +1180,8 @@ func stateReply(status string) string {
 	case statusSummary:
 		return "Обращение ждёт вашего решения по саммари: «Публикую» или «Поправить» " +
 			"под последним сообщением."
+	case statusAnswering:
+		return "Смотрю документацию проекта. Отвечу, как найду."
 	case statusPublishing:
 		return "Публикую тикет. Пришлю номер и ссылку, как только он заведётся."
 	default:
@@ -1209,7 +1269,8 @@ func (b *Bot) waitFor(cs *Case) {
 		// Разговор ушёл дальше: вопрос показан, саммари собрано или обращение
 		// закрыто. Предупреждать не о чем.
 		waiting := fresh != nil && fresh.Round == round &&
-			(fresh.Status == statusNormalizing || fresh.Status == statusInterview)
+			(fresh.Status == statusNormalizing || fresh.Status == statusInterview ||
+				fresh.Status == statusAnswering)
 		if !waiting || !b.markWaited(user, caseID, round) {
 			return
 		}
@@ -1292,6 +1353,74 @@ func markAnswered(c tele.Context, note string) string {
 		text = msg.Text
 	}
 	return text + "\n\n---\n" + note
+}
+
+// onToTicket - «Создать тикет» под ответом из документации. Тикет тут не
+// заводится: разговор продолжается обычным интервью по уже сказанному, и
+// подтверждение саммари остаётся на месте.
+func (b *Bot) onToTicket(c tele.Context) error {
+	b.toast(c, "Перевожу в тикет")
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return b.screen(c, "Разговор уже закрыт.", backHome())
+	}
+	// Кнопка живёт в переписке дольше экрана: разговор мог стать тикетом сам,
+	// репликой автора, или прошлым нажатием этой же кнопки. В разборе перевод
+	// оборвал бы цепочку нормализации, и автор получает состояние вместо него.
+	if cs.Mode != modeAsk || (cs.Status != statusCollecting && cs.Status != statusAnswering) {
+		return b.sendState(c, cs)
+	}
+
+	switched, err := b.cases.SwitchToTicket(ctx, cs)
+	if err != nil {
+		return err
+	}
+	if !switched {
+		return b.sendState(c, cs)
+	}
+	// Сбор закончился: счётчик материала больше не этого обращения. Панель сбора
+	// снимает сообщение о переводе - оно идёт из очереди, одинаково для кнопки и
+	// для реплики, распознанной ходом lookup.
+	b.dropTally(senderID(c))
+	b.waitFor(cs)
+	return b.screen(c, markAnswered(c, "Перевожу в тикет."), nil)
+}
+
+// onEndAsk - «Закончить разговор»: вопрос закрыт ответом, слот активного
+// обращения свободен, автор возвращается в меню.
+func (b *Bot) onEndAsk(c tele.Context) error {
+	b.toast(c, "Заканчиваю")
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		return b.screen(c, "Разговор уже закончен.", backHome())
+	}
+	// Разговор уже стал тикетом: этой кнопкой его не закрыть, выход - «Сброс».
+	if cs.Mode != modeAsk {
+		return b.sendState(c, cs)
+	}
+
+	if err := b.cases.EndAsk(ctx, cs); err != nil {
+		return err
+	}
+	b.dropTally(senderID(c))
+	if err := b.screen(c, markAnswered(c, "Разговор закончен."), nil); err != nil {
+		return err
+	}
+	return b.homeScreen(ctx, c, "Готово. Что дальше?")
 }
 
 // onPublish - «Публикую»: подтверждение саммари, после которого тикет уходит в
@@ -1378,9 +1507,13 @@ func (b *Bot) onDone(c tele.Context) error {
 	switch err := b.cases.FinishCollect(ctx, cs); {
 	case errors.Is(err, ErrNoItems):
 		return c.Send("Пока нечего разбирать. Пришлите текст, голосовое или скриншот.")
+	case errors.Is(err, ErrNoNewItems):
+		// Сырьё прошлого вопроса на месте, нового нет: молчание тут читалось бы
+		// как принятое «Готово», а второй поход в документацию повторил бы ответ.
+		return c.Send("Нового вопроса не вижу. Напишите или наговорите его и нажмите «Готово».")
 	case errors.Is(err, ErrNoProject):
 		// Сырьё на месте, статус не менялся: не хватает только проекта.
-		return b.askProject(ctx, c, "Выберите проект, без него тикет некуда заводить.")
+		return b.askProject(ctx, c, projectAsk(cs))
 	case errors.Is(err, ErrNotCollecting):
 		// Статусный ответ вместо «разбираю»: /done в нормализации и правда
 		// значит «идёт разбор», а в разговоре бот ждёт автора, а не наоборот.
@@ -1391,6 +1524,11 @@ func (b *Bot) onDone(c tele.Context) error {
 	// Сбор закрыт: счётчик отработал, следующее обращение заведёт свой.
 	b.dropTally(senderID(c))
 	b.waitFor(cs)
+	// В режиме вопроса панель сбора остаётся: следующий вопрос задаётся тем же
+	// порядком, «написал - нажал Готово», и искать её заново автор не должен.
+	if cs.Mode == modeAsk {
+		return c.Send("Принял вопрос, смотрю документацию.", collectKeyboard())
+	}
 	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", homeKeyboard())
 }
 
@@ -1543,6 +1681,17 @@ func summaryKeyboard() *tele.ReplyMarkup {
 		markup.Data("Публикую", publishBtn.Unique),
 		markup.Data("Поправить", fixBtn.Unique),
 	))
+	return markup
+}
+
+// answerKeyboard - решение по ответу из документации. Продолжить разговор
+// кнопки не предлагают: следующий вопрос идёт тем же порядком, что и первый.
+func answerKeyboard() *tele.ReplyMarkup {
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(
+		markup.Row(markup.Data("Создать тикет", toTicketBtn.Unique)),
+		markup.Row(markup.Data("Закончить разговор", endAskBtn.Unique)),
+	)
 	return markup
 }
 

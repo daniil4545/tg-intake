@@ -417,7 +417,7 @@ func startInterview(t *testing.T, cases *Cases, userID int64, round int) *Case {
 	t.Helper()
 	ctx := context.Background()
 
-	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, "tg-intake")
+	cs, _, err := cases.StartCase(ctx, User{ID: userID, First: "Тест"}, "tg-intake", modeTicket)
 	if err != nil {
 		t.Fatalf("start case: %v", err)
 	}
@@ -810,6 +810,38 @@ func TestShownSummaryIsInHistory(t *testing.T) {
 	}
 	if len(history) != 4 {
 		t.Errorf("событие без текста саммари попало в историю: %d сообщений", len(history))
+	}
+}
+
+// TestAskAnswerIsInHistory: разговор пришёл в тикет из режима вопроса, и «как
+// сейчас» уже установлено по документации. Ответ бота обязан лежать в истории,
+// иначе первый же раунд переспросит то же. Слова автора несёт протокол сырья,
+// поэтому вопрос в историю не идёт - он пришёл бы в контекст дважды.
+func TestAskAnswerIsInHistory(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6015, 0)
+
+	err := addEvent(ctx, pool, cs.ID, "question_asked", map[string]any{
+		"text": "через сколько срабатывает опрос",
+	})
+	if err != nil {
+		t.Fatalf("add question: %v", err)
+	}
+	if err := addEvent(ctx, pool, cs.ID, "answer_ready", map[string]any{"text": "Раз в сутки."}); err != nil {
+		t.Fatalf("add answer: %v", err)
+	}
+
+	history, err := cases.history(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(history) != 1 || history[0].Role != "assistant" {
+		t.Fatalf("история после перехода в тикет: %+v", history)
+	}
+	if !strings.Contains(history[0].Parts[0].text, "Раз в сутки") {
+		t.Errorf("ответ по документации не попал в историю: %q", history[0].Parts[0].text)
 	}
 }
 
