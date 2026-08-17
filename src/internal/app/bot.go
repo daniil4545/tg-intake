@@ -2021,8 +2021,7 @@ func projectSourceNote(source string) string {
 // projectFailText объясняет отказ словами автора, а не статусом API: для
 // fine-grained токена «нет репозитория» и «нет доступа» неразличимы.
 func projectFailText(err error) string {
-	var apiErr *githubError
-	if errors.As(err, &apiErr) && (apiErr.status == http.StatusNotFound || apiErr.status == http.StatusForbidden) {
+	if isDenied(err) {
 		return "Репозиторий недоступен: токен сервиса его не видит либо не может писать в Issues. " +
 			"Проверьте адрес и права токена, потом повторите."
 	}
