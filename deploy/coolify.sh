@@ -74,10 +74,17 @@ api() {
 }
 
 sync_compose() {
-    test -f "$compose" || { echo "нет файла $compose" >&2; exit 1; }
-    # docker compose config ловит битый Compose до того, как он уедет в контур:
-    # Coolify примет любой текст и сломается уже на выкате.
-    docker compose -f "$compose" config >/dev/null
+    test -s "$compose" || { echo "нет файла $compose или он пуст" >&2; exit 1; }
+    # docker compose config тут не годится: файл писан под Coolify и содержит
+    # его расширения (exclude_from_hc), на которых валидатор Compose падает, а
+    # значения переменных приходят из контура, не из репозитория. Проверяем то,
+    # что можно проверить локально: файл на месте и объявляет ожидаемый стек.
+    for service in postgres migrate app; do
+        grep -q "^  ${service}:" "$compose" || {
+            echo "в $compose нет сервиса $service" >&2
+            exit 1
+        }
+    done
     # openssl, а не base64: у GNU и BSD разные флаги переноса строк, а Coolify
     # ждёт одну строку.
     local payload
