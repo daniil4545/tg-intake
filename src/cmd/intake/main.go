@@ -171,8 +171,9 @@ func sweepDrafts(ctx context.Context, pool *pgxpool.Pool, cases *app.Cases, log 
 }
 
 // checkGitHub заводит метки каждого активного проекта и этим проверяет право
-// писать (раздел 6 architecture.md). Отказ по одному проекту - предупреждение,
-// а не падение старта; успех снимает bootstrap с горячего пути первого тикета.
+// писать (раздел 6 architecture.md), а следом - право читать содержимое.
+// Отказ по одному проекту - предупреждение, а не падение старта; успех
+// снимает bootstrap с горячего пути первого тикета.
 func checkGitHub(ctx context.Context, pool *pgxpool.Pool, github *app.GitHub, log *slog.Logger) {
 	projects, err := app.ListProjects(ctx, pool)
 	if err != nil {
@@ -190,6 +191,15 @@ func checkGitHub(ctx context.Context, pool *pgxpool.Pool, github *app.GitHub, lo
 			}
 		}
 		log.Info("github_write_ok", "project", p.Slug)
+
+		// Право читать содержимое отдельное от Issues, и без него молча не
+		// работает режим «Спросить»: заметить это должен старт, а не автор
+		// посреди разговора. Отказ не выключает проект - тикеты живы полностью.
+		if err := github.CheckRead(ctx, p); err != nil {
+			log.Warn("github_read_denied", "project", p.Slug, "repo", p.Owner+"/"+p.Repo, "error", err)
+			continue
+		}
+		log.Info("github_read_ok", "project", p.Slug)
 	}
 }
 

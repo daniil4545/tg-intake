@@ -1143,9 +1143,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				WHERE id = $1 AND status = 'answering'`, p.CaseID); err != nil {
 				return fmt.Errorf("return case %s to collecting: %w", p.CaseID, err)
 			}
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог посмотреть документацию. Спросите ещё раз своими словами - "+
-					"или нажмите «Создать тикет»."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, lookupFailedText(cause)); err != nil {
 				return err
 			}
 		case JobInterview, JobSummarize:
