@@ -120,6 +120,21 @@ func (g *GitHub) CheckWrite(ctx context.Context, p Project) error {
 	return err
 }
 
+// CheckRead проверяет право читать содержимое репозитория - им живёт режим
+// «Спросить». Право отдельное от Issues: токен, которым тикеты заводятся, о
+// документации проекта может не знать вовсе, и раньше это выяснял автор
+// посреди разговора.
+//
+// Листинг корня, а не README: README есть не в каждом репозитории, и его 404 не
+// отличить от отказа в правах. Клиент рабочий, хотя проверка и не в очереди:
+// зовут её со старта, никто не ждёт, а сетевой сбой на быстром клиенте
+// записался бы в лог отказом в правах. Настоящий отказ повторов не стоит - 403
+// без Retry-After возвращается сразу.
+func (g *GitHub) CheckRead(ctx context.Context, p Project) error {
+	_, err := g.call(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/contents/", p.Owner, p.Repo), nil)
+	return err
+}
+
 // createLabel: существующая метка возвращает 422, и это не ошибка - именно
 // такого состояния мы и добивались.
 func (g *GitHub) createLabel(ctx context.Context, p Project, name, color, desc string) error {
@@ -596,18 +611,38 @@ func authorName(u User) string {
 	return name
 }
 
+// isDenied - отказ в правах: GitHub отвечает и 403, и 404, потому что
+// fine-grained PAT не показывает разницы между «права нет» и «репозитория для
+// этого токена не существует». Для ответа автору это одно и то же.
+func isDenied(err error) bool {
+	var apiErr *githubError
+	return errors.As(err, &apiErr) &&
+		(apiErr.status == http.StatusForbidden || apiErr.status == http.StatusNotFound)
+}
+
 // publishFailedText отделяет отказ в правах от временного сбоя. Советовать
 // «нажмите ещё раз» там, где токену не хватает прав, значит гонять автора по
 // кругу: повтор не поможет, пока владелец не выдаст право заводить тикеты.
 func publishFailedText(cause error) string {
-	var apiErr *githubError
-	if errors.As(cause, &apiErr) &&
-		(apiErr.status == http.StatusForbidden || apiErr.status == http.StatusNotFound) {
+	if isDenied(cause) {
 		return "Тикет не создан: у сервиса нет прав заводить задачи в этом проекте. " +
 			"Материал сохранён. Напишите владельцу сервиса - когда право появится, " +
 			"нажмите «Публикую» ещё раз."
 	}
 	return "Не удалось создать тикет в GitHub. Нажмите «Публикую» ещё раз - материал на месте."
+}
+
+// lookupFailedText - то же разделение для похода в документацию: право читать
+// содержимое репозитория выдаётся отдельно от права заводить тикеты, и без него
+// «спросите ещё раз своими словами» отправляет автора по кругу навсегда.
+func lookupFailedText(cause error) string {
+	if isDenied(cause) {
+		return "У сервиса нет доступа к документации этого проекта, и повтор тут не " +
+			"поможет - напишите владельцу сервиса. Тикет создать можно: нажмите " +
+			"«Создать тикет»."
+	}
+	return "Не смог посмотреть документацию. Спросите ещё раз своими словами - " +
+		"или нажмите «Создать тикет»."
 }
 
 func publishedMessage(number int, url string, incomplete bool) string {
