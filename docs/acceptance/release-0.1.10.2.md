@@ -31,6 +31,10 @@ workflow (исполнитель-владелец, ref-тег, формат ве
 
 Все команды из корня репозитория. `<sha>` - коммит в `prod` после мерджа PR.
 
+Шаги выката выполняет общий инструмент платформы `infra/scripts/coolify-deploy.sh`
+из внутренней базы знаний - один на все контуры; здесь его нет намеренно,
+репозиторий публичный.
+
 ```sh
 # 1. Мердж и тег (владелец)
 gh pr merge 33 --merge
@@ -41,21 +45,19 @@ git tag -a v0.1.10.2 -F <файл с телом тега>
 make -C src ci-check
 
 # 3. Образ с рабочей машины
-docker buildx build --platform linux/amd64 --push \
-  -t ghcr.io/daniil4545/tg-intake:sha-<sha> \
-  --build-arg VCS_REF=<sha> src
+coolify-deploy.sh intake build <sha>
 
 # 4. Выкат: Compose, APP_IMAGE, деплой - строго в этом порядке
-deploy/coolify.sh release <sha>
+CONFIRM=yes coolify-deploy.sh intake release <sha>
 
 # 5. Приёмка
 deploy/safe-ssh.sh health
 deploy/safe-ssh.sh app-logs 100
 ```
 
-`deploy/coolify.sh` берёт токен, адрес API и uuid из Keychain; ничего из этого в
-репозиторий не попадает. Ответ Coolify 200 означает «запрос принят», не «версия
-выкачена».
+Инструмент сам не пустит прод дальше без `CONFIRM=yes`, чистого рабочего дерева
+и тега `v*` на коммите - это три из пяти проверок, потерянных вместе с workflow.
+Ответ Coolify 200 означает «запрос принят», не «версия выкачена».
 
 ## G8. Приёмка
 
@@ -79,5 +81,5 @@ deploy/safe-ssh.sh app-logs 100
 ## Откат
 
 Schema-compatible: миграций релиз не несёт, `goose down` не запускается.
-Возврат `APP_IMAGE` на предыдущий `sha-` и повторный `deploy/coolify.sh deploy`.
+Возврат `APP_IMAGE` на предыдущий `sha-` и повторный выкат тем же инструментом.
 Предыдущая ревизия контура - `a2c8e6b663a8218185742664e8bdb075e5ccac68`.
