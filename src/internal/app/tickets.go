@@ -12,10 +12,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ticketsLimit - сколько последних тикетов проекта показывает список. Листать
-// в Telegram неудобно, а тикет старше десятого ищется в GitHub тем, у кого есть
-// доступ.
-const ticketsLimit = 10
+// ticketsPage - сколько тикетов на странице списка. Потолка у списка больше
+// нет: прежние десять последних держались на том, что листать было нечем, и
+// тикет постарше в боте не находился вовсе.
+const ticketsPage = 5
 
 // issueScan - окно, в котором ищутся метки своих тикетов. Больше сотни GitHub
 // за один запрос не отдаёт.
@@ -70,19 +70,25 @@ func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger, a
 	return &Tickets{cases: cases, gh: gh, statuses: statuses, log: log, alertChat: alertChat}
 }
 
-// List - последние тикеты проекта. Номера и заголовки из своей базы, статусы
-// одним запросом к GitHub.
+// List - страница тикетов проекта, начиная с offset. Номера и заголовки из
+// своей базы, статусы одним запросом к GitHub. Второе значение - есть ли за
+// страницей ещё тикеты: по нему список решает, показывать ли «Вперёд».
 //
 // Отказ GitHub не прячет список: тикеты видны без статусов. Просмотр не должен
 // умирать вместе с чужим сервисом.
-func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
+func (t *Tickets) List(ctx context.Context, project Project, offset int) ([]Ticket, bool, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	// Страница плюс один: лишняя строка отвечает на вопрос «есть ли ещё»
+	// дешевле, чем отдельный COUNT по всей таблице.
 	rows, err := t.cases.pool.Query(ctx, `
 		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''), user_id
 		FROM cases
 		WHERE project_id = $1 AND issue_number IS NOT NULL
-		ORDER BY issue_number DESC LIMIT $2`, project.ID, ticketsLimit)
+		ORDER BY issue_number DESC LIMIT $2 OFFSET $3`, project.ID, ticketsPage+1, offset)
 	if err != nil {
-		return nil, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
+		return nil, false, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
 	}
 	defer rows.Close()
 
@@ -90,21 +96,26 @@ func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
 	for rows.Next() {
 		var t Ticket
 		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID); err != nil {
-			return nil, fmt.Errorf("scan ticket: %w", err)
+			return nil, false, fmt.Errorf("scan ticket: %w", err)
 		}
 		tickets = append(tickets, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read tickets: %w", err)
+		return nil, false, fmt.Errorf("read tickets: %w", err)
 	}
 	if len(tickets) == 0 {
-		return nil, nil
+		return nil, false, nil
+	}
+
+	more := len(tickets) > ticketsPage
+	if more {
+		tickets = tickets[:ticketsPage]
 	}
 
 	issues, err := t.gh.ListIssues(ctx, project, issueScan)
 	if err != nil {
 		t.log.Warn("issues_unavailable", "project", project.Slug, "error", err)
-		return tickets, nil
+		return tickets, more, nil
 	}
 
 	labels := make(map[int][]string, len(issues))
@@ -116,9 +127,10 @@ func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
 		if !ok {
 			// Тикет старше окна сканирования: сотню последних номеров в живом
 			// репозитории занимают и pull request'ы, вытеснить оттуда тикет
-			// проще, чем кажется. Добираем поштучно - в списке их не больше
-			// десяти. Первый отказ останавливает добор: GitHub деградировал, и
-			// долбить его из синхронного хендлера значит морозить бота.
+			// проще, чем кажется. Добираем поштучно - на странице их не больше
+			// пяти, и это же держит цену листания вглубь. Первый отказ
+			// останавливает добор: GitHub деградировал, и долбить его из
+			// синхронного хендлера значит морозить бота.
 			issue, err := t.gh.GetIssue(ctx, project, tickets[i].Number, true)
 			if err != nil {
 				if isNotFound(err) {
@@ -135,7 +147,7 @@ func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
 			tickets[i].Status = status
 		}
 	}
-	return tickets, nil
+	return tickets, more, nil
 }
 
 // Load - карточка тикета. Тело берётся из своей базы, а не из issue.body: в

@@ -35,7 +35,7 @@ func TestListSkipsPullRequests(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestListBackfillsOldTicket(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestListSurvivesGitHubError(t *testing.T) {
 	t.Cleanup(server.Close)
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 0)
 	if err != nil {
 		t.Fatalf("отказ GitHub уронил список: %v", err)
 	}
@@ -332,12 +332,56 @@ func TestListByProject(t *testing.T) {
 	}
 
 	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if len(list) != 1 || list[0].Number != 60 {
 		t.Fatalf("список чужого проекта или с черновиком: %+v", list)
+	}
+}
+
+// TestListPages: страница отдаёт ровно ticketsPage тикетов и говорит, есть ли
+// за ней ещё. Без этого признака кнопка «Вперёд» вела бы в пустой экран, а
+// последний тикет проекта было бы не отличить от середины списка.
+func TestListPages(t *testing.T) {
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	// Шесть тикетов: одна полная страница и хвост.
+	for i := 0; i < ticketsPage+1; i++ {
+		publishCase(t, cases, int64(7100+i), 100+i)
+	}
+	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
+
+	first, more, err := tickets.List(context.Background(), testProject(t, pool), 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(first) != ticketsPage || !more {
+		t.Fatalf("первая страница: %d тикетов, more=%v", len(first), more)
+	}
+	// Сортировка по убыванию номера: первым идёт самый свежий тикет.
+	if first[0].Number != 105 {
+		t.Errorf("порядок страницы нарушен: %d", first[0].Number)
+	}
+
+	second, more, err := tickets.List(context.Background(), testProject(t, pool), ticketsPage)
+	if err != nil {
+		t.Fatalf("list page 2: %v", err)
+	}
+	if len(second) != 1 || more {
+		t.Fatalf("вторая страница: %d тикетов, more=%v", len(second), more)
+	}
+	if second[0].Number != 100 {
+		t.Errorf("хвост списка: %d", second[0].Number)
+	}
+
+	empty, more, err := tickets.List(context.Background(), testProject(t, pool), 100)
+	if err != nil {
+		t.Fatalf("list past end: %v", err)
+	}
+	if len(empty) != 0 || more {
+		t.Fatalf("за концом списка: %d тикетов, more=%v", len(empty), more)
 	}
 }
 
