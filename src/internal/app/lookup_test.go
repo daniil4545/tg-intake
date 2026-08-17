@@ -118,6 +118,34 @@ func TestLookupAnswersWithLink(t *testing.T) {
 	}
 }
 
+// TestLookupDenialOffersTicket: отказ по правам зовёт автора создать тикет, и
+// кнопка обязана прийти с ним же. Панель сбора её не даёт, а разговор в
+// документацию больше не вернётся - без кнопки текст указывает в тупик.
+func TestLookupDenialOffersTicket(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startAsk(t, cases, 5107, "как часто уходит опрос")
+
+	job := lookupJob(cs.ID)
+	job.Attempts = maxAttempts + 1
+	cases.HandleFailedJob(ctx, job, &githubError{status: 403, message: "Resource not accessible"})
+
+	if got := reload(t, cases, cs.ID).Status; got != statusCollecting {
+		t.Errorf("статус после провала: %s, ожидался %s", got, statusCollecting)
+	}
+	sent := notifiesOf(t, pool, cs.ID)
+	if len(sent) != 1 {
+		t.Fatalf("сообщений автору: %d, ожидалось одно", len(sent))
+	}
+	if sent[0].Buttons != keysAnswer {
+		t.Errorf("кнопки под отказом: %q, ожидалось %q", sent[0].Buttons, keysAnswer)
+	}
+	if !strings.Contains(sent[0].Text, "владельцу") {
+		t.Errorf("текст отказа не отправляет к владельцу: %q", sent[0].Text)
+	}
+}
+
 // TestLookupSwitchesToTicket: реплика «давай поменяем» - уже не вопрос. Разговор
 // переходит в тикет с той же историей, и «как сейчас» не переспрашивается.
 func TestLookupSwitchesToTicket(t *testing.T) {

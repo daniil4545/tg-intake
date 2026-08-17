@@ -1143,9 +1143,11 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 				WHERE id = $1 AND status = 'answering'`, p.CaseID); err != nil {
 				return fmt.Errorf("return case %s to collecting: %w", p.CaseID, err)
 			}
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог посмотреть документацию. Спросите ещё раз своими словами - "+
-					"или нажмите «Создать тикет»."); err != nil {
+			// Кнопки те же, что под удачным ответом: оба текста отказа зовут
+			// «Создать тикет», а панель сбора её не даёт. При отказе по правам
+			// это единственный выход - разговор в документацию не вернётся.
+			if err := putNotifyKey(ctx, tx, p.CaseID, strconv.FormatInt(job.ID, 10),
+				lookupFailedText(cause), keysAnswer); err != nil {
 				return err
 			}
 		case JobInterview, JobSummarize:

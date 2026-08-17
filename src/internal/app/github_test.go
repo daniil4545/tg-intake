@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -140,5 +143,49 @@ func TestFileTooLargeReturnsError(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("содержимое не пустое при ошибке: %q", got)
+	}
+}
+
+// TestCheckReadNamesMissingPermission: отказ в праве читать содержимое должен
+// называть само право - именно на нём молча встал режим «Спросить», и по
+// сообщению владелец понимает, что выдать токену.
+func TestCheckReadNamesMissingPermission(t *testing.T) {
+	asked := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r.Method + " " + r.URL.Path
+		w.Header().Set("X-Accepted-GitHub-Permissions", "contents=read")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message": "Resource not accessible by personal access token"}`)
+	}))
+	t.Cleanup(server.Close)
+	gh := NewGitHub("token", server.URL, testStatuses, testLog(t))
+
+	err := gh.CheckRead(context.Background(), Project{Owner: "acme", Repo: "proj"})
+	if err == nil {
+		t.Fatal("отказ в правах должен вернуть ошибку")
+	}
+	if asked != "GET /repos/acme/proj/contents/" {
+		t.Errorf("проверка ушла не туда: %s", asked)
+	}
+	if !strings.Contains(err.Error(), "403") || !strings.Contains(err.Error(), "contents=read") {
+		t.Errorf("в ошибке нет статуса или нужного права: %v", err)
+	}
+}
+
+// TestLookupFailedTextSeparatesDenial: отказ в правах не лечится повтором, и
+// звать автора спросить ещё раз значит гонять его по кругу навсегда.
+func TestLookupFailedTextSeparatesDenial(t *testing.T) {
+	denied := lookupFailedText(&githubError{status: 403, message: "Resource not accessible"})
+	if !strings.Contains(denied, "владельцу") {
+		t.Errorf("отказ в правах не отправляет к владельцу: %s", denied)
+	}
+	if strings.Contains(denied, "Спросите ещё раз") {
+		t.Errorf("отказ в правах предлагает бесполезный повтор: %s", denied)
+	}
+
+	temporary := lookupFailedText(errors.New("read body: context deadline exceeded"))
+	if !strings.Contains(temporary, "Спросите ещё раз") {
+		t.Errorf("временный сбой должен звать спросить ещё раз: %s", temporary)
 	}
 }
