@@ -9,7 +9,7 @@ workflow (исполнитель-владелец, ref-тег, формат ве
 
 ## Состояние на 2026-08-17
 
-- Кандидат: PR #33, ветка `feature/lookup-read-check`, четыре коммита.
+- Кандидат: PR #33, ветка `feature/lookup-read-check`, шесть коммитов.
 - Приёмка среза: [lookup-read-check.md](lookup-read-check.md).
 - Право `Contents: read` у `GITHUB_TOKEN` расширено владельцем 17.08.2026,
   живым прогоном не подтверждено - это и проверяет G8.
@@ -67,7 +67,7 @@ deploy/safe-ssh.sh app-logs 100
 3. В логе старта на каждый активный проект пара `github_write_ok` и
    `github_read_ok`, ни одного `github_read_denied`.
 4. Живой вопрос в режиме «Спросить» по проекту qualifier: в логе `lookup_start`,
-   `lookup_pick` с числом файлов, `answer_given`; в чате ответ со ссылкой на
+   `lookup_pick` с числом файлов, `lookup_done`; в чате ответ со ссылкой на
    md-файл. `deploy/safe-ssh.sh case <id>` - работа `lookup` в `done`.
 
 Пункт 4 обязателен: он и есть проверка того, ради чего релиз делался. Пункты
