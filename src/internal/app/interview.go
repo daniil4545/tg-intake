@@ -1163,7 +1163,7 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool) s
 	if brief != "" {
 		b.WriteString(brief + "\n\n")
 	}
-	b.WriteString(plainSections(body))
+	b.WriteString(plainText(body))
 	if len(gaps) > 0 {
 		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") + ".")
 		// Пометку о неполноте несёт только незакрытый обязательный пункт:
@@ -1177,15 +1177,50 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool) s
 	return b.String()
 }
 
-// plainSections убирает markdown-заголовки: в тикете они нужны, в Telegram без
-// разметки выглядят решётками.
-func plainSections(body string) string {
+// plainText убирает markdown: Telegram его не рендерит, а parse_mode включать
+// нельзя - тексты приходят из GitHub, и непарная звёздочка в чужом комментарии
+// уронила бы отправку. Таблиц у Telegram нет вовсе, поэтому строка таблицы
+// становится перечислением через дефис.
+func plainText(body string) string {
 	lines := strings.Split(body, "\n")
-	for n, line := range lines {
-		lines[n] = strings.TrimPrefix(line, "## ")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " ")
+		if isTableRule(line) {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "|") {
+			line = tableRow(line)
+		}
+		line = headingRe.ReplaceAllString(line, "")
+		line = mdLinkRe.ReplaceAllString(line, "$1 ($2)")
+		line = strings.ReplaceAll(line, "**", "")
+		line = strings.ReplaceAll(line, "`", "")
+		out = append(out, line)
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(out, "\n")
 }
+
+// isTableRule - строка-разделитель шапки таблицы: показывать её нечем, в
+// перечислении она превратилась бы в строку из дефисов.
+func isTableRule(line string) bool {
+	return strings.Contains(line, "---") && tableRuleRe.MatchString(line)
+}
+
+// tableRow превращает строку таблицы в перечисление: ячейки через дефис.
+func tableRow(line string) string {
+	cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+	for n, cell := range cells {
+		cells[n] = strings.TrimSpace(cell)
+	}
+	return strings.Join(cells, " - ")
+}
+
+var (
+	headingRe   = regexp.MustCompile(`^#{1,6}\s+`)
+	tableRuleRe = regexp.MustCompile(`^[\s|:-]+$`)
+	mdLinkRe    = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+)
 
 // Структурные персональные данные вырезаются детерминированно до записи в
 // тикет; остальное (ФИО, переписка) - забота промтов, последняя защита - автор
