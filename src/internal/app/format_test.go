@@ -155,6 +155,18 @@ func TestCardFitsOneMessage(t *testing.T) {
 	if !strings.Contains(cardText(&ticket), ticket.Comment) {
 		t.Error("короткий комментарий обрезан")
 	}
+
+	// Тикет, заведённый до появления краткого содержания: описание берётся из
+	// начала тела, иначе от обращения в карточке остаётся один заголовок.
+	ticket.Brief = ""
+	ticket.Body = strings.Repeat("г", 3000)
+	text = cardText(&ticket)
+	if !strings.Contains(text, strings.Repeat("г", briefLimit)) {
+		t.Error("у тикета без краткого содержания карточка молчит о сути")
+	}
+	if runes := utf8.RuneCountInString(text); runes > maxMessage {
+		t.Errorf("карточка с телом не влезает в сообщение: %d рун", runes)
+	}
 }
 
 // TestCardHidesCancelWithoutStatus: карточка не выдаёт незнание за факт. При
