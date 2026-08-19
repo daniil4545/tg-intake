@@ -424,7 +424,7 @@ func TestRenderSections(t *testing.T) {
 	if body != want {
 		t.Errorf("тело саммари:\nполучено:\n%s\nожидалось:\n%s", body, want)
 	}
-	if strings.Contains(plainSections(body), "## ") {
+	if strings.Contains(plainText(body), "## ") {
 		t.Error("в сообщении автору остались markdown-заголовки")
 	}
 }
