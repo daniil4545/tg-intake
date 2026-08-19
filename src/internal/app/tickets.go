@@ -51,8 +51,15 @@ type Ticket struct {
 	// закрытому предлагать отмену нельзя.
 	Unavailable bool
 	Author      string
-	Body        string
-	Comment     string
+	// Brief - краткое содержание; Body - полное описание, которое открывается
+	// кнопкой. У тикетов, заведённых до появления краткого, Brief пуст, и
+	// карточка показывает Body, как раньше.
+	Brief   string
+	Body    string
+	Comment string
+	// News - по тикету есть новость, о которой автору сказали, а карточку он не
+	// открыл. Ставится только владельцу тикета: чужая отметка ему не нужна.
+	News bool
 }
 
 // Tickets - просмотр тикетов и отмена. Владелец состояния обращения по-прежнему
@@ -73,14 +80,17 @@ func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger, a
 // List - последние тикеты проекта. Номера и заголовки из своей базы, статусы
 // одним запросом к GitHub.
 //
-// Отказ GitHub не прячет список: тикеты видны без статусов. Просмотр не должен
-// умирать вместе с чужим сервисом.
-func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
+// Свои тикеты идут первыми: правило «все видят все» остаётся, но человек пришёл
+// за своим, а окно списка короткое. Отказ GitHub не прячет список: тикеты видны
+// без статусов. Просмотр не должен умирать вместе с чужим сервисом.
+func (t *Tickets) List(ctx context.Context, project Project, userID int64) ([]Ticket, error) {
 	rows, err := t.cases.pool.Query(ctx, `
-		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''), user_id
+		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''), user_id,
+		       has_news AND user_id = $3
 		FROM cases
 		WHERE project_id = $1 AND issue_number IS NOT NULL
-		ORDER BY issue_number DESC LIMIT $2`, project.ID, ticketsLimit)
+		ORDER BY (user_id = $3) DESC, issue_number DESC LIMIT $2`,
+		project.ID, ticketsLimit, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
 	}
@@ -89,7 +99,7 @@ func (t *Tickets) List(ctx context.Context, project Project) ([]Ticket, error) {
 	var tickets []Ticket
 	for rows.Next() {
 		var t Ticket
-		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID); err != nil {
+		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID, &t.News); err != nil {
 			return nil, fmt.Errorf("scan ticket: %w", err)
 		}
 		tickets = append(tickets, t)
@@ -146,10 +156,10 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 	var summary string
 	row := t.cases.pool.QueryRow(ctx, `
 		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''),
-		       user_id, COALESCE(summary, '')
+		       user_id, COALESCE(summary, ''), COALESCE(brief, ''), has_news
 		FROM cases WHERE project_id = $1 AND issue_number = $2`, project.ID, number)
 	if err := row.Scan(&ticket.CaseID, &ticket.Number, &ticket.URL, &ticket.Title,
-		&ticket.UserID, &summary); err != nil {
+		&ticket.UserID, &summary, &ticket.Brief, &ticket.News); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -182,19 +192,33 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 	}
 	ticket.Status = status
 
-	// Комментарий нужен там, где тикет доигран: автор пришёл узнать, почему.
-	if status.Final {
-		comment, err := t.gh.LastComment(ctx, project, number)
-		if err != nil {
-			t.log.Warn("comments_unavailable", "project", project.Slug, "issue", number, "error", err)
-			return &ticket, nil
-		}
-		if comment == "" {
-			t.log.Warn("comment_missing", "project", project.Slug, "issue", number)
-		}
-		ticket.Comment = comment
+	// Комментарий читается у любого тикета, а не только у доигранного: разбор и
+	// вопросы разработчика приходят задолго до финала, и у автора нет другого
+	// способа их прочитать - аккаунта GitHub у него нет.
+	comment, err := t.gh.LastComment(ctx, project, number)
+	if err != nil {
+		t.log.Warn("comments_unavailable", "project", project.Slug, "issue", number, "error", err)
+		return &ticket, nil
 	}
+	// Молчание при финальном статусе - дыра в инварианте «отклонение всегда с
+	// причиной»: у открытого тикета комментария просто может не быть.
+	if comment == "" && status.Final {
+		t.log.Warn("comment_missing", "project", project.Slug, "issue", number)
+	}
+	ticket.Comment = comment
 	return &ticket, nil
+}
+
+// MarkSeen снимает отметку о новости: автор открыл карточку и всё прочитал.
+// Автор проверяется условием запроса - чужое открытие чужую отметку не гасит.
+func (t *Tickets) MarkSeen(ctx context.Context, caseID string, userID int64) error {
+	_, err := t.cases.pool.Exec(ctx, `
+		UPDATE cases SET has_news = false, updated_at = now()
+		WHERE id = $1 AND user_id = $2 AND has_news`, caseID, userID)
+	if err != nil {
+		return fmt.Errorf("clear news of case %s: %w", caseID, err)
+	}
+	return nil
 }
 
 // Cancel ставит работу отмены. Через replaceJob: повторная отмена после

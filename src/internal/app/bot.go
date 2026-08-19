@@ -75,6 +75,7 @@ var (
 	fixBtn        = &tele.Btn{Unique: "fix"}
 	ticketsBtn    = &tele.Btn{Unique: "tickets"}
 	cardBtn       = &tele.Btn{Unique: "card"}
+	fullBtn       = &tele.Btn{Unique: "full"}
 	killBtn       = &tele.Btn{Unique: "kill"}
 	addProjectBtn = &tele.Btn{Unique: "add_project"}
 	homeBtn       = &tele.Btn{Unique: "home"}
@@ -253,6 +254,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(projectBtn, b.onProject)
 	tb.Handle(ticketsBtn, b.onTickets)
 	tb.Handle(cardBtn, b.onCard)
+	tb.Handle(fullBtn, b.onFull)
 	tb.Handle(killBtn, b.onKill)
 	tb.Handle(createBtn, b.onCreate)
 	tb.Handle(askBtn, b.onAsk)
@@ -514,6 +516,13 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 		return b.finishKill(cs, p.Text)
 	}
 
+	// Новость по тикету к жизни разговора отношения не имеет: автор мог в этот
+	// момент собирать новое обращение, и трогать его панель, счётчик материала и
+	// пометку раунда нельзя.
+	if p.Buttons == keysTicket {
+		return b.sendNews(ctx, cs, p.Text)
+	}
+
 	var opts []any
 	switch {
 	// Раньше проверки статуса: ответ из документации приходит в сбор, и кнопки
@@ -561,6 +570,24 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 		b.dropTally(cs.UserID)
 	}
 	return nil
+}
+
+// sendNews доставляет новость по тикету: одна кнопка перехода в карточку.
+// Сообщение новое, а не правка экрана: автор мог смотреть куда угодно, а новость
+// обязана попасть в переписку.
+func (b *Bot) sendNews(ctx context.Context, cs *Case, text string) error {
+	if cs.ProjectID == nil || cs.IssueNumber == 0 {
+		return fmt.Errorf("news of case %s has no ticket", cs.ID)
+	}
+	project, err := LoadProject(ctx, b.pool, *cs.ProjectID)
+	if err != nil {
+		return err
+	}
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data(fmt.Sprintf("Открыть тикет #%d", cs.IssueNumber),
+		cardBtn.Unique, cardData(project.Slug, cs.IssueNumber))))
+	_, err = b.sendLong(&tele.User{ID: cs.UserID}, text, markup)
+	return err
 }
 
 // finishKill доставляет исход отмены тикета. Экран запомнен нажатием кнопки и
@@ -1721,7 +1748,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return b.screen(c, "Проект недоступен: его выключили.", backHome())
 	}
 
-	tickets, err := b.tickets.List(ctx, project)
+	tickets, err := b.tickets.List(ctx, project, senderID(c))
 	if err != nil {
 		return err
 	}
@@ -1734,11 +1761,17 @@ func (b *Bot) onTickets(c tele.Context) error {
 	rows := make([]tele.Row, 0, len(tickets)+1)
 	var text strings.Builder
 	text.WriteString("Тикеты проекта «" + project.Title + "»:\n\n")
+	// Чужие тикеты отделены строкой: порядок выборки ставит свои первыми, и без
+	// разделителя список читается как один.
+	others := false
 	for _, t := range tickets {
+		if !others && t.UserID != senderID(c) {
+			others = true
+			text.WriteString("\nДругие тикеты проекта:\n")
+		}
 		text.WriteString(ticketLine(t) + "\n")
 		rows = append(rows, markup.Row(markup.Data(
-			fmt.Sprintf("#%d %s", t.Number, statusTitle(t.Status)),
-			cardBtn.Unique, cardData(project.Slug, t.Number))))
+			ticketButton(t), cardBtn.Unique, cardData(project.Slug, t.Number))))
 	}
 	rows = append(rows, markup.Row(markup.Data("Назад", backBtn.Unique, project.Slug)))
 	markup.Inline(rows...)
@@ -1774,8 +1807,20 @@ func (b *Bot) onCard(c tele.Context) error {
 	}
 	b.log.Info("ticket_opened", "user_id", senderID(c), "case_id", ticket.CaseID, "issue", number)
 
+	// Новость прочитана: карточка показывает и статус, и комментарий, а отметка в
+	// списке дальше только мешала бы искать непрочитанное.
+	if ticket.News && ticket.UserID == senderID(c) {
+		if err := b.tickets.MarkSeen(ctx, ticket.CaseID, senderID(c)); err != nil {
+			return err
+		}
+	}
+
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
+	if ticket.Brief != "" && ticket.Body != "" {
+		rows = append(rows, markup.Row(markup.Data("Подробнее", fullBtn.Unique,
+			cardData(project.Slug, number))))
+	}
 	if cancelOffered(ticket, senderID(c)) {
 		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
 			cardData(project.Slug, number))))
@@ -1797,6 +1842,40 @@ func backToList(slug string) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, slug)))
 	return markup
+}
+
+// onFull - полное описание тикета. Отдельный экран, а не длинная карточка:
+// саммари занимает весь телефон, и статус с комментарием уезжают из виду.
+func (b *Bot) onFull(c tele.Context) error {
+	b.toast(c, "Открываю описание")
+
+	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
+	defer cancel()
+
+	project, number, ok, err := b.cardTarget(ctx, c)
+	if err != nil || !ok {
+		return err
+	}
+
+	ticket, err := b.tickets.Load(ctx, project, number)
+	switch {
+	case errors.Is(err, ErrIssueGone):
+		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug))
+	case err != nil:
+		return err
+	case ticket == nil:
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
+	}
+
+	markup := &tele.ReplyMarkup{}
+	markup.Inline(markup.Row(markup.Data(fmt.Sprintf("К тикету #%d", number),
+		cardBtn.Unique, cardData(project.Slug, number))))
+	text := fmt.Sprintf("Тикет #%d - полное описание\n\n%s", number, ticket.Body)
+	if len(text) > maxMessage {
+		_, err := b.sendLong(c.Recipient(), text, markup)
+		return err
+	}
+	return b.screen(c, text, markup)
 }
 
 // onKill ставит работу отмены. Ответ автору синхронный, сама отмена идёт
@@ -1877,7 +1956,19 @@ func cardData(slug string, number int) string {
 }
 
 func ticketLine(t Ticket) string {
+	if t.News {
+		return fmt.Sprintf("#%d (новое) - %s - %s", t.Number, statusTitle(t.Status), t.Title)
+	}
 	return fmt.Sprintf("#%d - %s - %s", t.Number, statusTitle(t.Status), t.Title)
+}
+
+// ticketButton - подпись кнопки списка. Отметка новости повторяется на кнопке:
+// в длинном списке нажимают по кнопкам, не сверяясь с текстом выше.
+func ticketButton(t Ticket) string {
+	if t.News {
+		return fmt.Sprintf("#%d новое - %s", t.Number, statusTitle(t.Status))
+	}
+	return fmt.Sprintf("#%d %s", t.Number, statusTitle(t.Status))
 }
 
 // statusTitle - что показать вместо статуса, когда GitHub не ответил. Пустая
@@ -1899,7 +1990,12 @@ func cancelOffered(t *Ticket, userID int64) bool {
 func cardText(t *Ticket) string {
 	var text strings.Builder
 	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
-	if t.Body != "" {
+	// Кратко вместо полного описания: полное открывается кнопкой. У тикетов до
+	// появления краткого его нет, и карточка показывает описание целиком.
+	switch {
+	case t.Brief != "":
+		text.WriteString("\n" + t.Brief + "\n")
+	case t.Body != "":
 		text.WriteString("\n" + t.Body + "\n")
 	}
 	if t.Comment != "" {

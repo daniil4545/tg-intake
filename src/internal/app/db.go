@@ -24,6 +24,10 @@ type Project struct {
 	Repo        string
 	Context     string
 	LabelsReady bool
+	// CommentsSince - граница окна, за которым слежение ищет новые комментарии.
+	// Двигается только после успешного разбора: отказ GitHub оставляет её на
+	// месте, и следующий тик перекрывает пропущенное.
+	CommentsSince time.Time
 }
 
 // User - профиль автора из Telegram. ФИО нужно для шапки issue: GitHub не даёт
@@ -60,7 +64,8 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-const projectColumns = `id, slug, title, github_owner, github_repo, context, labels_ready`
+const projectColumns = `id, slug, title, github_owner, github_repo, context, labels_ready,
+	comments_since`
 
 func ListProjects(ctx context.Context, pool *pgxpool.Pool) ([]Project, error) {
 	rows, err := pool.Query(ctx, `SELECT `+projectColumns+` FROM projects WHERE active ORDER BY title`)
@@ -92,7 +97,8 @@ func LoadProject(ctx context.Context, pool *pgxpool.Pool, id int64) (Project, er
 }
 
 func scanProject(row pgx.Row, p *Project) error {
-	if err := row.Scan(&p.ID, &p.Slug, &p.Title, &p.Owner, &p.Repo, &p.Context, &p.LabelsReady); err != nil {
+	if err := row.Scan(&p.ID, &p.Slug, &p.Title, &p.Owner, &p.Repo, &p.Context, &p.LabelsReady,
+		&p.CommentsSince); err != nil {
 		return fmt.Errorf("scan project: %w", err)
 	}
 	return nil
@@ -135,6 +141,38 @@ func MarkLabelsReady(ctx context.Context, pool *pgxpool.Pool, id int64) error {
 	_, err := pool.Exec(ctx, `UPDATE projects SET labels_ready = true, updated_at = now() WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("mark labels ready of project %d: %w", id, err)
+	}
+	return nil
+}
+
+// inTx выполняет функцию в транзакции. Живёт здесь, а не методом владельца
+// состояния: транзакции нужны и обращению, и слежению, а две копии одного
+// шаблона разошлись бы на первой правке.
+func inTx(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// MoveCommentsSince сдвигает границу окна опроса комментариев. Назад она не
+// ходит: тик, разобравший меньше прошлого, не имеет права заставить сервис
+// перечитать уже доставленное.
+func MoveCommentsSince(ctx context.Context, pool *pgxpool.Pool, id int64, at time.Time) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE projects SET comments_since = $2, updated_at = now()
+		WHERE id = $1 AND comments_since < $2`, id, at)
+	if err != nil {
+		return fmt.Errorf("move comments border of project %d: %w", id, err)
 	}
 	return nil
 }
