@@ -31,7 +31,7 @@ func newTestInterview(t *testing.T, cases *Cases, rounds int) *Interview {
 	t.Helper()
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds)
+	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds, nil)
 }
 
 // TestLoadContract: правила едут в бинарь и обязаны быть рабочими. Тип без

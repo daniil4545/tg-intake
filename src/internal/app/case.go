@@ -100,8 +100,12 @@ type Case struct {
 	Summary   string
 	// Brief - краткое содержание: суть обращения в одном-двух предложениях. Идёт
 	// первым разделом в тело issue и заменяет полное описание в карточке бота.
-	Brief       string
-	Incomplete  bool
+	Brief      string
+	Incomplete bool
+	// Overlap - список пересечений черновика с состоянием проекта, собранный
+	// шагом саммари. Пусто и когда сверка не нашла ничего, и когда она не
+	// состоялась: для потока автора это одно и то же.
+	Overlap     string
 	IssueNumber int
 }
 
@@ -144,7 +148,7 @@ type txRunner interface {
 
 const caseColumns = `id, user_id, project_id, status, mode, protocol, COALESCE(kind, ''),
 	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), COALESCE(brief, ''),
-	incomplete, COALESCE(issue_number, 0)`
+	incomplete, overlap, COALESCE(issue_number, 0)`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -168,7 +172,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	var filled, gaps []byte
 	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Mode, &cs.Protocol, &cs.Kind,
 		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Brief, &cs.Incomplete,
-		&cs.IssueNumber)
+		&cs.Overlap, &cs.IssueNumber)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
