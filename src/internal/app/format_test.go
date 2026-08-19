@@ -133,6 +133,35 @@ func TestContinueText(t *testing.T) {
 	}
 }
 
+// TestPlainText: разметка комментария разработчика не доезжает до автора сырой.
+// Telegram markdown не рендерит, а parse_mode включать нельзя - текст приходит из
+// GitHub, и непарная звёздочка уронила бы отправку.
+func TestPlainText(t *testing.T) {
+	got := plainText(strings.Join([]string{
+		"## Разбор",
+		"**Причина закрытия** проставляется в `amo_deal`.",
+		"| Причина | Когда |",
+		"| --- | --- |",
+		"| Отказ | лид отказался |",
+		"Детали - [в тикете](https://example.invalid/issues/68).",
+	}, "\n"))
+
+	for _, mark := range []string{"##", "**", "`", "| ---", "]("} {
+		if strings.Contains(got, mark) {
+			t.Errorf("разметка %q осталась в тексте:\n%s", mark, got)
+		}
+	}
+	if !strings.Contains(got, "Отказ - лид отказался") {
+		t.Errorf("строка таблицы не стала перечислением:\n%s", got)
+	}
+	if !strings.Contains(got, "https://example.invalid/issues/68") {
+		t.Errorf("адрес ссылки потерян:\n%s", got)
+	}
+	if !strings.Contains(got, "Разбор") || !strings.Contains(got, "amo_deal") {
+		t.Errorf("чистка съела текст:\n%s", got)
+	}
+}
+
 // TestCardFitsOneMessage: карточка помещается в одно сообщение даже когда
 // комментарий разработчика - многостраничный разбор. Иначе Telegram получает
 // карточку двумя сообщениями, и вторым автору приходит обрывок комментария.

@@ -2014,11 +2014,11 @@ func cancelOffered(t *Ticket, userID int64) bool {
 // уезжала автору двумя, вторым - обрывок комментария.
 const cardComment = 600
 
-// cutForCard готовит длинный текст к показу в карточке: снимает markdown-заголовки
-// и режет хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
+// cutForCard готовит длинный текст к показу в карточке: снимает markdown и режет
+// хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
 // полный текст живёт в issue - ссылка стоит в той же карточке.
 func cutForCard(text string, limit int) string {
-	text = plainSections(strings.TrimSpace(text))
+	text = plainText(strings.TrimSpace(text))
 	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
