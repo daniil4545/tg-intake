@@ -1037,7 +1037,7 @@ func TestPrefixStable(t *testing.T) {
 	i := newTestInterview(t, cases, 3)
 	cs := startInterview(t, cases, 6004, 1)
 
-	first, err := i.dialog(ctx, cs, i.askPrefix)
+	first, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		t.Fatalf("dialog: %v", err)
 	}
@@ -1052,7 +1052,7 @@ func TestPrefixStable(t *testing.T) {
 		t.Fatalf("add answer: %v", err)
 	}
 
-	second, err := i.dialog(ctx, reload(t, cases, cs.ID), i.askPrefix)
+	second, _, err := i.dialog(ctx, reload(t, cases, cs.ID), i.askPrefix)
 	if err != nil {
 		t.Fatalf("dialog after round: %v", err)
 	}

@@ -191,7 +191,7 @@ func (l *Lookup) pick(ctx context.Context, project Project, docs []DocFile, hist
 
 	var out lookupPick
 	messages := lookupMessages(pickPrefix, project.Context, treeMessage(docs), history)
-	if err := l.complete(ctx, stepPick, messages, pickSchema, &out); err != nil {
+	if err := complete(ctx, l.llm, l.model, stepPick, pickSchema, messages, &out); err != nil {
 		return nil, 0, err
 	}
 
@@ -224,8 +224,9 @@ func (l *Lookup) load(ctx context.Context, cs *Case, project Project, ref string
 // askAnswer - ход ответа по скачанным файлам с проверкой вывода модели.
 func (l *Lookup) askAnswer(ctx context.Context, cs *Case, project Project, loaded []docText, history []Message) (lookupAnswer, error) {
 	var out lookupAnswer
-	messages := lookupMessages(answerPrefix, project.Context, docsMessage(loaded), history)
-	if err := l.complete(ctx, stepAnswer, messages, answerSchema, &out); err != nil {
+	messages := lookupMessages(answerPrefix, project.Context,
+		docsMessage(loaded, "Содержимое отобранных файлов:"), history)
+	if err := complete(ctx, l.llm, l.model, stepAnswer, answerSchema, messages, &out); err != nil {
 		return lookupAnswer{}, err
 	}
 
@@ -238,14 +239,15 @@ func (l *Lookup) askAnswer(ctx context.Context, cs *Case, project Project, loade
 	return checked, nil
 }
 
-// complete зовёт модель и разбирает ответ. Повтора на невалидный ответ нет:
-// схема strict, а смысл проверяет checkAnswer - непригодный ответ становится
-// честным «этого в документации нет», а не вторым вызовом.
-func (l *Lookup) complete(ctx context.Context, step string, messages []Message, schema json.RawMessage, out any) error {
-	raw, err := l.llm.Complete(ctx, Request{
+// complete зовёт диалоговую модель по схеме и разбирает ответ. Повтора на
+// невалидный ответ нет: схема strict, а смысл проверяет вызывающий - непригодный
+// ответ становится честным «не нашёл», а не второй генерацией.
+func complete(ctx context.Context, llm *OpenRouter, model DialogModel, step string,
+	schema json.RawMessage, messages []Message, out any) error {
+	raw, err := llm.Complete(ctx, Request{
 		Step:       step,
-		Model:      l.model.Name,
-		Reasoning:  l.model.Reasoning,
+		Model:      model.Name,
+		Reasoning:  model.Reasoning,
 		MaxTokens:  llmMaxTokens,
 		Messages:   messages,
 		SchemaName: step,
@@ -448,14 +450,16 @@ func treeMessage(docs []DocFile) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// docsMessage - волатильная часть хода ответа: содержимое отобранных файлов.
-func docsMessage(loaded []docText) string {
+// docsMessage - волатильная часть: содержимое прочитанных файлов. Заголовок
+// параметром: у отбора это «отобранные файлы», у сверки - выдержки из четырёх
+// известных документов, которые никто не выбирал.
+func docsMessage(loaded []docText, header string) string {
 	if len(loaded) == 0 {
 		return "Прочитать не удалось ни одного файла документации."
 	}
 
 	var b strings.Builder
-	b.WriteString("Содержимое отобранных файлов:\n")
+	b.WriteString(header + "\n")
 	for _, d := range loaded {
 		fmt.Fprintf(&b, "\n### %s\n\n%s\n", d.Path, d.Text)
 	}
