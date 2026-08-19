@@ -37,6 +37,10 @@ type watched struct {
 	commentID int64
 }
 
+// watchProject - потолок одного проекта в обходе. Два запроса к GitHub с
+// повторами укладываются в него, а зависший проект не забирает время остальных.
+const watchProject = 45 * time.Second
+
 // Run - один обход всех активных проектов. Отказ по проекту логируется и не
 // останавливает остальные: недоступный репозиторий не должен глушить чужие
 // новости.
@@ -49,8 +53,14 @@ func (w *Watch) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := w.project(ctx, p); err != nil {
-			w.log.Warn("watch_failed", "project", p.Slug, "error", err)
+		// Свой потолок на проект: без него медленный GitHub на первом проекте
+		// съедал бы бюджет тика целиком, и последние по алфавиту проекты
+		// голодали бы каждый раз, а не один тик.
+		one, cancel := context.WithTimeout(ctx, watchProject)
+		err := w.project(one, p)
+		cancel()
+		if err != nil {
+			w.log.Warn("watch_project_failed", "project", p.Slug, "error", err)
 		}
 	}
 	return nil
@@ -98,9 +108,10 @@ func (w *Watch) project(ctx context.Context, p Project) error {
 	for _, comment := range comments {
 		// Граница двигается по всем рассмотренным, а не только по доставленным:
 		// иначе комментарии по чужим тикетам оставались бы в окне навсегда и
-		// каждый тик перечитывал их заново.
-		if comment.CreatedAt.After(border) {
-			border = comment.CreatedAt
+		// каждый тик перечитывал их заново. Время правки, а не создания: since у
+		// GitHub считает по нему же.
+		if comment.UpdatedAt.After(border) {
+			border = comment.UpdatedAt
 		}
 		// Комментарий по тикету, которого нет в базе: issue заведён в
 		// репозитории руками, адресата у новости нет.

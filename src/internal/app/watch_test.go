@@ -117,14 +117,17 @@ func TestWatchTellsAboutComment(t *testing.T) {
 		t.Fatalf("set border: %v", err)
 	}
 
-	created := time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
+	// Комментарий заведён раньше границы окна, а правился после неё: since у
+	// GitHub считает по времени правки, и граница обязана двигаться по нему же.
+	created := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	updated := time.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339)
 	watch := newTestWatch(t, pool, githubStub(t, map[string]string{
 		"GET /repos/daniil4545/tg-intake/issues/comments": fmt.Sprintf(`[
-			{"id": 501, "body": "Смотрю", "created_at": %q,
+			{"id": 501, "body": "Смотрю", "created_at": %q, "updated_at": %q,
 			 "issue_url": "https://api.github.com/repos/daniil4545/tg-intake/issues/73"},
-			{"id": 502, "body": "Чужой тикет", "created_at": %q,
+			{"id": 502, "body": "Чужой тикет", "created_at": %q, "updated_at": %q,
 			 "issue_url": "https://api.github.com/repos/daniil4545/tg-intake/issues/999"}]`,
-			created, created),
+			created, updated, created, updated),
 	}).URL)
 	for range 2 {
 		if err := watch.Run(ctx); err != nil {
