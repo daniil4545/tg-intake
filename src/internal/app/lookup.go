@@ -416,7 +416,9 @@ func answerBody(out lookupAnswer) string {
 		return "В документации проекта ответа на это нет. Если нужна правка или " +
 			"что-то не работает - нажмите «Создать тикет»."
 	}
-	return out.Answer
+	// Разметку снимаем здесь же, где текст модели превращается в реплику бота:
+	// Telegram markdown не рендерит, а parse_mode на чужом тексте роняет отправку.
+	return plainText(out.Answer)
 }
 
 func withLinks(body string, links []string) string {

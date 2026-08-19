@@ -404,7 +404,7 @@ func (n *Normalizer) reopen(ctx context.Context, cs *Case, jobID int64) error {
 }
 
 func protocolMessage(protocol string) string {
-	return "Разобрал материал. Вот что получилось:\n\n" + protocol +
+	return "Разобрал материал. Вот что получилось:\n\n" + plainText(protocol) +
 		"\n\nСейчас уточню недостающее."
 }
 

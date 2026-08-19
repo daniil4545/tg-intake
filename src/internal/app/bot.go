@@ -2014,6 +2014,18 @@ func cancelOffered(t *Ticket, userID int64) bool {
 // уезжала автору двумя, вторым - обрывок комментария.
 const cardComment = 600
 
+// firstSection - первый раздел саммари вместе с его названием: обычно «Какую
+// задачу это решает». Карточка тикета без краткого содержания показывает его, а
+// не начало всего тела: за пределом в 400 символов иначе оказывался хвост одного
+// раздела и обрывок следующего.
+func firstSection(body string) string {
+	body = strings.TrimSpace(body)
+	if next := strings.Index(body, "\n## "); next > 0 {
+		return body[:next]
+	}
+	return body
+}
+
 // cutForCard готовит длинный текст к показу в карточке: снимает markdown и режет
 // хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
 // полный текст живёт в issue - ссылка стоит в той же карточке.
@@ -2034,7 +2046,7 @@ func cardText(t *Ticket) string {
 	case t.Brief != "":
 		text.WriteString("\n" + t.Brief + "\n")
 	case t.Body != "":
-		text.WriteString("\n" + cutForCard(t.Body, briefLimit) + "\n")
+		text.WriteString("\n" + cutForCard(firstSection(t.Body), briefLimit) + "\n")
 	}
 	if t.Comment != "" {
 		text.WriteString("\nПоследний комментарий:\n" + cutForCard(t.Comment, cardComment) + "\n")
