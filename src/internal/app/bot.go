@@ -35,7 +35,9 @@ const (
 	botTimeout = 2 * time.Minute
 	// Потолок Bot API - 4096 символов. Протокол с разбором скриншотов его
 	// перебирает, а отказ Telegram отправил бы работу notify в повторы, и автор
-	// не увидел бы результат вовсе.
+	// не увидел бы результат вовсе. Считается рунами, а не байтами: русский текст
+	// весит по два байта на символ, и байтовый предел резал сообщения вдвое
+	// раньше, чем нужно.
 	maxMessage = 4000
 	// Пачка пересылок без активного обращения приходит за секунды; меню в
 	// ответ на неё должно быть одно, а не по числу сообщений.
@@ -619,7 +621,7 @@ func (b *Bot) finishKill(cs *Case, text string) error {
 // кусок - тот, что несёт кнопки.
 func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Message, error) {
 	for {
-		if len(text) <= maxMessage {
+		if utf8.RuneCountInString(text) <= maxMessage {
 			sent, err := b.bot.Send(to, text, opts...)
 			if err != nil {
 				return nil, fmt.Errorf("send message: %w", err)
@@ -627,12 +629,12 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Messa
 			return sent, nil
 		}
 
-		cut := strings.LastIndex(text[:maxMessage], "\n")
+		// Голова - ровно maxMessage рун; её длина в байтах и есть предел резки,
+		// потому что голова - префикс текста.
+		head := string([]rune(text)[:maxMessage])
+		cut := strings.LastIndex(head, "\n")
 		if cut <= 0 {
-			cut = maxMessage
-			for cut > 1 && !utf8.RuneStart(text[cut]) {
-				cut--
-			}
+			cut = len(head)
 		}
 		// opts только на последнем куске: иначе кнопки дублируются под каждым, и
 		// автор жмёт устаревшую копию выше по переписке.
@@ -1801,7 +1803,7 @@ func (b *Bot) showTickets(ctx context.Context, c tele.Context, project Project, 
 		markup.Data("К проектам", homeBtn.Unique)))
 	markup.Inline(rows...)
 	// Правкой длинный список не помещается: та же гвардия, что у карточки.
-	if len(text.String()) > maxMessage {
+	if utf8.RuneCountInString(text.String()) > maxMessage {
 		_, err := b.sendLong(c.Recipient(), text.String(), markup)
 		return err
 	}
@@ -1857,7 +1859,7 @@ func (b *Bot) onCard(c tele.Context) error {
 
 	// Карточка длиннее одного сообщения правкой не помещается: режем на куски
 	// и отправляем, экран списка при этом остаётся выше.
-	if len(cardText(ticket)) > maxMessage {
+	if utf8.RuneCountInString(cardText(ticket)) > maxMessage {
 		_, err := b.sendLong(c.Recipient(), cardText(ticket), markup)
 		return err
 	}
@@ -2007,17 +2009,35 @@ func cancelOffered(t *Ticket, userID int64) bool {
 	return t.UserID == userID && !t.Unavailable && !t.Status.Final
 }
 
+// cardComment - сколько комментария помещается в карточку. Разбор разработчика
+// бывает в тысячи символов: без предела карточка не влезала в одно сообщение и
+// уезжала автору двумя, вторым - обрывок комментария.
+const cardComment = 600
+
+// cutForCard готовит длинный текст к показу в карточке: снимает markdown-заголовки
+// и режет хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
+// полный текст живёт в issue - ссылка стоит в той же карточке.
+func cutForCard(text string, limit int) string {
+	text = plainSections(strings.TrimSpace(text))
+	if utf8.RuneCountInString(text) <= limit {
+		return text
+	}
+	return string([]rune(text)[:limit]) + "...\n\nПолностью - в тикете по ссылке ниже."
+}
+
 func cardText(t *Ticket) string {
 	var text strings.Builder
 	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
-	// Только краткое содержание: полное тело тикета вытесняло с экрана статус и
-	// комментарий, за которыми автор и заходит. У тикетов до появления краткого
-	// описания в карточке нет вовсе, суть читается в заголовке.
-	if t.Brief != "" {
+	// Краткое содержание, а у тикетов до его появления - начало тела: целиком тело
+	// вытесняло с экрана статус и комментарий, за которыми автор и заходит.
+	switch {
+	case t.Brief != "":
 		text.WriteString("\n" + t.Brief + "\n")
+	case t.Body != "":
+		text.WriteString("\n" + cutForCard(t.Body, briefLimit) + "\n")
 	}
 	if t.Comment != "" {
-		text.WriteString("\nПоследний комментарий:\n" + t.Comment + "\n")
+		text.WriteString("\nПоследний комментарий:\n" + cutForCard(t.Comment, cardComment) + "\n")
 	}
 	if t.URL != "" {
 		text.WriteString("\n" + t.URL)
