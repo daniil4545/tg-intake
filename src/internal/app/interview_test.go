@@ -312,7 +312,7 @@ func TestSummaryTitle(t *testing.T) {
 
 // TestSummaryBrief: разросшееся краткое содержание отклоняется - оно вытеснило
 // бы статус и комментарий за край экрана. Пустое проходит: молчание модели не
-// останавливает тикет, карточка покажет описание целиком.
+// останавливает тикет, краткое достраивается из первого раздела саммари.
 func TestSummaryBrief(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
 	cs := &Case{Kind: "bug"}
@@ -326,20 +326,27 @@ func TestSummaryBrief(t *testing.T) {
 		t.Error("краткое содержание длиннее предела принято")
 	}
 
-	// Модель промолчала: суть берётся из первого раздела, иначе тикет уйдёт без
+	// Модель промолчала: суть берётся из первого раздела готового тела - там
+	// разделы уже обезличены и расставлены по контракту. Иначе тикет уйдёт без
 	// краткого содержания, а карточка в боте покажет один заголовок.
-	silent := summaryOut{Title: title, Sections: []section{
-		{Key: "case", Text: strings.Repeat("к", briefLimit+50)},
-		{Key: "expected", Text: "должна сохраняться"}}}
-	brief := briefOf(silent)
+	body := "## Конкретный случай\n\n" + strings.Repeat("к", briefLimit+50) +
+		"\n\n## Что должно было произойти\n\nдолжна сохраняться"
+	brief := briefOf("", body)
 	if utf8.RuneCountInString(brief) != briefLimit {
 		t.Errorf("замена краткого не обрезана по пределу: %d символов", utf8.RuneCountInString(brief))
 	}
-	if !strings.HasPrefix(silent.Sections[0].Text, brief) {
-		t.Errorf("замена взята не из первого раздела: %q", brief)
+	if strings.Contains(brief, "Конкретный случай") || strings.Contains(brief, "должна сохраняться") {
+		t.Errorf("замена взята не из текста первого раздела: %q", brief)
 	}
-	if got := briefOf(summaryOut{Title: title, Brief: "Заявка не сохраняется"}); got != "Заявка не сохраняется" {
+	if got := briefOf("Заявка не сохраняется", body); got != "Заявка не сохраняется" {
 		t.Errorf("своё краткое содержание подменено: %q", got)
+	}
+
+	// Обрезка идёт после обезличивания: телефон, разорванный границей среза, не
+	// совпал бы с шаблоном и уехал бы в тикет.
+	dirty := "## Случай\n\n" + strings.Repeat("к", briefLimit-8) + " +7 916 123-45-67 хвост"
+	if got := briefOf("", dirty); strings.Contains(got, "916 123") {
+		t.Errorf("телефон пережил обрезку краткого содержания: %q", got)
 	}
 }
 
