@@ -2014,27 +2014,30 @@ func cancelOffered(t *Ticket, userID int64) bool {
 // уезжала автору двумя, вторым - обрывок комментария.
 const cardComment = 600
 
-// shortComment готовит комментарий к показу: снимает markdown-заголовки и режет
-// хвост. Полный текст живёт в issue, ссылка на него стоит в той же карточке.
-func shortComment(text string) string {
+// cutForCard готовит длинный текст к показу в карточке: снимает markdown-заголовки
+// и режет хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
+// полный текст живёт в issue - ссылка стоит в той же карточке.
+func cutForCard(text string, limit int) string {
 	text = plainSections(strings.TrimSpace(text))
-	if utf8.RuneCountInString(text) <= cardComment {
+	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
-	return string([]rune(text)[:cardComment]) + "...\n\nПолностью - в тикете по ссылке ниже."
+	return string([]rune(text)[:limit]) + "...\n\nПолностью - в тикете по ссылке ниже."
 }
 
 func cardText(t *Ticket) string {
 	var text strings.Builder
 	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
-	// Только краткое содержание: полное тело тикета вытесняло с экрана статус и
-	// комментарий, за которыми автор и заходит. У тикетов до появления краткого
-	// описания в карточке нет вовсе, суть читается в заголовке.
-	if t.Brief != "" {
+	// Краткое содержание, а у тикетов до его появления - начало тела: целиком тело
+	// вытесняло с экрана статус и комментарий, за которыми автор и заходит.
+	switch {
+	case t.Brief != "":
 		text.WriteString("\n" + t.Brief + "\n")
+	case t.Body != "":
+		text.WriteString("\n" + cutForCard(t.Body, briefLimit) + "\n")
 	}
 	if t.Comment != "" {
-		text.WriteString("\nПоследний комментарий:\n" + shortComment(t.Comment) + "\n")
+		text.WriteString("\nПоследний комментарий:\n" + cutForCard(t.Comment, cardComment) + "\n")
 	}
 	if t.URL != "" {
 		text.WriteString("\n" + t.URL)
