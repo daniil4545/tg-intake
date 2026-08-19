@@ -27,6 +27,9 @@ const (
 	// третий автор читает как испорченную пластинку.
 	maxAsks  = 2
 	maxTitle = 80
+	// Предел краткого содержания. Два-три предложения о сути помещаются с
+	// запасом; всё, что длиннее, - уже пересказ разделов.
+	briefLimit = 400
 )
 
 var (
@@ -104,6 +107,7 @@ type section struct {
 
 type summaryOut struct {
 	Title    string    `json:"title"`
+	Brief    string    `json:"brief"`
 	Sections []section `json:"sections"`
 }
 
@@ -152,6 +156,7 @@ var summarySchema = json.RawMessage(`{
 	"type": "object",
 	"properties": {
 		"title": {"type": "string"},
+		"brief": {"type": "string"},
 		"sections": {
 			"type": "array",
 			"items": {
@@ -162,7 +167,7 @@ var summarySchema = json.RawMessage(`{
 			}
 		}
 	},
-	"required": ["title", "sections"],
+	"required": ["title", "brief", "sections"],
 	"additionalProperties": false
 }`)
 
@@ -558,6 +563,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	}
 
 	title := scrubContacts(strings.TrimSpace(out.Title))
+	brief := scrubContacts(strings.TrimSpace(out.Brief))
 	body := i.renderSections(cs, out.Sections)
 	// Недобран контракт или нет, решают обязательные пункты: необязательный
 	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
@@ -582,9 +588,9 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		}
 
 		tag, err := tx.Exec(ctx, `
-			UPDATE cases SET status = 'summary', title = $2, summary = $3, incomplete = $4,
-			                 updated_at = now()
-			WHERE id = $1 AND status = 'interview'`, cs.ID, title, body, incomplete)
+			UPDATE cases SET status = 'summary', title = $2, summary = $3, brief = $4,
+			                 incomplete = $5, updated_at = now()
+			WHERE id = $1 AND status = 'interview'`, cs.ID, title, body, brief, incomplete)
 		if err != nil {
 			return fmt.Errorf("save summary of case %s: %w", cs.ID, err)
 		}
@@ -598,7 +604,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// модель обязана видеть целиком.
 		if err := addEvent(ctx, tx, cs.ID, "summary_ready", map[string]any{
 			"incomplete": incomplete, "sections": len(out.Sections),
-			"title": title, "body": body,
+			"title": title, "brief": brief, "body": body,
 		}); err != nil {
 			return err
 		}
@@ -606,7 +612,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// переписанное саммари упёрлось бы в ключ прошлого - автор не увидел бы
 		// собственную правку.
 		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			summaryMessage(title, body, i.gapTitles(cs), incomplete), keysSummary)
+			summaryMessage(title, brief, body, i.gapTitles(cs), incomplete), keysSummary)
 	})
 	if err != nil {
 		return err
@@ -615,6 +621,9 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		return nil
 	}
 
+	if brief == "" {
+		i.log.Warn("brief_missing", "case_id", cs.ID)
+	}
 	i.log.Info("summary_ready", "case_id", cs.ID, "incomplete", incomplete,
 		"gap_keys", strings.Join(cs.Gaps, ","),
 		"sections", len(out.Sections), "chars", utf8.RuneCountInString(body))
@@ -666,6 +675,15 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 	// было некому.
 	if word := strings.ToLower(strings.Fields(title)[0]); slices.Contains(titleStopWords, strings.Trim(word, ":-")) {
 		return fmt.Errorf("summary title starts with %q", word)
+	}
+
+	// Разросшееся краткое содержание перестаёт быть кратким и вытесняет статус с
+	// комментарием за край экрана. Пустое не отклоняется: молчание модели не
+	// имеет права остановить тикет (решение 2026-08-09), карточка в этом случае
+	// показывает описание целиком, а пробел виден в логе.
+	brief := strings.TrimSpace(out.Brief)
+	if utf8.RuneCountInString(brief) > briefLimit {
+		return fmt.Errorf("summary brief is %d runes long", utf8.RuneCountInString(brief))
 	}
 
 	for _, s := range out.Sections {
@@ -1136,10 +1154,15 @@ func questionList(questions []Question) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func summaryMessage(title, body string, gaps []string, incomplete bool) string {
+func summaryMessage(title, brief, body string, gaps []string, incomplete bool) string {
 	var b strings.Builder
 	b.WriteString("Вот что уйдёт в тикет.\n\n")
 	b.WriteString(title + "\n\n")
+	// Краткое содержание показывается вместе с разделами: оно уедет в тикет, а
+	// подтверждает автор именно то, что уйдёт.
+	if brief != "" {
+		b.WriteString(brief + "\n\n")
+	}
 	b.WriteString(plainSections(body))
 	if len(gaps) > 0 {
 		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") + ".")

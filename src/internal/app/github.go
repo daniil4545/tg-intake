@@ -36,6 +36,13 @@ const (
 	githubScan = 30
 )
 
+// Порядок в списке issue. По созданию ходят просмотр и поиск маркера, по
+// изменению - слежение: тикет, которому сменили метку, свежим не становится.
+const (
+	sortCreated = "created"
+	sortUpdated = "updated"
+)
+
 // GitHub - клиент Issues API на net/http, без SDK (раздел 1 architecture.md).
 // Клиента два: рабочий с повторами для очереди и быстрый для хендлеров, где
 // отказ GitHub морозил бы бота (раздел 6). Прокси нет: GitHub идёт напрямую.
@@ -186,7 +193,7 @@ func (g *GitHub) CreateIssue(ctx context.Context, p Project, title, body string,
 // Список, а не поиск: индекс search обновляется с задержкой, и только что
 // созданный issue он не покажет, а список отдаёт его сразу.
 func (g *GitHub) FindIssue(ctx context.Context, p Project, marker string) (int, string, error) {
-	issues, err := g.listIssues(ctx, p, githubScan, false)
+	issues, err := g.listIssues(ctx, p, githubScan, sortCreated, false)
 	if err != nil {
 		return 0, "", err
 	}
@@ -223,10 +230,12 @@ func (i Issue) LabelNames() []string {
 }
 
 // listIssues читает последние тикеты репозитория. Pull request'ы отсеиваются
-// здесь, чтобы ни один вызывающий не забыл про них.
-func (g *GitHub) listIssues(ctx context.Context, p Project, limit int, fast bool) ([]Issue, error) {
-	path := fmt.Sprintf("/repos/%s/%s/issues?state=all&per_page=%d&sort=created&direction=desc",
-		p.Owner, p.Repo, limit)
+// здесь, чтобы ни один вызывающий не забыл про них. sort выбирает, какие
+// «последние» нужны: по созданию - просмотру и поиску маркера, по изменению -
+// слежению.
+func (g *GitHub) listIssues(ctx context.Context, p Project, limit int, sort string, fast bool) ([]Issue, error) {
+	path := fmt.Sprintf("/repos/%s/%s/issues?state=all&per_page=%d&sort=%s&direction=desc",
+		p.Owner, p.Repo, limit, sort)
 	raw, err := g.get(ctx, path, fast)
 	if err != nil {
 		return nil, err
@@ -247,7 +256,14 @@ func (g *GitHub) listIssues(ctx context.Context, p Project, limit int, fast bool
 
 // ListIssues - список для просмотра: короткий бюджет, без повторов.
 func (g *GitHub) ListIssues(ctx context.Context, p Project, limit int) ([]Issue, error) {
-	return g.listIssues(ctx, p, limit, true)
+	return g.listIssues(ctx, p, limit, sortCreated, true)
+}
+
+// ListUpdated - тикеты в порядке последнего изменения: слежению нужны те, где
+// метки могли поменяться, а не самые новые. Идёт рабочим клиентом: это фон, и
+// пара лишних секунд ему ничего не стоит.
+func (g *GitHub) ListUpdated(ctx context.Context, p Project, limit int) ([]Issue, error) {
+	return g.listIssues(ctx, p, limit, sortUpdated, false)
 }
 
 // GetIssue читает один тикет. fast решает, чей это вызов: просмотр из хендлера
@@ -299,6 +315,57 @@ func (g *GitHub) LastComment(ctx context.Context, p Project, number int) (string
 	}
 	g.log.Warn("comments_truncated", "repo", p.Owner+"/"+p.Repo, "issue", number)
 	return last, nil
+}
+
+// Comment - комментарий тикета в том виде, в каком его читает слежение. Номер
+// issue отдельным полем не приходит: в ответе есть только адрес, из него номер и
+// берётся.
+type Comment struct {
+	ID        int64     `json:"id"`
+	Body      string    `json:"body"`
+	IssueURL  string    `json:"issue_url"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// IssueNumber - номер тикета из адреса комментария. Ноль означает адрес, который
+// разобрать не удалось: такой комментарий слежение пропускает, а не гадает.
+func (c Comment) IssueNumber() int {
+	tail := c.IssueURL[strings.LastIndex(c.IssueURL, "/")+1:]
+	number, err := strconv.Atoi(tail)
+	if err != nil {
+		return 0
+	}
+	return number
+}
+
+// ListComments - комментарии всего репозитория, изменённые после since. Один
+// запрос на проект вместо запроса на каждый тикет: слежению нужны новые
+// комментарии, а не переписка конкретного issue.
+func (g *GitHub) ListComments(ctx context.Context, p Project, since time.Time) ([]Comment, error) {
+	const perPage = 100
+	var all []Comment
+	for page := 1; page <= githubCommentPages; page++ {
+		path := fmt.Sprintf(
+			"/repos/%s/%s/issues/comments?since=%s&per_page=%d&page=%d&sort=created&direction=asc",
+			p.Owner, p.Repo, url.QueryEscape(since.UTC().Format(time.RFC3339)), perPage, page)
+		raw, err := g.get(ctx, path, false)
+		if err != nil {
+			return nil, err
+		}
+
+		var comments []Comment
+		if err := json.Unmarshal(raw, &comments); err != nil {
+			return nil, fmt.Errorf("decode repo comments: %w", err)
+		}
+		all = append(all, comments...)
+		if len(comments) < perPage {
+			return all, nil
+		}
+	}
+	// Усечение не ошибка: граница окна не двинется дальше разобранного, и
+	// остаток доедет следующим тиком.
+	g.log.Warn("repo_comments_truncated", "repo", p.Owner+"/"+p.Repo, "since", since)
+	return all, nil
 }
 
 // AddLabel добавляет метку, не трогая остальные: PUT затёр бы всё, включая
@@ -572,6 +639,12 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 func (p *Publisher) body(cs *Case, author User, links []string, marker string) string {
 	var b strings.Builder
 	b.WriteString("Автор: " + authorName(author) + "\n\n")
+	// Кратко идёт первым разделом: тот, кто возьмёт тикет, читает суть до
+	// разделов контракта. Пусто оно только у тикетов, заведённых до появления
+	// поля.
+	if cs.Brief != "" {
+		b.WriteString("## Кратко\n\n" + cs.Brief + "\n\n")
+	}
 	b.WriteString(cs.Summary)
 
 	// Адреса из сырья идут отдельным разделом и целиком: тот, кто возьмёт тикет,

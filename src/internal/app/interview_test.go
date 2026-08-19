@@ -294,17 +294,35 @@ func TestSummaryTitle(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
 	cs := &Case{Kind: "bug"}
 
-	if err := i.checkSummary(cs, summaryOut{Title: "Заявка не сохраняется"}); err != nil {
+	const brief = "Заявка не сохраняется после нажатия «Готово», данные теряются."
+	if err := i.checkSummary(cs, summaryOut{Title: "Заявка не сохраняется", Brief: brief}); err != nil {
 		t.Errorf("годный заголовок отклонён: %v", err)
 	}
 	for _, title := range []string{"Проблема: заявка не сохраняется", "Баг в форме заявки",
 		"просьба добавить фильтр"} {
-		if err := i.checkSummary(cs, summaryOut{Title: title}); err == nil {
+		if err := i.checkSummary(cs, summaryOut{Title: title, Brief: brief}); err == nil {
 			t.Errorf("заголовок %q принят", title)
 		}
 	}
-	if err := i.checkSummary(cs, summaryOut{Title: "   "}); err == nil {
+	if err := i.checkSummary(cs, summaryOut{Title: "   ", Brief: brief}); err == nil {
 		t.Error("пустой заголовок принят")
+	}
+}
+
+// TestSummaryBrief: разросшееся краткое содержание отклоняется - оно вытеснило
+// бы статус и комментарий за край экрана. Пустое проходит: молчание модели не
+// останавливает тикет, карточка покажет описание целиком.
+func TestSummaryBrief(t *testing.T) {
+	i := newTestInterview(t, nil, 3)
+	cs := &Case{Kind: "bug"}
+	title := "Заявка не сохраняется"
+
+	if err := i.checkSummary(cs, summaryOut{Title: title, Brief: "  "}); err != nil {
+		t.Errorf("пустое краткое содержание остановило тикет: %v", err)
+	}
+	long := strings.Repeat("и", briefLimit+1)
+	if err := i.checkSummary(cs, summaryOut{Title: title, Brief: long}); err == nil {
+		t.Error("краткое содержание длиннее предела принято")
 	}
 }
 
