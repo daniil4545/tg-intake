@@ -16,8 +16,9 @@ import (
 
 var testStatuses = Statuses{
 	{Label: "status:cancelled", Title: "Отменён", Final: true},
-	{Label: "status:prod", Title: "В проде", Final: true},
-	{Label: "status:in-progress", Title: "В работе"},
+	{Label: "status:prod", Title: "В проде", Final: true, Notify: true},
+	{Label: "status:in-progress", Title: "В работе", Notify: true},
+	{Label: "status:dev", Title: "В dev"},
 	{Label: "status:new", Title: "Заведён"},
 }
 
@@ -35,7 +36,7 @@ func TestListSkipsPullRequests(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7001, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestListBackfillsOldTicket(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7009, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -83,7 +84,7 @@ func TestListSurvivesGitHubError(t *testing.T) {
 	t.Cleanup(server.Close)
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7002, 0)
 	if err != nil {
 		t.Fatalf("отказ GitHub уронил список: %v", err)
 	}
@@ -332,7 +333,7 @@ func TestListByProject(t *testing.T) {
 	}
 
 	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
-	list, err := tickets.List(context.Background(), testProject(t, pool))
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7006, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
