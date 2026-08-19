@@ -19,6 +19,30 @@ func testLog(t *testing.T) *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// TestIssueBodyStartsWithBrief: краткое содержание обязано доехать до тела
+// тикета первым разделом - его читает тот, кто возьмёт задачу, и по нему же
+// автор узнаёт свой тикет в боте. Молчание модели тикет не останавливает, но
+// тогда раздела нет вовсе, а не пустая рубрика.
+func TestIssueBodyStartsWithBrief(t *testing.T) {
+	publisher := NewPublisher(nil, nil, testRules(t), testLog(t), 0)
+	cs := &Case{Kind: "bug", Brief: "Заявка не сохраняется у менеджеров с утра.",
+		Summary: "## Случай\n\nФорма гасит кнопку"}
+
+	body := publisher.body(cs, User{First: "Иван"}, nil, "<!-- marker -->")
+	brief := strings.Index(body, "## Кратко")
+	if brief < 0 || !strings.Contains(body, cs.Brief) {
+		t.Fatalf("краткого содержания нет в теле тикета:\n%s", body)
+	}
+	if section := strings.Index(body, "## Случай"); section < brief {
+		t.Errorf("кратко идёт не первым разделом:\n%s", body)
+	}
+
+	cs.Brief = ""
+	if strings.Contains(publisher.body(cs, User{First: "Иван"}, nil, "<!-- marker -->"), "## Кратко") {
+		t.Error("пустое краткое содержание оставило в тикете пустую рубрику")
+	}
+}
+
 // TestTreeDocsFiltersMarkdown: отбор Lookup работает только с md, каталоги и
 // прочие расширения в дереве репозитория ему не нужны.
 func TestTreeDocsFiltersMarkdown(t *testing.T) {

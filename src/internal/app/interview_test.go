@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -323,6 +324,22 @@ func TestSummaryBrief(t *testing.T) {
 	long := strings.Repeat("и", briefLimit+1)
 	if err := i.checkSummary(cs, summaryOut{Title: title, Brief: long}); err == nil {
 		t.Error("краткое содержание длиннее предела принято")
+	}
+
+	// Модель промолчала: суть берётся из первого раздела, иначе тикет уйдёт без
+	// краткого содержания, а карточка в боте покажет один заголовок.
+	silent := summaryOut{Title: title, Sections: []section{
+		{Key: "case", Text: strings.Repeat("к", briefLimit+50)},
+		{Key: "expected", Text: "должна сохраняться"}}}
+	brief := briefOf(silent)
+	if utf8.RuneCountInString(brief) != briefLimit {
+		t.Errorf("замена краткого не обрезана по пределу: %d символов", utf8.RuneCountInString(brief))
+	}
+	if !strings.HasPrefix(silent.Sections[0].Text, brief) {
+		t.Errorf("замена взята не из первого раздела: %q", brief)
+	}
+	if got := briefOf(summaryOut{Title: title, Brief: "Заявка не сохраняется"}); got != "Заявка не сохраняется" {
+		t.Errorf("своё краткое содержание подменено: %q", got)
 	}
 }
 
