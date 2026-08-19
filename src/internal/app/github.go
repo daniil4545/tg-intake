@@ -321,10 +321,13 @@ func (g *GitHub) LastComment(ctx context.Context, p Project, number int) (string
 // issue отдельным полем не приходит: в ответе есть только адрес, из него номер и
 // берётся.
 type Comment struct {
-	ID        int64     `json:"id"`
-	Body      string    `json:"body"`
-	IssueURL  string    `json:"issue_url"`
-	CreatedAt time.Time `json:"created_at"`
+	ID       int64  `json:"id"`
+	Body     string `json:"body"`
+	IssueURL string `json:"issue_url"`
+	// UpdatedAt, а не время создания, двигает границу окна: since у GitHub
+	// фильтрует именно по нему, и правка старого комментария иначе держала бы
+	// окно на месте вечно.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // IssueNumber - номер тикета из адреса комментария. Ноль означает адрес, который
@@ -585,9 +588,13 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 
 	published := false
 	err = p.cases.inTx(ctx, func(tx pgx.Tx) error {
+		// told_status ставится здесь, а не первым тиком слежения: иначе метка,
+		// смененная в первые пять минут, была бы принята за первое наблюдение и
+		// автора не разбудила бы.
 		tag, err := tx.Exec(ctx, `
-			UPDATE cases SET status = 'published', issue_number = $2, issue_url = $3, updated_at = now()
-			WHERE id = $1 AND status = 'publishing'`, cs.ID, number, url)
+			UPDATE cases SET status = 'published', issue_number = $2, issue_url = $3,
+			                 told_status = $4, updated_at = now()
+			WHERE id = $1 AND status = 'publishing'`, cs.ID, number, url, labelNew)
 		if err != nil {
 			return fmt.Errorf("publish case %s: %w", cs.ID, err)
 		}

@@ -27,8 +27,9 @@ const sweepPeriod = time.Hour
 const watchPeriod = 5 * time.Minute
 
 // watchBudget - потолок одного обхода. Тик, упёршийся в недоступный GitHub,
-// обязан закончиться раньше следующего, иначе обходы наложились бы.
-const watchBudget = 2 * time.Minute
+// обязан закончиться раньше следующего, иначе обходы наложились бы. Внутри у
+// каждого проекта свой потолок, и обход рассчитан на то, что все они уместятся.
+const watchBudget = 4 * time.Minute
 
 // githubCheckBudget - потолок стартовой проверки прав по всем проектам. Меньше
 // запаса healthcheck на старт (45 с), чтобы недоступный GitHub не делал контур
@@ -203,7 +204,7 @@ func watchTickets(ctx context.Context, watch *app.Watch, log *slog.Logger) {
 		case <-ticker.C:
 			tick, cancel := context.WithTimeout(ctx, watchBudget)
 			if err := watch.Run(tick); err != nil {
-				log.Error("watch_failed", "error", err)
+				log.Error("watch_tick_failed", "error", err)
 			}
 			cancel()
 		}
