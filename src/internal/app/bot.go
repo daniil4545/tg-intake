@@ -631,7 +631,7 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Messa
 
 		// Голова - ровно maxMessage рун; её длина в байтах и есть предел резки,
 		// потому что голова - префикс текста.
-		head := string([]rune(text)[:maxMessage])
+		head := cutRunes(text, maxMessage)
 		cut := strings.LastIndex(head, "\n")
 		if cut <= 0 {
 			cut = len(head)
@@ -2014,18 +2014,6 @@ func cancelOffered(t *Ticket, userID int64) bool {
 // уезжала автору двумя, вторым - обрывок комментария.
 const cardComment = 600
 
-// firstSection - первый раздел саммари вместе с его названием: обычно «Какую
-// задачу это решает». Карточка тикета без краткого содержания показывает его, а
-// не начало всего тела: за пределом в 400 символов иначе оказывался хвост одного
-// раздела и обрывок следующего.
-func firstSection(body string) string {
-	body = strings.TrimSpace(body)
-	if next := strings.Index(body, "\n## "); next > 0 {
-		return body[:next]
-	}
-	return body
-}
-
 // cutForCard готовит длинный текст к показу в карточке: снимает markdown и режет
 // хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
 // полный текст живёт в issue - ссылка стоит в той же карточке.
@@ -2044,7 +2032,7 @@ func cardText(t *Ticket) string {
 	// вытесняло с экрана статус и комментарий, за которыми автор и заходит.
 	switch {
 	case t.Brief != "":
-		text.WriteString("\n" + t.Brief + "\n")
+		text.WriteString("\n" + cutForCard(t.Brief, briefLimit) + "\n")
 	case t.Body != "":
 		text.WriteString("\n" + cutForCard(firstSection(t.Body), briefLimit) + "\n")
 	}

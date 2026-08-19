@@ -468,7 +468,7 @@ func cutDoc(text string, limit int) string {
 	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
-	return string([]rune(text)[:limit]) + "\n\n[файл обрезан]"
+	return cutRunes(text, limit) + "\n\n[файл обрезан]"
 }
 
 // askHistory восстанавливает разговор режима вопроса из журнала: реплики автора
