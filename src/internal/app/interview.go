@@ -563,8 +563,8 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	}
 
 	title := scrubContacts(strings.TrimSpace(out.Title))
-	brief := briefOf(out)
 	body := i.renderSections(cs, out.Sections)
+	brief := briefOf(out.Brief, body)
 	// Недобран контракт или нет, решают обязательные пункты: необязательный
 	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
 	// иначе её носил бы каждый тикет.
@@ -679,8 +679,8 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 
 	// Разросшееся краткое содержание перестаёт быть кратким и вытесняет статус с
 	// комментарием за край экрана. Пустое не отклоняется: молчание модели не
-	// имеет права остановить тикет (решение 2026-08-09), карточка в этом случае
-	// показывает описание целиком, а пробел виден в логе.
+	// имеет права остановить тикет (решение 2026-08-09), краткое достраивается из
+	// первого раздела, а пробел виден в логе.
 	brief := strings.TrimSpace(out.Brief)
 	if utf8.RuneCountInString(brief) > briefLimit {
 		return fmt.Errorf("summary brief is %d runes long", utf8.RuneCountInString(brief))
@@ -1177,16 +1177,38 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool) s
 	return b.String()
 }
 
-// briefOf - краткое содержание из ответа модели. Молчание модели не оставляет
-// тикет без сути: краткое берётся из начала первого раздела. Пустая рубрика в
-// теле issue и карточка без описания хуже пересказа, а останавливать тикет из-за
-// молчания нельзя - решение 2026-08-09.
-func briefOf(out summaryOut) string {
-	brief := strings.TrimSpace(out.Brief)
-	if brief == "" && len(out.Sections) > 0 {
-		brief = cutRunes(strings.TrimSpace(out.Sections[0].Text), briefLimit)
+// briefOf - краткое содержание: своё от модели или начало первого раздела
+// саммари, когда модель промолчала. Молчание не имеет права остановить тикет
+// (решение 2026-08-09), а пустая рубрика в issue и карточка без описания хуже
+// пересказа.
+//
+// Замена берётся из готового тела, а не из сырых разделов ответа: в теле они уже
+// обезличены и расставлены по контракту. Резать раньше обезличивания нельзя -
+// телефон, разорванный границей среза, перестал бы совпадать с шаблоном и уехал
+// бы в тикет.
+func briefOf(brief, body string) string {
+	if text := strings.TrimSpace(brief); text != "" {
+		return scrubContacts(text)
 	}
-	return scrubContacts(brief)
+	first := firstSection(body)
+	// Заголовок раздела в краткое содержание не идёт: рубрика в issue уже
+	// называется «Кратко», а карточка печатает текст без названия поля.
+	if _, text, found := strings.Cut(first, "\n\n"); found {
+		first = text
+	}
+	return cutRunes(strings.TrimSpace(first), briefLimit)
+}
+
+// firstSection - первый раздел саммари вместе с его названием: обычно «Какую
+// задачу это решает». Карточка тикета без краткого содержания показывает его, а
+// не начало всего тела: за пределом в 400 символов иначе оказывался хвост одного
+// раздела и обрывок следующего.
+func firstSection(body string) string {
+	body = strings.TrimSpace(body)
+	if next := strings.Index(body, "\n## "); next > 0 {
+		return body[:next]
+	}
+	return body
 }
 
 // cutRunes режет текст по числу символов, а не байтов: русская строка весит по

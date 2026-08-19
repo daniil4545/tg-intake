@@ -631,7 +631,7 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Messa
 
 		// Голова - ровно maxMessage рун; её длина в байтах и есть предел резки,
 		// потому что голова - префикс текста.
-		head := string([]rune(text)[:maxMessage])
+		head := cutRunes(text, maxMessage)
 		cut := strings.LastIndex(head, "\n")
 		if cut <= 0 {
 			cut = len(head)
@@ -2032,9 +2032,9 @@ func cardText(t *Ticket) string {
 	// вытесняло с экрана статус и комментарий, за которыми автор и заходит.
 	switch {
 	case t.Brief != "":
-		text.WriteString("\n" + t.Brief + "\n")
+		text.WriteString("\n" + cutForCard(t.Brief, briefLimit) + "\n")
 	case t.Body != "":
-		text.WriteString("\n" + cutForCard(t.Body, briefLimit) + "\n")
+		text.WriteString("\n" + cutForCard(firstSection(t.Body), briefLimit) + "\n")
 	}
 	if t.Comment != "" {
 		text.WriteString("\nПоследний комментарий:\n" + cutForCard(t.Comment, cardComment) + "\n")
