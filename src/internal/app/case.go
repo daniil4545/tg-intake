@@ -86,18 +86,21 @@ var (
 // Filled и Gaps - состояние контракта готовности: что интервью уже закрыло и
 // что осталось пробелом. Round - номер последнего заданного раунда вопросов.
 type Case struct {
-	ID          string
-	UserID      int64
-	ProjectID   *int64
-	Status      string
-	Mode        string
-	Protocol    string
-	Kind        string
-	Filled      map[string]string
-	Gaps        []string
-	Round       int
-	Title       string
-	Summary     string
+	ID        string
+	UserID    int64
+	ProjectID *int64
+	Status    string
+	Mode      string
+	Protocol  string
+	Kind      string
+	Filled    map[string]string
+	Gaps      []string
+	Round     int
+	Title     string
+	Summary   string
+	// Brief - краткое содержание: суть обращения в одном-двух предложениях. Идёт
+	// первым разделом в тело issue и заменяет полное описание в карточке бота.
+	Brief       string
 	Incomplete  bool
 	IssueNumber int
 }
@@ -140,8 +143,8 @@ type txRunner interface {
 }
 
 const caseColumns = `id, user_id, project_id, status, mode, protocol, COALESCE(kind, ''),
-	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), incomplete,
-	COALESCE(issue_number, 0)`
+	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), COALESCE(brief, ''),
+	incomplete, COALESCE(issue_number, 0)`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -164,7 +167,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	var cs Case
 	var filled, gaps []byte
 	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Mode, &cs.Protocol, &cs.Kind,
-		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Incomplete,
+		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Brief, &cs.Incomplete,
 		&cs.IssueNumber)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -1088,6 +1091,7 @@ const (
 	keysHome    = "home"    // панель «Меню | Сброс»: обращение доиграно
 	keysCancel  = "cancel"  // исход отмены тикета: правит экран, а не шлёт новое
 	keysAnswer  = "answer"  // ответ из документации: «Создать тикет», «Закончить разговор»
+	keysTicket  = "ticket"  // новость по тикету: одна кнопка перехода в карточку
 )
 
 // HandleFailedJob - исход работы, исчерпавшей повторы; воркер зовёт её через
@@ -1303,17 +1307,5 @@ func addEvent(ctx context.Context, db Runner, caseID, kind string, payload any) 
 // inTx держит инвариант среза: переход статуса, событие и постановка работ
 // живут или не живут вместе.
 func (c *Cases) inTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
-	tx, err := c.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	if err := fn(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
-	}
-	return nil
+	return inTx(ctx, c.pool, fn)
 }

@@ -21,6 +21,16 @@ var version = "dev"
 // sweepPeriod - как часто убираются файлы брошенных черновиков.
 const sweepPeriod = time.Hour
 
+// watchPeriod - как часто слежение спрашивает GitHub о новостях по тикетам.
+// Пять минут - компромисс: автор узнаёт о смене статуса почти сразу, а расход
+// лимита остаётся двумя запросами на проект за тик.
+const watchPeriod = 5 * time.Minute
+
+// watchBudget - потолок одного обхода. Тик, упёршийся в недоступный GitHub,
+// обязан закончиться раньше следующего, иначе обходы наложились бы. Внутри у
+// каждого проекта свой потолок, и обход рассчитан на то, что все они уместятся.
+const watchBudget = 4 * time.Minute
+
 // githubCheckBudget - потолок стартовой проверки прав по всем проектам. Меньше
 // запаса healthcheck на старт (45 с), чтобы недоступный GitHub не делал контур
 // нездоровым.
@@ -94,6 +104,7 @@ func main() {
 	checkGitHub(ctx, pool, github, log)
 
 	tickets := app.NewTickets(cases, github, statuses, log, cfg.AlertChatID)
+	watch := app.NewWatch(pool, github, statuses, log)
 	projects := app.NewProjects(cases, github, llm, dialog, log)
 	lookup := app.NewLookup(cases, github, llm, log, dialog)
 
@@ -122,7 +133,7 @@ func main() {
 	}
 
 	var background sync.WaitGroup
-	background.Add(2)
+	background.Add(3)
 	go func() {
 		defer background.Done()
 		app.RunWorker(ctx, pool, log, handlers, cases.HandleFailedJob)
@@ -130,6 +141,10 @@ func main() {
 	go func() {
 		defer background.Done()
 		sweepDrafts(ctx, pool, cases, log)
+	}()
+	go func() {
+		defer background.Done()
+		watchTickets(ctx, watch, log)
 	}()
 
 	go bot.Start()
@@ -171,6 +186,27 @@ func sweepDrafts(ctx context.Context, pool *pgxpool.Pool, cases *app.Cases, log 
 			if err := app.SweepJobs(ctx, pool); err != nil {
 				log.Error("sweep_jobs_failed", "error", err)
 			}
+		}
+	}
+}
+
+// watchTickets раз в пять минут спрашивает GitHub, что случилось с тикетами, и
+// зовёт авторов. Своя горутина, а не часовой sweeper: новость о смене статуса,
+// пролежавшая час, для автора почти то же, что не пришедшая.
+func watchTickets(ctx context.Context, watch *app.Watch, log *slog.Logger) {
+	ticker := time.NewTicker(watchPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tick, cancel := context.WithTimeout(ctx, watchBudget)
+			if err := watch.Run(tick); err != nil {
+				log.Error("watch_tick_failed", "error", err)
+			}
+			cancel()
 		}
 	}
 }
