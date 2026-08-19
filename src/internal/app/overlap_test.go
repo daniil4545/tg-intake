@@ -1,6 +1,9 @@
 package app
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -18,6 +21,7 @@ func TestOverlapKeepsOnlyRead(t *testing.T) {
 		{Path: "CHANGELOG.md", Note: "вышло в 0.4.2"},
 		{Path: "docs/выдумка.md", Note: "выдуманный путь"},
 		{Issue: 68, Note: ""},
+		{Issue: 68, Path: "CHANGELOG.md", Note: "и тикет, и документ разом"},
 	}, issues, loaded)
 
 	if len(kept) != 2 {
@@ -26,8 +30,79 @@ func TestOverlapKeepsOnlyRead(t *testing.T) {
 	if kept[0].Issue != 57 || kept[1].Path != "CHANGELOG.md" {
 		t.Errorf("прошли не те пункты: %+v", kept)
 	}
-	if dropped != 3 {
-		t.Errorf("отброшено пунктов: %d, ожидалось 3", dropped)
+	if dropped != 4 {
+		t.Errorf("отброшено пунктов: %d, ожидалось 4", dropped)
+	}
+}
+
+// TestOverlapCutsListAndText: список - подсказка автору, а не отчёт. Пункты
+// сверх предела, повтор одного тикета и заметка на страницу вытолкнули бы кнопки
+// саммари в отдельное сообщение, а перевод строки сломал бы пункт в теле issue.
+func TestOverlapCutsListAndText(t *testing.T) {
+	issues := []Issue{{Number: 1}, {Number: 2}, {Number: 3}, {Number: 4}, {Number: 5}}
+
+	kept, _ := keepFound([]overlapItem{
+		{Issue: 1, Note: "раз"}, {Issue: 2, Note: "два"}, {Issue: 1, Note: "повтор"},
+		{Issue: 3, Note: "три"}, {Issue: 4, Note: "четыре"}, {Issue: 5, Note: "пять"},
+	}, issues, nil)
+
+	if len(kept) != maxOverlapItems {
+		t.Fatalf("пунктов в списке: %d, ожидалось %d", len(kept), maxOverlapItems)
+	}
+	for _, item := range kept {
+		if item.Note == "повтор" {
+			t.Error("один тикет попал в список дважды")
+		}
+	}
+
+	long, _ := keepFound([]overlapItem{
+		{Issue: 1, Note: "первая строка\nвторая строка " + strings.Repeat("длинно ", 100)},
+	}, issues, nil)
+	if strings.Contains(long[0].Note, "\n") {
+		t.Error("перевод строки остался в заметке")
+	}
+	if len([]rune(long[0].Note)) > overlapNoteChars {
+		t.Errorf("заметка длиной %d рун при пределе %d", len([]rune(long[0].Note)), overlapNoteChars)
+	}
+}
+
+// TestOverlapTitleCannotStealLink: заголовок тикета пишет посторонний человек, а
+// ссылку собирает Go. Скобки внутри заголовка увели бы автора и того, кто возьмёт
+// тикет, на чужой адрес.
+func TestOverlapTitleCannotStealLink(t *testing.T) {
+	issues := []Issue{{
+		Number: 57, Title: "Отказы ](https://evil.example) [x",
+		HTMLURL: "https://github.com/acme/proj/issues/57",
+	}}
+
+	list := overlapList([]overlapItem{{Issue: 57, Note: "та же механика"}},
+		issues, Project{Owner: "acme", Repo: "proj"}, "main")
+
+	if strings.Contains(list, "evil.example") {
+		t.Errorf("чужой адрес из заголовка попал в список:\n%s", list)
+	}
+	if !strings.Contains(list, "(https://github.com/acme/proj/issues/57)") {
+		t.Errorf("ссылка на тикет собрана не по ответу GitHub:\n%s", list)
+	}
+}
+
+// TestOverlapSurvivesDeadGitHub: критерий приёмки среза - недоступный репозиторий
+// не мешает саммари. Сверка обязана вернуть пустой список молча и не звать модель
+// вовсе: клиент модели здесь nil, и обращение к нему уронило бы работу саммари.
+func TestOverlapSurvivesDeadGitHub(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	overlap := NewOverlap(NewGitHub("token", server.URL, nil, testLog(t)), nil, testLog(t),
+		DialogModel{Name: "test-model"})
+
+	list := overlap.Check(context.Background(), "case-1",
+		Project{Owner: "acme", Repo: "proj"}, "Заголовок", "", "## Случай\n\nтекст")
+
+	if list != "" {
+		t.Errorf("недоступный GitHub дал список пересечений: %q", list)
 	}
 }
 

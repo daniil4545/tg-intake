@@ -13,16 +13,23 @@ import (
 const stepOverlap = "overlap"
 
 const (
-	// Окно тикетов: пересечение почти всегда со свежим тикетом, а полный список
-	// активного репозитория не влез бы в контекст и стоил бы страниц запросов.
-	overlapIssues = 50
+	// Свой бюджет: сверка идёт последней в работе саммари, и без потолка её
+	// повторы съели бы время, оставшееся транзакции. Готовое саммари ушло бы в
+	// повтор вместе со сверкой - ровно то, что шаг обязан не делать.
+	overlapBudget = 60 * time.Second
+	// Окно ленты issues. Считается записями, а не тикетами: pull request'ы
+	// приходят тем же списком и отсеиваются после, поэтому окно взято с запасом.
+	overlapIssues = 100
 	// Бюджеты выдержек. Один docs/architecture.md весит под 50 КБ: без обреза он
 	// один занял бы всё окно, вытеснив CHANGELOG, ради которого сверка и заводится.
 	overlapDocChars = 20000
 	overlapAllChars = 60000
-	// Предел списка: подсказка автору, а не отчёт. Лишние пункты размывают сильное
-	// совпадение, ради которого он и читается.
-	maxOverlapItems = 4
+	// Пределы вывода модели. Список - подсказка, а не отчёт; длинная заметка
+	// вытолкнула бы кнопки саммари в отдельное сообщение, а многострочная
+	// сломала бы пункт списка в теле issue.
+	maxOverlapItems   = 4
+	overlapNoteChars  = 200
+	overlapTitleChars = 100
 )
 
 // Документы состояния проекта в порядке убывания пользы. Отбора моделью здесь
@@ -34,6 +41,10 @@ var overlapDocs = []string{
 	"docs/backlog.md",
 	"docs/architecture.md",
 }
+
+// Метки, которые сверке о чём-то говорят. Метка автора не проходит: ФИО
+// сотрудников незачем отправлять в модель ради поиска похожего тикета.
+var overlapLabels = []string{"type:", "status:", "incomplete"}
 
 var overlapPrefix = strings.ReplaceAll(mustPrompt("overlap.md"), "{{DOCMAP}}", docMap)
 
@@ -87,40 +98,46 @@ func NewOverlap(gh *GitHub, llm *OpenRouter, log *slog.Logger, model DialogModel
 }
 
 // Check возвращает markdown-список пересечений или пустую строку. Ошибку наружу
-// не отдаёт: любой сбой - недоступный GitHub, вышедший бюджет, мусор от модели -
-// стоит подсказки, а не обращения. Обратное поведение отняло бы у бизнеса
-// единственный вход в разработку ради необязательной проверки.
-func (o *Overlap) Check(ctx context.Context, cs *Case, p Project, title, brief, body string) string {
-	start := time.Now()
+// не отдаёт: любой сбой стоит подсказки, а не обращения. Обратное поведение
+// отняло бы у бизнеса единственный вход в разработку ради необязательной проверки.
+func (o *Overlap) Check(ctx context.Context, caseID string, p Project, title, brief, body string) string {
+	// Бюджета работы может уже не остаться: саммари перед этим тратило свой на
+	// модель с повторами. Начатая на остатке сверка отняла бы время у транзакции.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < overlapBudget {
+		o.log.Warn("overlap_skipped", "case_id", caseID, "step", "budget")
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, overlapBudget)
+	defer cancel()
 
+	start := time.Now()
 	repo, err := o.gh.GetRepo(ctx, p.Owner, p.Repo)
 	if err != nil {
-		o.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "repo", "error", err)
+		o.log.Warn("overlap_skipped", "case_id", caseID, "step", "repo", "error", err)
 		return ""
 	}
-	docs, err := o.gh.TreeDocs(ctx, p, repo.DefaultBranch)
+	issues, err := o.gh.listIssues(ctx, p, overlapIssues, sortCreated, false)
 	if err != nil {
-		o.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "tree", "error", err)
-		return ""
-	}
-	issues, err := o.gh.ListIssues(ctx, p, overlapIssues)
-	if err != nil {
-		o.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "issues", "error", err)
+		o.log.Warn("overlap_skipped", "case_id", caseID, "step", "issues", "error", err)
 		return ""
 	}
 
-	loaded, chars := o.load(ctx, cs, p, repo.DefaultBranch, docs)
+	loaded, chars := o.load(ctx, caseID, p, repo.DefaultBranch)
 	if len(issues) == 0 && len(loaded) == 0 {
-		o.log.Info("overlap_empty_sources", "case_id", cs.ID, "project", p.Slug)
+		o.log.Info("overlap_empty_sources", "case_id", caseID, "project", p.Slug)
 		return ""
 	}
+
+	// Документы впереди тикетов: они меняются на релизе, а лента тикетов - от
+	// каждой публикации, и общий префикс запроса иначе обесценивался бы чаще.
+	volatile := docsMessage(loaded, "Выдержки из документов проекта:") +
+		"\n\n" + issuesMessage(issues)
+	draft := []Message{{Role: "user", Parts: []Part{TextPart(draftMessage(title, brief, body))}}}
 
 	var out overlapOut
-	messages := lookupMessages(overlapPrefix, p.Context,
-		issuesMessage(issues)+"\n\n"+docsMessage(loaded),
-		[]Message{{Role: "user", Parts: []Part{TextPart(draftMessage(title, brief, body))}}})
-	if err := o.complete(ctx, messages, &out); err != nil {
-		o.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "model", "error", err)
+	messages := lookupMessages(overlapPrefix, p.Context, volatile, draft)
+	if err := complete(ctx, o.llm, o.model, stepOverlap, overlapSchema, messages, &out); err != nil {
+		o.log.Warn("overlap_skipped", "case_id", caseID, "step", "model", "error", err)
 		return ""
 	}
 
@@ -128,23 +145,19 @@ func (o *Overlap) Check(ctx context.Context, cs *Case, p Project, title, brief, 
 	if dropped > 0 {
 		// Номер и путь, которых модель не видела, - выдумка: автор принял бы её за
 		// факт и не завёл нужный тикет.
-		o.log.Warn("overlap_invented", "case_id", cs.ID, "dropped", dropped)
+		o.log.Warn("overlap_invented", "case_id", caseID, "dropped", dropped)
 	}
-	o.log.Info("overlap_done", "case_id", cs.ID, "project", p.Slug,
+	o.log.Info("overlap_done", "case_id", caseID, "project", p.Slug,
 		"issues", len(issues), "docs", len(loaded), "chars", chars,
 		"found", len(items), "ms", time.Since(start).Milliseconds())
 
 	return overlapList(items, issues, p, repo.DefaultBranch)
 }
 
-// load читает документы состояния проекта, которые есть в дереве. Отсутствие
-// файла - обычное дело: комплект документов у проектов разный.
-func (o *Overlap) load(ctx context.Context, cs *Case, p Project, ref string, docs []DocFile) ([]docText, int) {
-	known := make(map[string]bool, len(docs))
-	for _, d := range docs {
-		known[d.Path] = true
-	}
-
+// load читает документы состояния проекта. Дерево репозитория для этого не
+// нужно: отсутствующий файл отвечает 404, а комплект документов у проектов
+// разный, и это обычное дело, а не отказ.
+func (o *Overlap) load(ctx context.Context, caseID string, p Project, ref string) ([]docText, int) {
 	loaded := make([]docText, 0, len(overlapDocs))
 	chars := 0
 	for _, path := range overlapDocs {
@@ -152,12 +165,11 @@ func (o *Overlap) load(ctx context.Context, cs *Case, p Project, ref string, doc
 		if left <= 0 {
 			break
 		}
-		if !known[path] {
-			continue
-		}
 		text, err := o.gh.File(ctx, p, path, ref)
 		if err != nil {
-			o.log.Warn("overlap_file_failed", "case_id", cs.ID, "path", path, "error", err)
+			if !isDenied(err) {
+				o.log.Warn("overlap_file_failed", "case_id", caseID, "path", path, "error", err)
+			}
 			continue
 		}
 		text = cutDoc(text, min(overlapDocChars, left))
@@ -167,29 +179,9 @@ func (o *Overlap) load(ctx context.Context, cs *Case, p Project, ref string, doc
 	return loaded, chars
 }
 
-func (o *Overlap) complete(ctx context.Context, messages []Message, out *overlapOut) error {
-	raw, err := o.llm.Complete(ctx, Request{
-		Step:       stepOverlap,
-		Model:      o.model.Name,
-		Reasoning:  o.model.Reasoning,
-		MaxTokens:  llmMaxTokens,
-		Messages:   messages,
-		SchemaName: stepOverlap,
-		Schema:     overlapSchema,
-	})
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode %s: %w", stepOverlap, err)
-	}
-	return nil
-}
-
 // keepFound оставляет пункты, опирающиеся на прочитанное: номер обязан быть среди
-// выданных тикетов, путь - среди прочитанных файлов. Второе значение - сколько
-// отброшено. Флаг found от модели не смотрим: список строят пункты, а «нашёл» без
-// пункта не значит ничего.
+// выданных модели тикетов, путь - среди прочитанных файлов. Второе значение -
+// сколько отброшено. Флаг found не смотрится вовсе: список строят пункты.
 func keepFound(items []overlapItem, issues []Issue, loaded []docText) ([]overlapItem, int) {
 	known := make(map[int]bool, len(issues))
 	for _, issue := range issues {
@@ -204,38 +196,50 @@ func keepFound(items []overlapItem, issues []Issue, loaded []docText) ([]overlap
 	dropped := 0
 	for _, item := range items {
 		item.Path = strings.TrimSpace(item.Path)
-		item.Note = scrubContacts(strings.TrimSpace(item.Note))
+		item.Note = cutRunes(scrubContacts(oneLine(item.Note)), overlapNoteChars)
+		// Пункт называет либо тикет, либо документ: заполненное разом не говорит,
+		// чем именно совпало, и ссылка вышла бы наугад. Второй пункт про тот же
+		// источник тоже не проходит - в списке он стал бы повтором строки.
+		var found overlapItem
 		switch {
 		case item.Note == "":
-			dropped++
-		case item.Issue != 0 && known[item.Issue]:
-			kept = append(kept, overlapItem{Issue: item.Issue, Note: item.Note})
+		case item.Issue != 0 && item.Path == "" && known[item.Issue]:
+			found = overlapItem{Issue: item.Issue, Note: item.Note}
+			known[item.Issue] = false
 		case item.Issue == 0 && read[item.Path]:
-			kept = append(kept, overlapItem{Path: item.Path, Note: item.Note})
-		default:
-			dropped++
+			found = overlapItem{Path: item.Path, Note: item.Note}
+			read[item.Path] = false
 		}
-		if len(kept) == maxOverlapItems {
-			break
+		if found.Issue == 0 && found.Path == "" {
+			dropped++
+			continue
+		}
+		if len(kept) < maxOverlapItems {
+			kept = append(kept, found)
 		}
 	}
 	return kept, dropped
 }
 
-// overlapList - готовый список пунктов. Ссылку строит Go по номеру и пути: модель
-// адресов не пишет - тот же довод, что у ответа по документации.
+// overlapList - готовый список пунктов. Ссылку берёт Go: у документа собирает по
+// ветке из ответа GitHub, у тикета берёт адрес из того же ответа - модель адресов
+// не пишет, тот же довод, что у ответа по документации.
 func overlapList(items []overlapItem, issues []Issue, p Project, ref string) string {
-	titles := make(map[int]Issue, len(issues))
+	found := make(map[int]Issue, len(issues))
 	for _, issue := range issues {
-		titles[issue.Number] = issue
+		found[issue.Number] = issue
 	}
 
 	var b strings.Builder
 	for _, item := range items {
 		if item.Issue != 0 {
-			issue := titles[item.Issue]
+			issue := found[item.Issue]
+			state := ""
+			if issue.State == "closed" {
+				state = ", закрыт"
+			}
 			fmt.Fprintf(&b, "- [Тикет #%d %s](%s)%s: %s\n",
-				item.Issue, issue.Title, issue.HTMLURL, closedMark(issue), item.Note)
+				item.Issue, linkText(issue.Title), issue.HTMLURL, state, item.Note)
 			continue
 		}
 		links := sourceLinks(p, ref, []string{item.Path})
@@ -244,30 +248,46 @@ func overlapList(items []overlapItem, issues []Issue, p Project, ref string) str
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// closedMark отмечает закрытый тикет: для автора это разница между «уже делают» и
-// «сделано или отклонено».
-func closedMark(issue Issue) string {
-	if issue.State == "closed" {
-		return ", закрыт"
-	}
-	return ""
+// linkText готовит чужой текст к подстановке в markdown-ссылку. Заголовок тикета
+// пишет посторонний человек: скобки внутри него увели бы ссылку мимо собранной
+// Go, а адрес в тексте увёл бы туда же самого автора.
+func linkText(text string) string {
+	text = linkRe.ReplaceAllString(oneLine(text), "[ссылка]")
+	text = strings.NewReplacer("[", "", "]", "", "(", "", ")", "").Replace(text)
+	return cutRunes(text, overlapTitleChars)
 }
 
 // issuesMessage - волатильная часть: тикеты репозитория. Тело не идёт вовсе -
-// пятьдесят описаний не влезут в окно, а для совпадения по сути хватает
-// заголовка, состояния и меток.
+// сотня описаний не влезет в окно, а для совпадения по сути хватает заголовка,
+// состояния и меток.
 func issuesMessage(issues []Issue) string {
 	if len(issues) == 0 {
 		return "Тикетов в репозитории нет."
 	}
 
 	var b strings.Builder
-	b.WriteString("Последние тикеты репозитория (номер, состояние, метки, заголовок):\n")
+	b.WriteString("Последние тикеты репозитория (номер, состояние, метки, заголовок). " +
+		"Список - окно последних, старые тикеты в него не попали:\n")
 	for _, issue := range issues {
 		fmt.Fprintf(&b, "#%d [%s] %s %s\n", issue.Number, issue.State,
-			strings.Join(issue.LabelNames(), ","), issue.Title)
+			strings.Join(keepLabels(issue.LabelNames()), ","), linkText(issue.Title))
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// keepLabels отсеивает метки, которые сверке ничего не говорят. Метка автора
+// несёт ФИО сотрудника, и в модель она не уходит.
+func keepLabels(labels []string) []string {
+	var kept []string
+	for _, label := range labels {
+		for _, prefix := range overlapLabels {
+			if strings.HasPrefix(label, prefix) {
+				kept = append(kept, label)
+				break
+			}
+		}
+	}
+	return kept
 }
 
 // draftMessage - черновик тикета последним сообщением: он меняется от обращения к

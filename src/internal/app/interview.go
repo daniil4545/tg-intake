@@ -236,7 +236,7 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return err
 	}
 
-	messages, err := i.dialog(ctx, cs, i.askPrefix)
+	messages, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		return err
 	}
@@ -554,7 +554,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		return err
 	}
 
-	messages, err := i.dialog(ctx, cs, i.sumPrefix)
+	messages, project, err := i.dialog(ctx, cs, i.sumPrefix)
 	if err != nil {
 		return err
 	}
@@ -579,7 +579,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 
 	// Сверка стоит между готовым саммари и его показом: точка подтверждения у
 	// автора остаётся одна, а сверять раньше нечего - черновика ещё нет.
-	overlap := i.checkOverlap(ctx, cs, title, brief, body)
+	overlap := i.checkOverlap(ctx, cs, project, version, title, brief, body)
 
 	moved := false
 	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
@@ -636,16 +636,19 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	return nil
 }
 
-// checkOverlap сверяет готовый черновик с состоянием проекта. Проект читается
-// заново: dialog брал его для промта, а держать в поле шага незачем - карточка
-// проекта меняется реже, чем живёт процесс, но обращение живёт дольше вызова.
-func (i *Interview) checkOverlap(ctx context.Context, cs *Case, title, brief, body string) string {
-	project, err := LoadProject(ctx, i.cases.pool, *cs.ProjectID)
-	if err != nil {
-		i.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "project", "error", err)
+// checkOverlap сверяет готовый черновик с состоянием проекта. Сначала смотрит,
+// не дописал ли автор, пока собиралось саммари: сверка стоит запросов к GitHub и
+// хода модели, а показывать это саммари всё равно уже нельзя.
+func (i *Interview) checkOverlap(ctx context.Context, cs *Case, project Project,
+	version int, title, brief, body string) string {
+	if i.overlap == nil {
 		return ""
 	}
-	return i.overlap.Check(ctx, cs, project, title, brief, body)
+	current, err := i.cases.turnsCount(ctx, i.cases.pool, cs.ID)
+	if err != nil || current != version {
+		return ""
+	}
+	return i.overlap.Check(ctx, cs.ID, project, title, brief, body)
 }
 
 func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message) (summaryOut, error) {
@@ -762,10 +765,10 @@ func (i *Interview) gapTitles(cs *Case) []string {
 // dialog собирает сообщения запроса. Порядок обязателен: стабильный префикс
 // первым сообщением, протокол сырья вторым, история раундов последней. Любая
 // изменяющаяся строка перед промтом молча гасит кэш провайдера.
-func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Message, error) {
+func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Message, Project, error) {
 	project, err := LoadProject(ctx, i.cases.pool, *cs.ProjectID)
 	if err != nil {
-		return nil, err
+		return nil, Project{}, err
 	}
 
 	messages := []Message{
@@ -775,9 +778,9 @@ func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Mess
 
 	history, err := i.cases.history(ctx, cs.ID)
 	if err != nil {
-		return nil, err
+		return nil, Project{}, err
 	}
-	return append(messages, history...), nil
+	return append(messages, history...), project, nil
 }
 
 // history восстанавливает разговор из журнала. Отдельной таблицы у него нет:
@@ -835,8 +838,9 @@ func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 			messages = append(messages, Message{Role: role, Parts: []Part{TextPart(p.Text)}})
 		case "summary_ready":
 			var p struct {
-				Title string `json:"title"`
-				Body  string `json:"body"`
+				Title   string `json:"title"`
+				Body    string `json:"body"`
+				Overlap string `json:"overlap"`
 			}
 			if err := json.Unmarshal(payload, &p); err != nil {
 				return nil, fmt.Errorf("decode shown summary: %w", err)
@@ -846,9 +850,15 @@ func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
 			if p.Body == "" {
 				continue
 			}
+			shown := p.Title + "\n\n" + p.Body
+			// Пересечения показаны автору той же репликой, и следующий его ответ
+			// часто отвечает именно им: без них ход переспросит мимо.
+			if p.Overlap != "" {
+				shown += "\n\nПохоже, часть этого уже есть:\n\n" + p.Overlap
+			}
 			messages = append(messages, Message{
 				Role:  "assistant",
-				Parts: []Part{TextPart(p.Title + "\n\n" + p.Body)},
+				Parts: []Part{TextPart(shown)},
 			})
 		}
 	}
