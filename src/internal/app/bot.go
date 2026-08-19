@@ -75,7 +75,6 @@ var (
 	fixBtn        = &tele.Btn{Unique: "fix"}
 	ticketsBtn    = &tele.Btn{Unique: "tickets"}
 	cardBtn       = &tele.Btn{Unique: "card"}
-	fullBtn       = &tele.Btn{Unique: "full"}
 	killBtn       = &tele.Btn{Unique: "kill"}
 	addProjectBtn = &tele.Btn{Unique: "add_project"}
 	homeBtn       = &tele.Btn{Unique: "home"}
@@ -257,7 +256,6 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(projectBtn, b.onProject)
 	tb.Handle(ticketsBtn, b.onTickets)
 	tb.Handle(cardBtn, b.onCard)
-	tb.Handle(fullBtn, b.onFull)
 	tb.Handle(killBtn, b.onKill)
 	tb.Handle(createBtn, b.onCreate)
 	tb.Handle(askBtn, b.onAsk)
@@ -1848,10 +1846,6 @@ func (b *Bot) onCard(c tele.Context) error {
 
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
-	if ticket.Brief != "" && ticket.Body != "" {
-		rows = append(rows, markup.Row(markup.Data("Подробнее", fullBtn.Unique,
-			cardData(project.Slug, number))))
-	}
 	if cancelOffered(ticket, senderID(c)) {
 		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
 			cardData(project.Slug, number))))
@@ -1877,46 +1871,6 @@ func backToList(slug string, page int) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, listData(slug, page))))
 	return markup
-}
-
-// onFull - полное описание тикета. Отдельный экран, а не длинная карточка:
-// саммари занимает весь телефон, и статус с комментарием уезжают из виду.
-func (b *Bot) onFull(c tele.Context) error {
-	b.toast(c, "Открываю описание")
-
-	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
-	defer cancel()
-
-	project, number, ok, err := b.cardTarget(ctx, c)
-	if err != nil || !ok {
-		return err
-	}
-	page, err := b.tickets.Page(ctx, project, number)
-	if err != nil {
-		return err
-	}
-
-	ticket, err := b.tickets.Load(ctx, project, number)
-	switch {
-	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug, page))
-	case err != nil:
-		return err
-	case ticket == nil:
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
-	}
-
-	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(
-		markup.Data(fmt.Sprintf("К тикету #%d", number), cardBtn.Unique,
-			cardData(project.Slug, number)),
-		markup.Data("К списку", ticketsBtn.Unique, listData(project.Slug, page))))
-	text := fmt.Sprintf("Тикет #%d - полное описание\n\n%s", number, ticket.Body)
-	if len(text) > maxMessage {
-		_, err := b.sendLong(c.Recipient(), text, markup)
-		return err
-	}
-	return b.screen(c, text, markup)
 }
 
 // onKill ставит работу отмены. Ответ автору синхронный, сама отмена идёт
@@ -2056,13 +2010,11 @@ func cancelOffered(t *Ticket, userID int64) bool {
 func cardText(t *Ticket) string {
 	var text strings.Builder
 	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
-	// Кратко вместо полного описания: полное открывается кнопкой. У тикетов до
-	// появления краткого его нет, и карточка показывает описание целиком.
-	switch {
-	case t.Brief != "":
+	// Только краткое содержание: полное тело тикета вытесняло с экрана статус и
+	// комментарий, за которыми автор и заходит. У тикетов до появления краткого
+	// описания в карточке нет вовсе, суть читается в заголовке.
+	if t.Brief != "" {
 		text.WriteString("\n" + t.Brief + "\n")
-	case t.Body != "":
-		text.WriteString("\n" + t.Body + "\n")
 	}
 	if t.Comment != "" {
 		text.WriteString("\nПоследний комментарий:\n" + t.Comment + "\n")

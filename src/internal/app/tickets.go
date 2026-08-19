@@ -12,10 +12,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// ticketsLimit - сколько последних тикетов проекта показывает список. Листать
-// в Telegram неудобно, а тикет старше десятого ищется в GitHub тем, у кого есть
-// доступ.
-const ticketsLimit = 10
+// ticketsLimit - сколько тикетов на странице списка. Пять помещаются на экран
+// телефона вместе с кнопками листания; остальное достаётся листанием.
+const ticketsLimit = 5
 
 // issueScan - окно, в котором ищутся метки своих тикетов. Больше сотни GitHub
 // за один запрос не отдаёт.
@@ -36,7 +35,7 @@ var (
 	ErrIssueGone = errors.New("issue does not exist")
 )
 
-// Ticket - тикет для показа автору. Author, Body и Comment заполняет только
+// Ticket - тикет для показа автору. Author, Brief и Comment заполняет только
 // карточка: в списке они пусты, и второй тип ради трёх пустых строк не стоит
 // пересечения в шести полях.
 type Ticket struct {
@@ -51,11 +50,10 @@ type Ticket struct {
 	// закрытому предлагать отмену нельзя.
 	Unavailable bool
 	Author      string
-	// Brief - краткое содержание; Body - полное описание, которое открывается
-	// кнопкой. У тикетов, заведённых до появления краткого, Brief пуст, и
-	// карточка показывает Body, как раньше.
+	// Brief - краткое содержание, единственное описание в карточке. Полное тело
+	// тикета не показывается: на экране телефона оно вытесняет статус и
+	// комментарий. У тикетов, заведённых до появления краткого, Brief пуст.
 	Brief   string
-	Body    string
 	Comment string
 	// News - по тикету есть новость, о которой автору сказали, а карточку он не
 	// открыл. Ставится только владельцу тикета: чужая отметка ему не нужна.
@@ -158,20 +156,17 @@ func (t *Tickets) List(ctx context.Context, project Project, userID int64, page 
 // незачем уезжать в чат.
 func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticket, error) {
 	var ticket Ticket
-	var summary string
 	row := t.cases.pool.QueryRow(ctx, `
 		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''),
-		       user_id, COALESCE(summary, ''), COALESCE(brief, ''), has_news
+		       user_id, COALESCE(brief, ''), has_news
 		FROM cases WHERE project_id = $1 AND issue_number = $2`, project.ID, number)
 	if err := row.Scan(&ticket.CaseID, &ticket.Number, &ticket.URL, &ticket.Title,
-		&ticket.UserID, &summary, &ticket.Brief, &ticket.News); err != nil {
+		&ticket.UserID, &ticket.Brief, &ticket.News); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("load ticket %d of project %d: %w", number, project.ID, err)
 	}
-	ticket.Body = plainSections(summary)
-
 	author, err := LoadUser(ctx, t.cases.pool, ticket.UserID)
 	if err != nil {
 		return nil, err
