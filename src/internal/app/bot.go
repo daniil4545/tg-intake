@@ -2022,7 +2022,7 @@ func cutForCard(text string, limit int) string {
 	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
-	return string([]rune(text)[:limit]) + "...\n\nПолностью - в тикете по ссылке ниже."
+	return cutRunes(text, limit) + "...\n\nПолностью - в тикете по ссылке ниже."
 }
 
 func cardText(t *Ticket) string {
