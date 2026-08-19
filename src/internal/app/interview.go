@@ -563,7 +563,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	}
 
 	title := scrubContacts(strings.TrimSpace(out.Title))
-	brief := scrubContacts(strings.TrimSpace(out.Brief))
+	brief := briefOf(out)
 	body := i.renderSections(cs, out.Sections)
 	// Недобран контракт или нет, решают обязательные пункты: необязательный
 	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
@@ -621,8 +621,8 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if brief == "" {
-		i.log.Warn("brief_missing", "case_id", cs.ID)
+	if strings.TrimSpace(out.Brief) == "" {
+		i.log.Warn("brief_missing", "case_id", cs.ID, "replaced", brief != "")
 	}
 	i.log.Info("summary_ready", "case_id", cs.ID, "incomplete", incomplete,
 		"gap_keys", strings.Join(cs.Gaps, ","),
@@ -1175,6 +1175,27 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool) s
 	}
 	b.WriteString("\n\nГде я ошибся? Напишите правку - или публикуем.")
 	return b.String()
+}
+
+// briefOf - краткое содержание из ответа модели. Молчание модели не оставляет
+// тикет без сути: краткое берётся из начала первого раздела. Пустая рубрика в
+// теле issue и карточка без описания хуже пересказа, а останавливать тикет из-за
+// молчания нельзя - решение 2026-08-09.
+func briefOf(out summaryOut) string {
+	brief := strings.TrimSpace(out.Brief)
+	if brief == "" && len(out.Sections) > 0 {
+		brief = cutRunes(strings.TrimSpace(out.Sections[0].Text), briefLimit)
+	}
+	return scrubContacts(brief)
+}
+
+// cutRunes режет текст по числу символов, а не байтов: русская строка весит по
+// два байта на символ, и байтовый предел обрезал бы её вдвое раньше.
+func cutRunes(text string, limit int) string {
+	if utf8.RuneCountInString(text) <= limit {
+		return text
+	}
+	return string([]rune(text)[:limit])
 }
 
 // plainText убирает markdown: Telegram его не рендерит, а parse_mode включать
