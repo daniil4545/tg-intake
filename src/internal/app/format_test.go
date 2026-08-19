@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tele "gopkg.in/telebot.v4"
 )
@@ -129,6 +130,30 @@ func TestContinueText(t *testing.T) {
 	}
 	if !strings.Contains(continueText(modeTicket, modeAsk), "тикета") {
 		t.Errorf("экран не назвал режим живого обращения: %q", continueText(modeTicket, modeAsk))
+	}
+}
+
+// TestCardFitsOneMessage: карточка помещается в одно сообщение даже когда
+// комментарий разработчика - многостраничный разбор. Иначе Telegram получает
+// карточку двумя сообщениями, и вторым автору приходит обрывок комментария.
+func TestCardFitsOneMessage(t *testing.T) {
+	ticket := Ticket{Number: 68, Title: strings.Repeat("а", maxTitle),
+		Author: "Иван", Status: Status{Title: "в работе"},
+		Brief:   strings.Repeat("б", briefLimit),
+		Comment: strings.Repeat("в", 5000),
+		URL:     "https://example.invalid/issues/68"}
+
+	text := cardText(&ticket)
+	if runes := utf8.RuneCountInString(text); runes > maxMessage {
+		t.Errorf("карточка не влезает в сообщение: %d рун", runes)
+	}
+	if !strings.Contains(text, "Полностью - в тикете") {
+		t.Error("обрез комментария не помечен, автор примет обрывок за весь текст")
+	}
+
+	ticket.Comment = "Смотрю, к вечеру отвечу"
+	if !strings.Contains(cardText(&ticket), ticket.Comment) {
+		t.Error("короткий комментарий обрезан")
 	}
 }
 
