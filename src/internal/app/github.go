@@ -206,11 +206,14 @@ func (g *GitHub) FindIssue(ctx context.Context, p Project, marker string) (int, 
 }
 
 // Issue - тикет в том виде, в каком его читает сервис. Labels нужны просмотру,
-// Body - поиску маркера, PullRequest - отсеву: REST GitHub считает issue каждый
-// pull request, и в активном репозитории они вытесняют тикеты из окна.
+// Body - поиску маркера, Title и State - сверке черновика с состоянием проекта,
+// PullRequest - отсеву: REST GitHub считает issue каждый pull request, и в
+// активном репозитории они вытесняют тикеты из окна.
 type Issue struct {
 	Number      int    `json:"number"`
 	HTMLURL     string `json:"html_url"`
+	Title       string `json:"title"`
+	State       string `json:"state"`
 	Body        string `json:"body"`
 	PullRequest *struct {
 		URL string `json:"url"`
@@ -662,6 +665,15 @@ func (p *Publisher) body(cs *Case, author User, links []string, marker string) s
 			b.WriteString("- " + link + "\n")
 		}
 		b.WriteString("\nПрислано автором вместе с материалом обращения.")
+	}
+
+	// Пересечения идут после ссылок и до пробелов: это не часть обращения, а
+	// найденный сервисом контекст, и берущему тикет он нужен раньше, чем список
+	// того, чего автор не уточнил.
+	if cs.Overlap != "" {
+		b.WriteString("\n\n## Пересечения\n\n" + cs.Overlap + "\n")
+		b.WriteString("\nНашёл бот при сборке тикета и показал автору: он видел этот " +
+			"список и всё равно завёл тикет.")
 	}
 
 	if len(cs.Gaps) > 0 {

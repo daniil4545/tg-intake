@@ -49,12 +49,13 @@ var (
 // саммари. Побочные эффекты выполняет Go: модель возвращает структуру, Go
 // валидирует её и только потом пишет в БД.
 type Interview struct {
-	cases  *Cases
-	llm    *OpenRouter
-	log    *slog.Logger
-	rules  Contract
-	model  DialogModel
-	rounds int
+	cases   *Cases
+	llm     *OpenRouter
+	log     *slog.Logger
+	rules   Contract
+	model   DialogModel
+	rounds  int
+	overlap *Overlap
 
 	// Готовые куски системного сообщения: собираются один раз, потому что
 	// стабильный префикс не имеет права меняться между вызовами.
@@ -63,7 +64,7 @@ type Interview struct {
 	turnSchema json.RawMessage
 }
 
-func NewInterview(cases *Cases, llm *OpenRouter, log *slog.Logger, rules Contract, model DialogModel, rounds int) *Interview {
+func NewInterview(cases *Cases, llm *OpenRouter, log *slog.Logger, rules Contract, model DialogModel, rounds int, overlap *Overlap) *Interview {
 	return &Interview{
 		cases:      cases,
 		llm:        llm,
@@ -71,6 +72,7 @@ func NewInterview(cases *Cases, llm *OpenRouter, log *slog.Logger, rules Contrac
 		rules:      rules,
 		model:      model,
 		rounds:     rounds,
+		overlap:    overlap,
 		askPrefix:  strings.ReplaceAll(interviewPrompt, "{{CONTRACT}}", rules.Prompt()),
 		sumPrefix:  strings.ReplaceAll(summaryPrompt, "{{CONTRACT}}", rules.Prompt()),
 		turnSchema: turnSchema(rules),
@@ -575,6 +577,10 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		return fmt.Errorf("summary of case %s has no content", cs.ID)
 	}
 
+	// Сверка стоит между готовым саммари и его показом: точка подтверждения у
+	// автора остаётся одна, а сверять раньше нечего - черновика ещё нет.
+	overlap := i.checkOverlap(ctx, cs, title, brief, body)
+
 	moved := false
 	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
 		// Автор дописал, пока собиралось саммари: его ответ уже поставил новый
@@ -589,8 +595,8 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 
 		tag, err := tx.Exec(ctx, `
 			UPDATE cases SET status = 'summary', title = $2, summary = $3, brief = $4,
-			                 incomplete = $5, updated_at = now()
-			WHERE id = $1 AND status = 'interview'`, cs.ID, title, body, brief, incomplete)
+			                 incomplete = $5, overlap = $6, updated_at = now()
+			WHERE id = $1 AND status = 'interview'`, cs.ID, title, body, brief, incomplete, overlap)
 		if err != nil {
 			return fmt.Errorf("save summary of case %s: %w", cs.ID, err)
 		}
@@ -604,7 +610,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// модель обязана видеть целиком.
 		if err := addEvent(ctx, tx, cs.ID, "summary_ready", map[string]any{
 			"incomplete": incomplete, "sections": len(out.Sections),
-			"title": title, "brief": brief, "body": body,
+			"title": title, "brief": brief, "body": body, "overlap": overlap,
 		}); err != nil {
 			return err
 		}
@@ -612,7 +618,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// переписанное саммари упёрлось бы в ключ прошлого - автор не увидел бы
 		// собственную правку.
 		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			summaryMessage(title, brief, body, i.gapTitles(cs), incomplete), keysSummary)
+			summaryMessage(title, brief, body, i.gapTitles(cs), incomplete, overlap), keysSummary)
 	})
 	if err != nil {
 		return err
@@ -625,9 +631,21 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		i.log.Warn("brief_missing", "case_id", cs.ID, "replaced", brief != "")
 	}
 	i.log.Info("summary_ready", "case_id", cs.ID, "incomplete", incomplete,
-		"gap_keys", strings.Join(cs.Gaps, ","),
+		"overlap", overlap != "", "gap_keys", strings.Join(cs.Gaps, ","),
 		"sections", len(out.Sections), "chars", utf8.RuneCountInString(body))
 	return nil
+}
+
+// checkOverlap сверяет готовый черновик с состоянием проекта. Проект читается
+// заново: dialog брал его для промта, а держать в поле шага незачем - карточка
+// проекта меняется реже, чем живёт процесс, но обращение живёт дольше вызова.
+func (i *Interview) checkOverlap(ctx context.Context, cs *Case, title, brief, body string) string {
+	project, err := LoadProject(ctx, i.cases.pool, *cs.ProjectID)
+	if err != nil {
+		i.log.Warn("overlap_skipped", "case_id", cs.ID, "step", "project", "error", err)
+		return ""
+	}
+	return i.overlap.Check(ctx, cs, project, title, brief, body)
 }
 
 func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message) (summaryOut, error) {
@@ -1154,7 +1172,7 @@ func questionList(questions []Question) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func summaryMessage(title, brief, body string, gaps []string, incomplete bool) string {
+func summaryMessage(title, brief, body string, gaps []string, incomplete bool, overlap string) string {
 	var b strings.Builder
 	b.WriteString("Вот что уйдёт в тикет.\n\n")
 	b.WriteString(title + "\n\n")
@@ -1172,6 +1190,13 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool) s
 		if incomplete {
 			b.WriteString(" Тикет уйдёт с пометкой о неполноте.")
 		}
+	}
+	// Пересечения идут перед вопросом о правке: это то, чего автор не знал, и
+	// решать ему сразу после - публиковать или бросить обращение.
+	if overlap != "" {
+		b.WriteString("\n\nПохоже, часть этого уже есть:\n\n" + plainText(overlap))
+		b.WriteString("\n\nЕсли это оно - нажмите «Сброс», тикет не понадобится. " +
+			"Если нет - напишите, чего не хватает.")
 	}
 	b.WriteString("\n\nГде я ошибся? Напишите правку - или публикуем.")
 	return b.String()
