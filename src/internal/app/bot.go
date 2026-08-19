@@ -133,6 +133,9 @@ type Bot struct {
 type killScreen struct {
 	tele.StoredMessage
 	slug string
+	// page - страница списка, с которой автор ушёл в карточку: исход отмены
+	// правит то же сообщение и обязан вернуть его туда же.
+	page int
 }
 
 // roundState - сообщение раунда: Bot API правит сообщение целиком, поэтому
@@ -603,9 +606,9 @@ func (b *Bot) finishKill(cs *Case, text string) error {
 		return err
 	}
 
-	if _, err := b.bot.Edit(screen.StoredMessage, text, backToList(screen.slug)); err != nil {
+	if _, err := b.bot.Edit(screen.StoredMessage, text, backToList(screen.slug, screen.page)); err != nil {
 		b.log.Warn("kill_edit_failed", "case_id", cs.ID, "error", err)
-		if _, err := b.sendLong(&tele.User{ID: cs.UserID}, text, backToList(screen.slug)); err != nil {
+		if _, err := b.sendLong(&tele.User{ID: cs.UserID}, text, backToList(screen.slug, screen.page)); err != nil {
 			return err
 		}
 	}
@@ -1740,40 +1743,64 @@ func (b *Bot) onTickets(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
-	project, ok, err := b.project(ctx, c.Data())
+	slug, page := listTarget(c.Data())
+	project, ok, err := b.project(ctx, slug)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return b.screen(c, "Проект недоступен: его выключили.", backHome())
 	}
+	return b.showTickets(ctx, c, project, page)
+}
 
-	tickets, err := b.tickets.List(ctx, project, senderID(c))
+// showTickets рисует страницу списка. Вынесена из хендлера, потому что страница
+// за концом списка возвращает автора на первую: тикет могли отменить между
+// показом и нажатием.
+func (b *Bot) showTickets(ctx context.Context, c tele.Context, project Project, page int) error {
+	tickets, total, err := b.tickets.List(ctx, project, senderID(c), page)
 	if err != nil {
 		return err
 	}
 	if len(tickets) == 0 {
-		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.", backProject(project.Slug))
+		if page > 0 {
+			return b.showTickets(ctx, c, project, 0)
+		}
+		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.",
+			backProject(project.Slug))
 	}
-	b.log.Info("tickets_listed", "user_id", senderID(c), "project", project.Slug, "count", len(tickets))
+	pages := (total + ticketsLimit - 1) / ticketsLimit
+	b.log.Info("tickets_listed", "user_id", senderID(c), "project", project.Slug,
+		"count", len(tickets), "page", page+1, "pages", pages)
 
 	markup := &tele.ReplyMarkup{}
-	rows := make([]tele.Row, 0, len(tickets)+1)
+	rows := make([]tele.Row, 0, len(tickets)+2)
 	var text strings.Builder
-	text.WriteString("Тикеты проекта «" + project.Title + "»:\n\n")
-	// Чужие тикеты отделены строкой: порядок выборки ставит свои первыми, и без
-	// разделителя список читается как один.
-	others := false
+	text.WriteString("Тикеты проекта «" + project.Title + "»")
+	if pages > 1 {
+		fmt.Fprintf(&text, ", страница %d из %d", page+1, pages)
+	}
+	text.WriteString(":\n\n")
 	for _, t := range tickets {
-		if !others && t.UserID != senderID(c) {
-			others = true
-			text.WriteString("\nДругие тикеты проекта:\n")
-		}
 		text.WriteString(ticketLine(t) + "\n")
 		rows = append(rows, markup.Row(markup.Data(
 			ticketButton(t), cardBtn.Unique, cardData(project.Slug, t.Number))))
 	}
-	rows = append(rows, markup.Row(markup.Data("Назад", backBtn.Unique, project.Slug)))
+	// Кнопка листания появляется только там, куда есть куда идти: кнопка,
+	// которая ничего не делает, читается как поломка.
+	var nav tele.Row
+	if page > 0 {
+		nav = append(nav, markup.Data("Предыдущие", ticketsBtn.Unique, listData(project.Slug, page-1)))
+	}
+	if page+1 < pages {
+		nav = append(nav, markup.Data("Следующие", ticketsBtn.Unique, listData(project.Slug, page+1)))
+	}
+	if len(nav) > 0 {
+		rows = append(rows, nav)
+	}
+	rows = append(rows, markup.Row(
+		markup.Data("Меню проекта", backBtn.Unique, project.Slug),
+		markup.Data("К проектам", homeBtn.Unique)))
 	markup.Inline(rows...)
 	// Правкой длинный список не помещается: та же гвардия, что у карточки.
 	if len(text.String()) > maxMessage {
@@ -1795,15 +1822,19 @@ func (b *Bot) onCard(c tele.Context) error {
 	if err != nil || !ok {
 		return err
 	}
+	page, err := b.tickets.Page(ctx, project, number)
+	if err != nil {
+		return err
+	}
 
 	ticket, err := b.tickets.Load(ctx, project, number)
 	switch {
 	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug))
+		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug, page))
 	case err != nil:
 		return err
 	case ticket == nil:
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
 	}
 	b.log.Info("ticket_opened", "user_id", senderID(c), "case_id", ticket.CaseID, "issue", number)
 
@@ -1825,7 +1856,9 @@ func (b *Bot) onCard(c tele.Context) error {
 		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
 			cardData(project.Slug, number))))
 	}
-	rows = append(rows, markup.Row(markup.Data("К списку", ticketsBtn.Unique, project.Slug)))
+	rows = append(rows, markup.Row(
+		markup.Data("К списку", ticketsBtn.Unique, listData(project.Slug, page)),
+		markup.Data("Меню проекта", backBtn.Unique, project.Slug)))
 	markup.Inline(rows...)
 
 	// Карточка длиннее одного сообщения правкой не помещается: режем на куски
@@ -1837,10 +1870,12 @@ func (b *Bot) onCard(c tele.Context) error {
 	return b.screen(c, cardText(ticket), markup)
 }
 
-// backToList - единственная кнопка возврата к списку тикетов проекта.
-func backToList(slug string) *tele.ReplyMarkup {
+// backToList - единственная кнопка возврата к списку тикетов проекта. Страница
+// та, на которой лежит тикет: возврат в начало списка с третьей страницы читался
+// бы как потеря места.
+func backToList(slug string, page int) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, slug)))
+	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, listData(slug, page))))
 	return markup
 }
 
@@ -1856,20 +1891,26 @@ func (b *Bot) onFull(c tele.Context) error {
 	if err != nil || !ok {
 		return err
 	}
+	page, err := b.tickets.Page(ctx, project, number)
+	if err != nil {
+		return err
+	}
 
 	ticket, err := b.tickets.Load(ctx, project, number)
 	switch {
 	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug))
+		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug, page))
 	case err != nil:
 		return err
 	case ticket == nil:
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
 	}
 
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data(fmt.Sprintf("К тикету #%d", number),
-		cardBtn.Unique, cardData(project.Slug, number))))
+	markup.Inline(markup.Row(
+		markup.Data(fmt.Sprintf("К тикету #%d", number), cardBtn.Unique,
+			cardData(project.Slug, number)),
+		markup.Data("К списку", ticketsBtn.Unique, listData(project.Slug, page))))
 	text := fmt.Sprintf("Тикет #%d - полное описание\n\n%s", number, ticket.Body)
 	if len(text) > maxMessage {
 		_, err := b.sendLong(c.Recipient(), text, markup)
@@ -1890,14 +1931,18 @@ func (b *Bot) onKill(c tele.Context) error {
 	if err != nil || !ok {
 		return err
 	}
+	page, err := b.tickets.Page(ctx, project, number)
+	if err != nil {
+		return err
+	}
 
 	caseID, err := b.tickets.Cancel(ctx, project, number, senderID(c))
 	switch {
 	case errors.Is(err, ErrNotAuthor):
 		b.log.Warn("cancel_denied", "user_id", senderID(c), "project", project.Slug, "issue", number)
-		return b.screen(c, "Отменить тикет может только его автор.", backToList(project.Slug))
+		return b.screen(c, "Отменить тикет может только его автор.", backToList(project.Slug, page))
 	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug))
+		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
 	case err != nil:
 		return err
 	}
@@ -1909,15 +1954,16 @@ func (b *Bot) onKill(c tele.Context) error {
 				MessageID: strconv.Itoa(msg.ID), ChatID: msg.Chat.ID,
 			},
 			slug: project.Slug,
+			page: page,
 		})
 	}
 	// Кнопка отмены снимается сразу: работа уже в очереди, второе нажатие
 	// поставило бы её заново.
 	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу, когда закроется.", number),
-		backToList(project.Slug))
+		backToList(project.Slug, page))
 }
 
-// cardTarget разбирает кнопку карточки. Второе значение false означает, что
+// cardTarget разбирает кнопку карточки. Третье значение false означает, что
 // автору уже ответили отказом.
 func (b *Bot) cardTarget(ctx context.Context, c tele.Context) (Project, int, bool, error) {
 	slug, raw, found := strings.Cut(c.Data(), ":")
@@ -1953,6 +1999,26 @@ func (b *Bot) project(ctx context.Context, slug string) (Project, bool, error) {
 
 func cardData(slug string, number int) string {
 	return slug + ":" + strconv.Itoa(number)
+}
+
+// listData - кнопка страницы списка. Формат тот же, что у карточки: `slug:N`
+// укладывается в 64 байта callback_data с запасом.
+func listData(slug string, page int) string {
+	return slug + ":" + strconv.Itoa(page)
+}
+
+// listTarget разбирает кнопку списка. Кнопка без номера страницы - это вход из
+// меню проекта и из команды: там страница всегда первая.
+func listTarget(data string) (string, int) {
+	slug, raw, found := strings.Cut(data, ":")
+	if !found {
+		return data, 0
+	}
+	page, err := strconv.Atoi(raw)
+	if err != nil || page < 0 {
+		return slug, 0
+	}
+	return slug, page
 }
 
 func ticketLine(t Ticket) string {

@@ -36,7 +36,7 @@ func TestListSkipsPullRequests(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool), 7001)
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7001, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestListBackfillsOldTicket(t *testing.T) {
 	})
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool), 7009)
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7009, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestListSurvivesGitHubError(t *testing.T) {
 	t.Cleanup(server.Close)
 	tickets := newTestTickets(t, cases, server.URL)
 
-	list, err := tickets.List(context.Background(), testProject(t, pool), 7002)
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7002, 0)
 	if err != nil {
 		t.Fatalf("отказ GitHub уронил список: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestListByProject(t *testing.T) {
 	}
 
 	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
-	list, err := tickets.List(context.Background(), testProject(t, pool), 7006)
+	list, _, err := tickets.List(context.Background(), testProject(t, pool), 7006, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
