@@ -197,9 +197,9 @@ func TestMarkSeenOnlyAuthor(t *testing.T) {
 	}
 }
 
-// TestListPutsOwnFirst: окно списка короткое, и человек пришёл за своим тикетом.
-// Отметка новости остаётся авторской: чужая ему ничего не говорит.
-func TestListPutsOwnFirst(t *testing.T) {
+// TestListNewsIsAuthors: отметка новости авторская. Чужая ничего не говорит тому,
+// кто открыл список, а гасит её только автор.
+func TestListNewsIsAuthors(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
@@ -212,19 +212,70 @@ func TestListPutsOwnFirst(t *testing.T) {
 	}
 
 	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
-	list, err := tickets.List(ctx, testProject(t, pool), 7107)
+	list, total, err := tickets.List(ctx, testProject(t, pool), 7107, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(list) != 2 {
-		t.Fatalf("тикетов: %d, ожидалось 2", len(list))
+	if len(list) != 2 || total != 2 {
+		t.Fatalf("тикетов: %d, всего %d, ожидалось 2 и 2", len(list), total)
 	}
-	// Свой тикет с меньшим номером стоит выше чужого со старшим.
-	if list[0].Number != 80 || !list[0].News {
-		t.Errorf("первым идёт %+v", list[0])
+	// Порядок по номеру: 90 свежее 80.
+	if list[0].Number != 90 || list[0].News {
+		t.Errorf("чужой тикет: %+v", list[0])
 	}
-	if list[1].Number != 90 || list[1].News {
-		t.Errorf("чужой тикет: %+v", list[1])
+	if list[1].Number != 80 || !list[1].News {
+		t.Errorf("свой тикет без отметки: %+v", list[1])
+	}
+}
+
+// TestListPaging: вторая страница отдаёт следующую десятку, а не повторяет
+// первую. Без листания старый тикет автору недостижим - аккаунта GitHub у него
+// нет.
+func TestListPaging(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	for n := range ticketsLimit + 3 {
+		publishCase(t, cases, int64(7200+n), 200+n)
+	}
+
+	tickets := newTestTickets(t, cases, githubStub(t, nil).URL)
+	first, total, err := tickets.List(ctx, testProject(t, pool), 7200, 0)
+	if err != nil {
+		t.Fatalf("list page 1: %v", err)
+	}
+	if total != ticketsLimit+3 || len(first) != ticketsLimit {
+		t.Fatalf("страница 1: %d из %d", len(first), total)
+	}
+	second, _, err := tickets.List(ctx, testProject(t, pool), 7200, 1)
+	if err != nil {
+		t.Fatalf("list page 2: %v", err)
+	}
+	if len(second) != 3 {
+		t.Fatalf("страница 2: %d, ожидалось 3", len(second))
+	}
+	if second[0].Number != first[len(first)-1].Number-1 {
+		t.Errorf("страницы пересекаются или рвутся: %d после %d",
+			second[0].Number, first[len(first)-1].Number)
+	}
+
+	// Страница за концом списка: пусто, но без ошибки - экран вернёт на первую.
+	empty, _, err := tickets.List(ctx, testProject(t, pool), 7200, 9)
+	if err != nil || len(empty) != 0 {
+		t.Errorf("страница за концом: %d тикетов, ошибка %v", len(empty), err)
+	}
+
+	// Кнопка «К списку» считает страницу по номеру тикета: возврат обязан попасть
+	// туда, откуда автор ушёл в карточку.
+	page, err := tickets.Page(ctx, testProject(t, pool), second[0].Number)
+	if err != nil {
+		t.Fatalf("page: %v", err)
+	}
+	if page != 1 {
+		t.Errorf("страница тикета #%d: %d, ожидалась 1", second[0].Number, page)
+	}
+	if page, err = tickets.Page(ctx, testProject(t, pool), first[0].Number); err != nil || page != 0 {
+		t.Errorf("страница свежего тикета: %d, ошибка %v", page, err)
 	}
 }
 

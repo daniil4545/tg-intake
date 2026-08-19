@@ -77,44 +77,49 @@ func NewTickets(cases *Cases, gh *GitHub, statuses Statuses, log *slog.Logger, a
 	return &Tickets{cases: cases, gh: gh, statuses: statuses, log: log, alertChat: alertChat}
 }
 
-// List - последние тикеты проекта. Номера и заголовки из своей базы, статусы
-// одним запросом к GitHub.
+// List - страница тикетов проекта. Номера и заголовки из своей базы, статусы
+// одним запросом к GitHub. Второе значение - сколько тикетов у проекта всего:
+// без него не собрать навигацию, а лишний COUNT по своей базе дешевле, чем
+// «вперёд» в пустоту.
 //
-// Свои тикеты идут первыми: правило «все видят все» остаётся, но человек пришёл
-// за своим, а окно списка короткое. Отказ GitHub не прячет список: тикеты видны
-// без статусов. Просмотр не должен умирать вместе с чужим сервисом.
-func (t *Tickets) List(ctx context.Context, project Project, userID int64) ([]Ticket, error) {
+// Отказ GitHub не прячет список: тикеты видны без статусов. Просмотр не должен
+// умирать вместе с чужим сервисом.
+func (t *Tickets) List(ctx context.Context, project Project, userID int64, page int) ([]Ticket, int, error) {
+	if page < 0 {
+		page = 0
+	}
 	rows, err := t.cases.pool.Query(ctx, `
 		SELECT id, issue_number, COALESCE(issue_url, ''), COALESCE(title, ''), user_id,
-		       has_news AND user_id = $3
+		       has_news AND user_id = $3, count(*) OVER ()
 		FROM cases
 		WHERE project_id = $1 AND issue_number IS NOT NULL
-		ORDER BY (user_id = $3) DESC, issue_number DESC LIMIT $2`,
-		project.ID, ticketsLimit, userID)
+		ORDER BY issue_number DESC LIMIT $2 OFFSET $4`,
+		project.ID, ticketsLimit, userID, page*ticketsLimit)
 	if err != nil {
-		return nil, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
+		return nil, 0, fmt.Errorf("query tickets of project %d: %w", project.ID, err)
 	}
 	defer rows.Close()
 
 	var tickets []Ticket
+	total := 0
 	for rows.Next() {
 		var t Ticket
-		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID, &t.News); err != nil {
-			return nil, fmt.Errorf("scan ticket: %w", err)
+		if err := rows.Scan(&t.CaseID, &t.Number, &t.URL, &t.Title, &t.UserID, &t.News, &total); err != nil {
+			return nil, 0, fmt.Errorf("scan ticket: %w", err)
 		}
 		tickets = append(tickets, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read tickets: %w", err)
+		return nil, 0, fmt.Errorf("read tickets: %w", err)
 	}
 	if len(tickets) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	issues, err := t.gh.ListIssues(ctx, project, issueScan)
 	if err != nil {
 		t.log.Warn("issues_unavailable", "project", project.Slug, "error", err)
-		return tickets, nil
+		return tickets, total, nil
 	}
 
 	labels := make(map[int][]string, len(issues))
@@ -145,7 +150,7 @@ func (t *Tickets) List(ctx context.Context, project Project, userID int64) ([]Ti
 			tickets[i].Status = status
 		}
 	}
-	return tickets, nil
+	return tickets, total, nil
 }
 
 // Load - карточка тикета. Тело берётся из своей базы, а не из issue.body: в
@@ -207,6 +212,21 @@ func (t *Tickets) Load(ctx context.Context, project Project, number int) (*Ticke
 	}
 	ticket.Comment = comment
 	return &ticket, nil
+}
+
+// Page - на какой странице списка лежит тикет. Считается по номеру, а не
+// запоминается в кнопке: кнопку нажимают и из сообщения недельной давности, а
+// список к тому времени сдвинулся.
+func (t *Tickets) Page(ctx context.Context, project Project, number int) (int, error) {
+	var above int
+	err := t.cases.pool.QueryRow(ctx, `
+		SELECT count(*) FROM cases
+		WHERE project_id = $1 AND issue_number IS NOT NULL AND issue_number > $2`,
+		project.ID, number).Scan(&above)
+	if err != nil {
+		return 0, fmt.Errorf("count tickets above %d: %w", number, err)
+	}
+	return above / ticketsLimit, nil
 }
 
 // MarkSeen снимает отметку о новости: автор открыл карточку и всё прочитал.
