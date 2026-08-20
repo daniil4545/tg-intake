@@ -97,8 +97,9 @@ func main() {
 		"model_dialog", cfg.ModelDialog, "reasoning", cfg.ReasoningDialog)
 	normalizer := app.NewNormalizer(cases, llm, log)
 	dialog := app.DialogModel{Name: cfg.ModelDialog, Reasoning: cfg.ReasoningDialog}
-	interview := app.NewInterview(cases, llm, log, rules, dialog, cfg.InterviewRounds)
 	github := app.NewGitHub(cfg.GitHubToken, app.GitHubAPI, statuses, log)
+	overlap := app.NewOverlap(github, llm, log, dialog)
+	interview := app.NewInterview(cases, llm, log, rules, dialog, cfg.InterviewRounds, overlap)
 	publisher := app.NewPublisher(cases, github, rules, log, cfg.AlertChatID)
 
 	checkGitHub(ctx, pool, github, log)

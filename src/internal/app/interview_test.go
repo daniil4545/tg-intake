@@ -31,7 +31,7 @@ func newTestInterview(t *testing.T, cases *Cases, rounds int) *Interview {
 	t.Helper()
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds)
+	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds, nil)
 }
 
 // TestLoadContract: правила едут в бинарь и обязаны быть рабочими. Тип без
@@ -1037,7 +1037,7 @@ func TestPrefixStable(t *testing.T) {
 	i := newTestInterview(t, cases, 3)
 	cs := startInterview(t, cases, 6004, 1)
 
-	first, err := i.dialog(ctx, cs, i.askPrefix)
+	first, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		t.Fatalf("dialog: %v", err)
 	}
@@ -1052,7 +1052,7 @@ func TestPrefixStable(t *testing.T) {
 		t.Fatalf("add answer: %v", err)
 	}
 
-	second, err := i.dialog(ctx, reload(t, cases, cs.ID), i.askPrefix)
+	second, _, err := i.dialog(ctx, reload(t, cases, cs.ID), i.askPrefix)
 	if err != nil {
 		t.Fatalf("dialog after round: %v", err)
 	}
