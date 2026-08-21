@@ -68,7 +68,13 @@ intake/
 Всё из `src`: `docker compose up -d postgres`, `make migrate-up`, `make run`,
 `make test`, `make vet`, `make ci-check`, `make migrate-reset`. `migrate-*`
 отказываются работать с не-localhost базой без `ALLOW_REMOTE=1`; тесты с базой
-идут только при заданном `TEST_DATABASE_URL`, иначе молча скипаются.
+идут только при заданном `TEST_DATABASE_URL`, иначе молча скипаются. Это и есть
+быстрый ярус: без переменной прогон закрывает срез не полностью, доказательный -
+только с `TEST_DATABASE_URL`.
+
+Новый тест оправдан, только если сломанный код его роняет: прежде чем оставить
+тест, мысленно сломать покрываемую строку и назвать, что упадёт. Не падает - тест
+не пишется. Один сценарий спеки - один тест.
 
 Обязательные переменные: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`,
 `TELEGRAM_ALLOWED_IDS`, `OPENROUTER_API_KEY`, `GITHUB_TOKEN`; проекты контура -
