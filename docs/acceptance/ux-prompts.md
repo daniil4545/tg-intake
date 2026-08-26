@@ -1,6 +1,6 @@
 # Приёмка: мелочи разговора и код под правила промтов
 
-Дата: 2026-08-13. Спека: [plan-ux-prompts.md](../plans/plan-ux-prompts.md).
+Дата: 2026-08-13. Релиз 0.1.8.
 Ветка: `feature/ux-prompts`. Идёт следом за
 [queue-hardening](queue-hardening.md).
 

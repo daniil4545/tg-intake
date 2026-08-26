@@ -1,7 +1,6 @@
 # Приёмка: время ответа интервью
 
-Дата: 2026-08-13. Спека: [plan-interview-latency.md](../plans/plan-interview-latency.md).
-Ветка: `feature/interview-latency`.
+Дата: 2026-08-13. Релиз 0.1.6. Ветка: `feature/interview-latency`.
 
 ## Что меняется для людей
 

@@ -50,7 +50,7 @@ GitHub REST API. Runtime - один сервис в Docker, контур в Cool
 | [docs/llm.md](docs/llm.md) | схемы ответов модели, проверки Go, промты и правила |
 | [docs/backlog.md](docs/backlog.md) | milestones и активные задачи |
 | [docs/state.md](docs/state.md) | что сделано, что в работе, принятые решения |
-| [docs/plans/](docs/plans/) | спека каждого нетривиального среза до его реализации |
+| [docs/plans/](docs/plans/) | спека нетривиального среза до реализации; у закрытых срезов остаётся выжимка «что вышло иначе и почему» |
 | [docs/acceptance/](docs/acceptance/) | паспорт приёмки среза: что меняется для людей и как проверить |
 | [AGENTS.md](AGENTS.md) | точка входа для AI-агентов |
 
