@@ -143,7 +143,9 @@ jobs:
           #
           # Ответ печатаем по той же причине: HTTP 200 приходит и тогда, когда
           # выкат не начат, а причина лежит в теле.
-          response=$(curl --fail --silent --show-error --request GET \
+          #
+          # POST, а не GET: с Coolify 4.2.0 изменяющие ручки отвечают на GET 405.
+          response=$(curl --fail --silent --show-error --request POST \
             "${COOLIFY_API_BASE}/deploy?uuid=${COOLIFY_DEV_SERVICE_UUID}&force=true" \
             --header "Authorization: Bearer ${COOLIFY_TOKEN}")
           echo "coolify response: ${response}"
