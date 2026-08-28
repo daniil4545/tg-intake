@@ -1,9 +1,9 @@
 name: CI
 
+# Автотриггер снят 28.08.2026: GitHub Actions не используются, проверки идут
+# локально (make ci-check). Вернуть pull_request вместе с self-hosted раннером.
 on:
-  pull_request:
-    branches:
-      - prod
+  workflow_dispatch:
 
 permissions:
   contents: read
