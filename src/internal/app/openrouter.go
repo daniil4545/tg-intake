@@ -320,7 +320,7 @@ func (c *OpenRouter) send(ctx context.Context, body []byte) (llmResult, bool, er
 	if err != nil {
 		return llmResult{}, true, fmt.Errorf("post: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, llmBodyLimit))
 	if err != nil {

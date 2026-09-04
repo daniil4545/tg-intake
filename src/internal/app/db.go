@@ -153,7 +153,7 @@ func inTx(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) err
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := fn(tx); err != nil {
 		return err

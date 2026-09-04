@@ -474,7 +474,7 @@ func (g *GitHub) send(ctx context.Context, client *http.Client, method, path str
 		// от дубля защищает поиск маркера.
 		return nil, true, fmt.Errorf("github %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, githubLimit))
 	if err != nil {

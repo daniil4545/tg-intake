@@ -9,7 +9,7 @@ endif
 GOOSE := go run -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.27.3
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: run build test vet ci-check check-db migrate-up migrate-down migrate-reset
+.PHONY: run build test test-fast vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
 
 run:
 	go run ./cmd/intake
@@ -23,10 +23,24 @@ build:
 test:
 	go test ./... $(if $(RUN),-run $(RUN) -count=1,)
 
+# Быстрый ярус без БД: петля внутри среза и кольцо коммита.
+test-fast:
+	go test -short ./... $(if $(RUN),-run $(RUN) -count=1,)
+
 vet:
 	go vet ./...
 
-ci-check: migrate-up test vet build
+fmt-check:
+	@out=$$(gofmt -l ./cmd ./internal); \
+	test -z "$$out" || { echo "gofmt needed:"; echo "$$out"; exit 1; }
+
+lint:
+	golangci-lint run --timeout 120s
+
+# Кольцо коммита: секунды, без БД. Полный набор закрывает срез (ci-check).
+commit-check: fmt-check vet lint test-fast
+
+ci-check: migrate-up test vet fmt-check lint build
 
 # DATABASE_URL молча подхватывается из .env, поэтому migrate-* может уехать в
 # чужую базу. Печатаем цель без пароля и требуем ALLOW_REMOTE=1 для всего, что

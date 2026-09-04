@@ -64,7 +64,7 @@ func (m *Media) Download(bot *tele.Bot, caseID, name string, file tele.File) (st
 	if err := bot.Download(&file, path); err != nil {
 		// Недокачанный файл нельзя оставлять: шаг нормализации примет его за
 		// целый и отдаст модели обрезанную запись.
-		os.Remove(path)
+		_ = os.Remove(path)
 		return "", fmt.Errorf("download file: %w", err)
 	}
 	return path, nil
