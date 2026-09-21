@@ -8,7 +8,7 @@
 |---|---|---|---|
 | Telegram Bot API | у сообщения одно поле `reply_markup`: либо inline, либо reply-клавиатура | Bot API, `sendMessage`; код `bot.go:770`, 21.09 | - |
 | Telegram Bot API | `deleteMessage` работает для сообщений моложе 48 часов | Bot API, `deleteMessage`, 21.09 | правило 5 §2.1 не меняется |
-| Telegram Bot API | снятие inline-кнопок `editMessageReplyMarkup` у старого сообщения бота | не проверено | замер в срезе 4 до кода: снять кнопки у сообщения старше 48 часов в песочнице; не работает - устаревшие кнопки ловит только правило 3 |
+| Telegram Bot API | снятие inline-кнопок `editMessageReplyMarkup` у старого сообщения бота | Bot API, `editMessageReplyMarkup`, 21.09: предел 48 часов назван только для бизнес-сообщений не от бота | закрывается логом `screen_strip_failed` на контуре; безопасно при обоих ответах |
 | Telegram Bot API | `callback_data` 1-64 байта | `docs/contracts.md`, 21.09 | формат кнопок не меняется (§2.1, правило 3) |
 | OpenRouter | структурный вывод `json_schema` у `OPENROUTER_MODEL_DIALOG` | прод 0.1.13, интервью на нём работает, 21.09 | - |
 | Прод-БД intake | сырьё хранится после публикации: `cases.protocol`, `case_items.normalized`, ответы в `case_events` | миграция `0001_init.sql:35,62,74`, 21.09 | набор собирается из тел issue, цифры кругов не сравнимы |
