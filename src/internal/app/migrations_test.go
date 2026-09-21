@@ -182,3 +182,69 @@ func TestMigration0011(t *testing.T) {
 		t.Error("после отката CHECK принял mixed")
 	}
 }
+
+// TestMigration0012: строка, заведённая до миграции, получает нулевой живой
+// экран (screen_msg = 0 - «экрана нет», screen_round = 0 - «не раунд»), а
+// откат убирает обе колонки без следа (строка 1 §3b плана live-screen).
+func TestMigration0012(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := goose.SetDialect("postgres"); err != nil {
+		t.Fatalf("set dialect: %v", err)
+	}
+	const dir = "../../migrations"
+	// Остальные тесты пакета ждут схему последней версии.
+	t.Cleanup(func() {
+		if err := goose.Up(db, dir); err != nil {
+			t.Errorf("restore schema: %v", err)
+		}
+	})
+
+	if err := goose.UpTo(db, dir, 11); err != nil {
+		t.Fatalf("up to 11: %v", err)
+	}
+	if _, err := db.Exec(`TRUNCATE cases, case_items, case_events, jobs, users RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO users (telegram_id, first_name, slug) VALUES (9400, 'Тест', 'test-0012')`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	var id string
+	err = db.QueryRow(`
+		INSERT INTO cases (user_id, status) VALUES (9400, 'collecting') RETURNING id`).Scan(&id)
+	if err != nil {
+		t.Fatalf("insert case: %v", err)
+	}
+
+	if err := goose.UpTo(db, dir, 12); err != nil {
+		t.Fatalf("up to 12: %v", err)
+	}
+	var screenMsg, screenRound int
+	if err := db.QueryRow(`SELECT screen_msg, screen_round FROM cases WHERE id = $1`, id).
+		Scan(&screenMsg, &screenRound); err != nil {
+		t.Fatalf("read screen columns: %v", err)
+	}
+	if screenMsg != 0 || screenRound != 0 {
+		t.Errorf("после миграции: screen_msg=%d screen_round=%d, ожидалось 0 и 0", screenMsg, screenRound)
+	}
+
+	if err := goose.DownTo(db, dir, 11); err != nil {
+		t.Fatalf("down to 11: %v", err)
+	}
+	var columns int
+	if err := db.QueryRow(`
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_name = 'cases' AND column_name IN ('screen_msg', 'screen_round')`).Scan(&columns); err != nil {
+		t.Fatalf("check columns: %v", err)
+	}
+	if columns != 0 {
+		t.Errorf("после отката колонки живого экрана остались: %d", columns)
+	}
+}

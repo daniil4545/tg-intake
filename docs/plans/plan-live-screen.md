@@ -48,13 +48,13 @@ Architecture review: pass with fixes, находки M1, M2, S1-S7 закрыт�
 
 ## 3b. Сценарии проверки
 
-Вынесены в [plan-live-screen-3b.md](plan-live-screen-3b.md), 20 строк.
+Вынесены в [plan-live-screen-3b.md](plan-live-screen-3b.md), 23 строки (20 плана + 3 ревью).
 
 ## 4. Данные и состояния
 
-`screen_msg`: 0 - экрана нет; чат равен `user_id`. `screen_round`: номер раунда на экране,
-0 - экран не раунд (счётчик, саммари). Шаг - снять старый, отправить, записать новый;
-переход - снять, записать 0; правка на месте экран не меняет.
+`screen_msg`/`screen_round`: 0 - нет экрана / не раунд ответа (счётчик, саммари), чат равен
+`user_id`. Шаг - снять старый, отправить, записать новый; переход - снять, обнулить; правка на
+месте экран не меняет.
 
 | Место | Класс | Экран |
 |---|---|---|
@@ -63,7 +63,7 @@ Architecture review: pass with fixes, находки M1, M2, S1-S7 закрыт�
 | `Notify` `keysSummary` | шаг | `showStep`, раунд 0 |
 | `Notify` `keysHome` | переход | `closeScreen`, затем отправка |
 | `Notify` `keysAnswer` | вне шагов | `ResetScreen` без снятия, вместо `dropTally` |
-| `onDone` после `FinishCollect == nil`; `onContinue` в ветке `collecting`; `onReset`, `onResetYes` после `CancelCase == nil`; `onToTicket` при `switched` | переход | `closeScreen` |
+| `onDone`/`onEndAsk`/`onToTicket` после успешного перехода; `onContinue` в `collecting`, после проверки проекта; `onReset`/`onResetYes` после `CancelCase == nil` | переход | `closeScreen` |
 
 ## 5. Кодовая модель
 
@@ -76,6 +76,7 @@ func (b *Bot) showStep(ctx context.Context, cs *Case, round int, text string, op
 func (b *Bot) closeScreen(ctx context.Context, cs *Case)
 func (b *Bot) stripScreen(cs *Case, msgID int)
 func (b *Bot) liveScreen(c tele.Context, cs *Case) bool
+func (b *Bot) markRound(ctx context.Context, cs *Case, first string) bool
 ```
 
 - `SetScreen`: `UPDATE cases SET screen_msg = $2, screen_round = $3 WHERE id = $1`.
@@ -87,18 +88,18 @@ func (b *Bot) liveScreen(c tele.Context, cs *Case) bool
   `SetScreen(sent.ID, round)`; ошибки отправки и записи - наверх.
 - `closeScreen`: снять, `ResetScreen(cs.Screen)`; ошибка записи - `Warn screen_reset_failed`.
 - `liveScreen`: `Screen == 0` или id нажатого равен `Screen` - true; иначе toast, снятие
-  нажатого, false. Зовут `onAllTrue`, `onPublish`, `onFix` после `Active` и до своего toast.
-- `markRound`: правит `Screen`, только если `statusInterview`, `Screen != 0`,
-  `ScreenRound == cs.Round` (раунд ответа) и текст `roundMessage` из `RoundView` с пометкой
-  по `answers` не длиннее `maxMessage`; иначе false, ответ новым сообщением.
+  нажатого, false. Зовут `onAllTrue`/`onPublish`/`onFix` после `Active`, до своего toast.
+- `markRound(ctx, cs, first)`: правит `Screen`, только если `statusInterview`, `Screen != 0`,
+  `ScreenRound == cs.Round` и текст `roundMessage` из `RoundView` с пометкой (`first` при одном
+  ответе, «Принято ответов: N» при нескольких) не длиннее `maxMessage`; иначе false, ответ
+  новым сообщением, нажатую кнопку (если была) снимает вызывающий.
 - `RoundView`: `lastQuestions` и `count(*)` `answer_given` с `id` больше последнего `round_asked`.
 
 ## 6. Этапы реализации
 
 1. Тесты §3b, красные. 2. `0012`, поля `Case`, `SetScreen`, `ResetScreen`, `RoundView`.
 3. Помощники, `Notify`, `countItem`, `markRound`; `tally`, `rounds` удаляются. 4. `liveScreen`,
-переходы. 5. Канон: `contracts.md` (живой экран, правило 3), `architecture.md` (колонки,
-память `Bot`).
+переходы. 5. Канон: `contracts.md` (живой экран, правило 3), `architecture.md` (колонки).
 
 ## 7. Критерий приёмки
 
@@ -124,22 +125,24 @@ func (b *Bot) liveScreen(c tele.Context, cs *Case) bool
 
 Bot API, `editMessageReplyMarkup` (проверено 21.09): «Note that business messages that were
 not sent by the bot and do not contain an inline keyboard can only be edited within 48 hours
-from the time they were sent». Предел назван только для бизнес-сообщений не от бота; прямого
-«без предела» для своих сообщений нет. Поведение безопасно при обоих ответах: отказ снятия -
-лог, устаревшую кнопку ловит правило 3; вопрос закрывает `screen_strip_failed` на контуре.
+from the time they were sent». Предел - только у бизнес-сообщений не от бота, для своих явного
+«без предела» нет: отказ снятия - лог, кнопку ловит правило 3.
 
 1. Исход отмены тикета и `kills` - срез 6: навигация §2.1 (§8, §13 глобальной спеки поправлены).
 2. Счётчик сбора - живой экран без кнопок, заменяет `tally` (Р-8); снятие у него - no-op.
 3. Ответ по документации не шаг: кнопки остаются, экран обнуляется, как `dropTally`.
 4. Toast правила 3 только у кнопок шага; фолбэк `OnCallback` и «Это кнопка от прошлого
    вопроса» (путь `screen_msg = 0`) - срезы 6, 7.
-5. Хендлер шага читает обращение до toast: callback отвечается один раз, текст toast зависит
-   от проверки. Цена - спиннер на один `SELECT`. Каждый выход хендлера кнопки шага до
-   `liveScreen` (ошибка `Active`, `cs == nil`) отвечает на callback (S3).
-6. Отказ `ResetScreen` на переходе - лог: переход автор уже получил.
+5. Хендлер шага читает обращение до toast, текст toast зависит от проверки. `cs == nil` -
+   ожидаемый исход, отвечает сам; отказ `Active` не отвечает - ответит `OnError`, второй
+   `Respond` был бы дублем (ревью).
+6. Отказ `ResetScreen` - только лог, без return: на переходе автор уже получил ответ, а после
+   `keysAnswer` повтор работы прислал бы тот же ответ вторым сообщением (ревью).
 7. `screen_round` (M1): без него пометка ответа садилась на саммари или на экран прошлого
-   раунда, когда следующий записан, а `Notify` ещё не доставлен.
+   раунда, когда следующий уже записан, а `Notify` не доставлен. Тот же риск для самого
+   `Notify` (ревью): `keysRound`/`keysAsk` несут раунд в payload (`putNotifyRound`), шаг только
+   при `interview && payload.Round >= cs.Round`; `keysSummary` - только при `summary`; `keysHome`
+   закрывает экран, только если `ScreenRound == 0`. Иначе - сообщение без кнопки, экран цел.
 8. `bigint`: `message_id` в Bot API - Integer без обещания 32 бит.
-9. После «Всё так» следующий текст автора перепишет «Принято: всё так» в «Принято ответов:
-   N» (раньше `dropRound` отдавал его новым сообщением): `AcceptRound` тоже пишет
-   `answer_given`. Принято (S4): экран раунда один, счёт честный.
+9. «Всё так» переиспользует `markRound` (S4): первый ответ - «Принято: всё так», следующие -
+   общий счётчик «Принято ответов: N», `AcceptRound` тоже пишет `answer_given`.

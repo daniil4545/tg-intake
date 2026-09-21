@@ -107,6 +107,10 @@ type Case struct {
 	// состоялась: для потока автора это одно и то же.
 	Overlap     string
 	IssueNumber int
+	// Screen - id последнего сообщения шага, кнопки которого ещё действуют
+	// («живой экран»), 0 - экрана нет. ScreenRound - раунд, к которому оно
+	// относится, 0 - экран не раунд ответа (счётчик сбора, саммари).
+	Screen, ScreenRound int
 }
 
 // Item - элемент сырья. Forwarded помечает пересылку: модель должна знать, что
@@ -148,7 +152,7 @@ type txRunner interface {
 
 const caseColumns = `id, user_id, project_id, status, mode, protocol, COALESCE(kind, ''),
 	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), COALESCE(brief, ''),
-	incomplete, overlap, COALESCE(issue_number, 0)`
+	incomplete, overlap, COALESCE(issue_number, 0), screen_msg, screen_round`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -172,7 +176,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	var filled, gaps []byte
 	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Mode, &cs.Protocol, &cs.Kind,
 		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Brief, &cs.Incomplete,
-		&cs.Overlap, &cs.IssueNumber)
+		&cs.Overlap, &cs.IssueNumber, &cs.Screen, &cs.ScreenRound)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -276,6 +280,31 @@ func (c *Cases) SetProject(ctx context.Context, cs *Case, projectSlug string) er
 
 	cs.ProjectID = &id
 	c.log.Info("project_set", "user_id", cs.UserID, "case_id", cs.ID, "project", projectSlug)
+	return nil
+}
+
+// SetScreen фиксирует новый живой экран обращения: id только что отправленного
+// сообщения шага и раунд, к которому оно относится. Пишет только свои колонки -
+// updated_at не трогает, иначе на нём споткнулись бы SweepDrafts и RemindDrafts.
+func (c *Cases) SetScreen(ctx context.Context, caseID string, msgID, round int) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE cases SET screen_msg = $2, screen_round = $3 WHERE id = $1`, caseID, msgID, round)
+	if err != nil {
+		return fmt.Errorf("set screen of case %s: %w", caseID, err)
+	}
+	return nil
+}
+
+// ResetScreen снимает живой экран, только если он всё ещё тот, что назвал
+// вызывающий: параллельный шаг мог успеть записать новый экран, и его нельзя
+// затирать чужим снятием.
+func (c *Cases) ResetScreen(ctx context.Context, caseID string, msgID int) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE cases SET screen_msg = 0, screen_round = 0
+		WHERE id = $1 AND screen_msg = $2`, caseID, msgID)
+	if err != nil {
+		return fmt.Errorf("reset screen of case %s: %w", caseID, err)
+	}
 	return nil
 }
 
@@ -1080,11 +1109,15 @@ type itemPayload struct {
 // текущий раунд.
 // Непустой ChatID означает уведомление владельцу: адресат назван явно, кнопок и
 // экранов у него нет.
+// Round - номер раунда, к которому относится сообщение keysRound/keysAsk:
+// запоздавшая доставка (round меньше текущего cs.Round) не должна стать новым
+// живым экраном поверх раунда, который автор уже прошёл.
 type notifyPayload struct {
 	CaseID  string `json:"case_id"`
 	Text    string `json:"text"`
 	Buttons string `json:"buttons,omitempty"`
 	ChatID  int64  `json:"chat_id,omitempty"`
+	Round   int    `json:"round,omitempty"`
 }
 
 // Наборы кнопок под сообщением из очереди.
@@ -1250,11 +1283,19 @@ func putNotify(ctx context.Context, db Runner, caseID string, jobID int64, text 
 	return putNotifyKey(ctx, db, caseID, strconv.FormatInt(jobID, 10), text, "")
 }
 
-// putNotifyKey - то же с явным суффиксом ключа: у напоминания и у раунда
-// вопросов нет породившей работы, но повторяться они не должны.
+// putNotifyKey - то же с явным суффиксом ключа: у напоминания, например, нет
+// породившей работы, но повторяться оно не должно.
 func putNotifyKey(ctx context.Context, db Runner, caseID, suffix, text, buttons string) error {
 	key := fmt.Sprintf("%s:%s:%s", JobNotify, caseID, suffix)
 	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons})
+}
+
+// putNotifyRound - сообщение раунда вопросов (keysRound/keysAsk), несёт номер
+// раунда: запоздавшая доставка после следующего раунда не должна стать новым
+// живым экраном, Notify это проверяет по Round из payload.
+func putNotifyRound(ctx context.Context, db Runner, caseID string, round int, text, buttons string) error {
+	key := fmt.Sprintf("%s:%s:round-%d", JobNotify, caseID, round)
+	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons, Round: round})
 }
 
 // putAlert ставит уведомление владельцу. Работа того же вида, что и сообщение

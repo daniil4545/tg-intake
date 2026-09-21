@@ -386,8 +386,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		if hasSuggestion(turn.Questions) {
 			keys = keysRound
 		}
-		return putNotifyKey(ctx, tx, cs.ID, fmt.Sprintf("round-%d", round),
-			roundMessage(turn.Questions), keys)
+		return putNotifyRound(ctx, tx, cs.ID, round, roundMessage(turn.Questions), keys)
 	})
 	return saved, err
 }
@@ -1113,6 +1112,28 @@ func (c *Cases) lastQuestions(ctx context.Context, caseID string) ([]Question, e
 		return nil, fmt.Errorf("decode last round of case %s: %w", caseID, err)
 	}
 	return p.Questions, nil
+}
+
+// RoundView - вопросы последнего раунда вместе с числом ответов после него:
+// живая версия того, что markRound показывает на экране. Живёт в БД, а не в
+// памяти процесса - экран обязан пережить рестарт.
+func (c *Cases) RoundView(ctx context.Context, caseID string) ([]Question, int, error) {
+	questions, err := c.lastQuestions(ctx, caseID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var answers int
+	err = c.pool.QueryRow(ctx, `
+		SELECT count(*) FROM case_events
+		WHERE case_id = $1 AND kind = 'answer_given'
+		  AND id > COALESCE(
+		      (SELECT max(id) FROM case_events WHERE case_id = $1 AND kind = 'round_asked'), 0)`,
+		caseID).Scan(&answers)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count round answers of case %s: %w", caseID, err)
+	}
+	return questions, answers, nil
 }
 
 // ConfirmSummary - кнопка «Публикую». Ключ работы без счётчика: issue у

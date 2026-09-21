@@ -111,18 +111,13 @@ type Bot struct {
 	// на репозиторий. Та же дисциплина, что и menuAt: последовательные хендлеры,
 	// потеря при рестарте безвредна - автор нажмёт кнопку снова.
 	awaitLink map[int64]time.Time
-	// Сообщения, которые переписываются в отклик: счётчик сбора и последний
-	// раунд вопросов. Пишут поллер бота и воркер через Notify, а конкурентная
-	// запись в map фатальна - только под mu. Хранение в памяти осознанно:
-	// message_id нужен до следующего шага, потеря стоит пропущенной правки.
-	mu     sync.Mutex
-	tally  map[int64]tele.StoredMessage
-	rounds map[int64]roundState
 	// Ход, о задержке которого автору уже сказали: ответов подряд бывает
 	// несколько, а предупреждение нужно одно. Ход - это обращение вместе с
 	// номером раунда: по одному номеру следующее обращение автора считалось бы
 	// тем же ходом и осталось бы без предупреждения (раунд нового обращения
-	// снова нулевой).
+	// снова нулевой). Пишут поллер бота и воркер через Notify, а конкурентная
+	// запись в map фатальна - только под mu.
+	mu     sync.Mutex
 	waited map[int64]string
 	// Экран, с которого запустили отмену тикета, по обращению: исход приходит
 	// очередью и правит то же сообщение.
@@ -137,46 +132,6 @@ type killScreen struct {
 	// page - страница списка, с которой автор ушёл в карточку: исход отмены
 	// правит то же сообщение и обязан вернуть его туда же.
 	page int
-}
-
-// roundState - сообщение раунда: Bot API правит сообщение целиком, поэтому
-// исходный текст надо помнить, а счётчик ответов держит пометку честной, когда
-// автор отвечает несколькими сообщениями подряд.
-type roundState struct {
-	tele.StoredMessage
-	text    string
-	answers int
-}
-
-func (b *Bot) setTally(user int64, msg tele.StoredMessage) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.tally[user] = msg
-}
-
-func (b *Bot) getTally(user int64) (tele.StoredMessage, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	msg, ok := b.tally[user]
-	return msg, ok
-}
-
-func (b *Bot) dropTally(user int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.tally, user)
-}
-
-func (b *Bot) setRound(user int64, state roundState) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.rounds[user] = state
-}
-
-func (b *Bot) dropRound(user int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.rounds, user)
 }
 
 func (b *Bot) setKill(caseID string, screen killScreen) {
@@ -200,26 +155,10 @@ func (b *Bot) dropKill(caseID string) {
 	delete(b.kills, caseID)
 }
 
-// answerRound отмечает ещё один ответ на текущий раунд и отдаёт состояние для
-// правки. Запись остаётся до следующего раунда: автор отвечает и двумя
-// сообщениями подряд, и каждое обязано получить отклик.
-func (b *Bot) answerRound(user int64) (roundState, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	state, ok := b.rounds[user]
-	if !ok {
-		return roundState{}, false
-	}
-	state.answers++
-	b.rounds[user] = state
-	return state, true
-}
-
 func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, projects *Projects, log *slog.Logger) (*Bot, error) {
 	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
 		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
-		tally: map[int64]tele.StoredMessage{}, rounds: map[int64]roundState{},
 		waited: map[int64]string{}, kills: map[string]killScreen{}}
 
 	// Verbose дампит сырые payload Bot API с текстами сообщений, а стандартный
@@ -520,57 +459,71 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	}
 
 	// Новость по тикету к жизни разговора отношения не имеет: автор мог в этот
-	// момент собирать новое обращение, и трогать его панель, счётчик материала и
-	// пометку раунда нельзя.
+	// момент собирать новое обращение, и трогать его живой экран нельзя.
 	if p.Buttons == keysTicket {
 		return b.sendNews(ctx, cs, p.Text)
 	}
 
+	// Переход снимает живой экран раньше своей отправки: устаревшую кнопку не
+	// должно быть кому ловить правилом 3. Экран раунда сюда не входит: «to-
+	// ticket» кладёт keysHome в одной транзакции со сменой режима, и, если этот
+	// notify доставлен с опозданием, за это время уже мог появиться свой живой
+	// экран следующего раунда - закрывать чужой прогресс нельзя. Экран саммари
+	// и счётчика сбора всегда round == 0, их закрытие такому риску не подвержено.
+	if p.Buttons == keysHome {
+		if cs.ScreenRound == 0 {
+			b.closeScreen(ctx, cs)
+		}
+		_, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text, homeKeyboard())
+		return err
+	}
+
+	// Раунд вопросов и саммари - шаг: прежний живой экран снимается, новый
+	// текст становится следующим. Запоздавшая доставка - раунд, который автор
+	// уже прошёл (payload.Round < cs.Round), или саммари, которое больше не
+	// текущее (status != summary) - шагом не становится: обычное сообщение без
+	// кнопок шага, живой экран не трогает.
+	switch p.Buttons {
+	case keysRound, keysAsk:
+		if cs.Status == statusInterview && p.Round >= cs.Round {
+			var opts []any
+			if p.Buttons == keysRound {
+				opts = append(opts, roundKeyboard(cs.Round))
+			}
+			return b.showStep(ctx, cs, cs.Round, p.Text, opts...)
+		}
+		_, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text)
+		return err
+	case keysSummary:
+		if cs.Status == statusSummary {
+			return b.showStep(ctx, cs, 0, p.Text, summaryKeyboard())
+		}
+		_, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text)
+		return err
+	}
+
 	var opts []any
 	switch {
-	// Раньше проверки статуса: ответ из документации приходит в сбор, и кнопки
-	// решения по ответу важнее панели - она в режиме вопроса и так на месте.
+	// Ответ из документации не шаг: кнопки решения важнее панели сбора, она в
+	// режиме вопроса и так на месте.
 	case p.Buttons == keysAnswer:
 		opts = append(opts, answerKeyboard())
 	// Провал нормализации возвращает обращение в сбор, а кнопки сбора сняты
 	// нажатием «Готово»: без них автор не поймёт, чем закончить второй заход.
 	case cs.Status == statusCollecting:
 		opts = append(opts, collectKeyboard())
-	case p.Buttons == keysRound:
-		opts = append(opts, roundKeyboard(cs.Round))
-	case p.Buttons == keysSummary:
-		opts = append(opts, summaryKeyboard())
-	case p.Buttons == keysHome:
-		opts = append(opts, homeKeyboard())
 	}
-	sent, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...)
-	if err != nil {
+	if _, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text, opts...); err != nil {
 		return err
 	}
-	// Сбор закончился и обращение ушло дальше - счётчик материала больше не
-	// его: следующее обращение заведёт свой.
-	if cs.Status != statusCollecting {
-		b.dropTally(cs.UserID)
-	}
-	switch {
-	// Сообщение раунда запоминается: ответ автора пометит его принятым и снимет
-	// кнопку «Всё так». Раунд без кнопки помечается тем же способом: автору важно
-	// видеть, на какие вопросы его ответ уже принят.
-	case (p.Buttons == keysRound || p.Buttons == keysAsk) && sent != nil:
-		b.setRound(cs.UserID, roundState{
-			StoredMessage: tele.StoredMessage{
-				MessageID: strconv.Itoa(sent.ID), ChatID: sent.Chat.ID,
-			},
-			text: sent.Text,
-		})
-	// Разговор ушёл дальше раундов: правка саммари не должна помечать вопросы,
-	// на которые уже ответили, - иначе пометка садится вверх переписки.
-	case p.Buttons == keysSummary:
-		b.dropRound(cs.UserID)
-	// Ответ показан: счётчик прошлого вопроса остался выше по переписке, и
-	// следующий вопрос заводит свой - под ответом.
-	case p.Buttons == keysAnswer:
-		b.dropTally(cs.UserID)
+	// Ответ показан: прежний живой экран (счётчик или раунд) больше не в счёт,
+	// но кнопки его не наши - снимать нечего, только забыть в базе. Автор уже
+	// получил ответ - отказ записи не идёт наверх, иначе повтор работы прислал
+	// бы тот же ответ вторым сообщением.
+	if p.Buttons == keysAnswer {
+		if err := b.cases.ResetScreen(ctx, cs.ID, cs.Screen); err != nil {
+			b.log.Warn("screen_reset_failed", "case_id", cs.ID, "error", err)
+		}
 	}
 	return nil
 }
@@ -643,6 +596,73 @@ func (b *Bot) sendLong(to tele.Recipient, text string, opts ...any) (*tele.Messa
 		}
 		text = strings.TrimLeft(text[cut:], "\n")
 	}
+}
+
+// showStep - шаг разговора: снять кнопки прежнего живого экрана, отправить
+// текст следующего и запомнить его вместе с раундом. Кнопки нового сообщения
+// (если есть) - на последнем куске sendLong, он и есть новый экран. Гонка со
+// снятием параллельного шага не страшна: устаревшую копию ловит liveScreen.
+func (b *Bot) showStep(ctx context.Context, cs *Case, round int, text string, opts ...any) error {
+	b.stripScreen(cs, cs.Screen)
+
+	sent, err := b.sendLong(&tele.User{ID: cs.UserID}, text, opts...)
+	if err != nil {
+		return err
+	}
+	if err := b.cases.SetScreen(ctx, cs.ID, sent.ID, round); err != nil {
+		return err
+	}
+	cs.Screen, cs.ScreenRound = sent.ID, round
+	return nil
+}
+
+// closeScreen снимает кнопки живого экрана на переходе и обнуляет его в базе:
+// следующий шаг заводит новый экран с нуля. Экрана нет - снимать нечего.
+func (b *Bot) closeScreen(ctx context.Context, cs *Case) {
+	if cs.Screen == 0 {
+		return
+	}
+	b.stripScreen(cs, cs.Screen)
+	if err := b.cases.ResetScreen(ctx, cs.ID, cs.Screen); err != nil {
+		b.log.Warn("screen_reset_failed", "case_id", cs.ID, "error", err)
+		return
+	}
+	cs.Screen, cs.ScreenRound = 0, 0
+}
+
+// stripScreen снимает инлайн-кнопки чужого или прежнего экрана. id 0 - экрана
+// не было. Отказ Telegram шаг не останавливает: устаревшую кнопку в худшем
+// случае поймает liveScreen, а лог даёт знать про контур, где сообщение нельзя
+// отредактировать (раздел 9 плана среза).
+func (b *Bot) stripScreen(cs *Case, msgID int) {
+	if msgID == 0 {
+		return
+	}
+	msg := tele.StoredMessage{MessageID: strconv.Itoa(msgID), ChatID: cs.UserID}
+	_, err := b.bot.EditReplyMarkup(msg, nil)
+	if err == nil || errors.Is(err, tele.ErrMessageNotModified) || errors.Is(err, tele.ErrSameMessageContent) {
+		return
+	}
+	b.log.Warn("screen_strip_failed", "case_id", cs.ID, "message_id", msgID, "error", err)
+}
+
+// liveScreen - правило 3: нажатая кнопка шага действует, только если она с
+// живого экрана обращения. Экрана нет (screen_msg == 0 - счётчик сбора кнопок
+// не несёт, переход его уже снял) - сверять нечего. Кнопка с чужого сообщения -
+// устаревший шаг: тост, снятие нажатой кнопки, дальше действие не идёт.
+func (b *Bot) liveScreen(c tele.Context, cs *Case) bool {
+	if cs.Screen == 0 {
+		return true
+	}
+	msg := c.Message()
+	if msg != nil && msg.ID == cs.Screen {
+		return true
+	}
+	b.toast(c, "Этот экран устарел")
+	if msg != nil {
+		b.stripScreen(cs, msg.ID)
+	}
+	return false
 }
 
 // allow - единственная точка контроля доступа: обойти её хендлером нельзя.
@@ -1040,6 +1060,10 @@ func (b *Bot) onContinue(c tele.Context) error {
 			}
 		}
 	}
+	// Продолжаем с чистого листа только теперь, когда переход точно состоится:
+	// счётчик материала прежнего захода больше не в счёт, следующий элемент
+	// заведёт свой.
+	b.closeScreen(ctx, cs)
 	if err := b.screen(c, "Продолжаем прежнее обращение.", nil); err != nil {
 		return err
 	}
@@ -1102,7 +1126,7 @@ func inBatch(msg *tele.Message) bool {
 func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	askProject, err := b.cases.CollectItem(ctx, b.bot, cs, c.Message())
 	if err == nil {
-		b.countItem(ctx, c, cs)
+		b.countItem(ctx, cs)
 	}
 	reply, internal := itemReply(err, b.maxItems)
 	if reply != "" {
@@ -1124,35 +1148,30 @@ func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 }
 
 // countItem - отклик на принятый материал: первое сообщение сбора заводит
-// счётчик, следующие переписывают его же, не наращивая переписку. Число из
-// базы: после рестарта или возврата в сбор память пуста и врала бы. Отклик
-// косметический, ошибку наверх не отдаёт: шаги приёма из-за него не срываются.
-func (b *Bot) countItem(ctx context.Context, c tele.Context, cs *Case) {
-	user := senderID(c)
+// счётчик - живой экран без кнопок, следующие правят его же, не наращивая
+// переписку. Число из базы: после рестарта или возврата в сбор память пуста и
+// врала бы. Отклик косметический, ошибку наверх не отдаёт: шаги приёма из-за
+// него не срываются.
+func (b *Bot) countItem(ctx context.Context, cs *Case) {
 	count, err := b.cases.CountItems(ctx, cs.ID)
 	if err != nil {
 		b.log.Warn("tally_count_failed", "case_id", cs.ID, "error", err)
 		return
 	}
-
 	text := fmt.Sprintf("Принято сообщений: %d. Закончите - нажмите «Готово».", count)
-	if msg, ok := b.getTally(user); ok {
-		if _, err := b.bot.Edit(msg, text); err == nil {
+
+	if cs.Screen != 0 {
+		msg := tele.StoredMessage{MessageID: strconv.Itoa(cs.Screen), ChatID: cs.UserID}
+		if _, err := b.bot.Edit(msg, text); err == nil || errors.Is(err, tele.ErrSameMessageContent) {
 			return
-		} else if errors.Is(err, tele.ErrSameMessageContent) {
-			return
-		} else {
-			// Сообщение удалили или оно слишком старое: заводим новый счётчик.
-			b.log.Warn("tally_edit_failed", "user_id", user, "error", err)
 		}
+		// Сообщение удалили или оно слишком старое: заводим новый счётчик.
+		b.log.Warn("tally_edit_failed", "case_id", cs.ID, "error", err)
 	}
 
-	sent, err := b.bot.Send(c.Recipient(), text)
-	if err != nil {
-		b.log.Warn("tally_send_failed", "user_id", user, "error", err)
-		return
+	if err := b.showStep(ctx, cs, 0, text); err != nil {
+		b.log.Warn("tally_send_failed", "case_id", cs.ID, "error", err)
 	}
-	b.setTally(user, tele.StoredMessage{MessageID: strconv.Itoa(sent.ID), ChatID: sent.Chat.ID})
 }
 
 // itemReply - что ответить автору на неудачный приём и надо ли тащить ошибку
@@ -1245,11 +1264,11 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 			return err
 		}
 		b.waitFor(cs)
-		// До следующего раунда - секунды работы модели. Правим сообщение с
-		// вопросами: кнопка «Всё так» снимается (ответ уже дан), и видно, что
-		// ответ принят. Править нечего - отвечаем словами, молчания быть не
-		// должно.
-		if !b.markRound(cs) {
+		// До следующего раунда - секунды работы модели. Правим экран раунда:
+		// кнопка «Всё так» снимается (ответ уже дан), и видно, что ответ принят.
+		// Экран не тот (потерян рестартом, чужой раунд, отказ Telegram) -
+		// отвечаем словами, молчания быть не должно.
+		if !b.markRound(ctx, cs, "Ответ принят. Думаю дальше.") {
 			return c.Send("Ответ принят. Думаю дальше.")
 		}
 		return nil
@@ -1257,21 +1276,37 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 	return c.Send("Ответьте текстом или голосовым. Скриншоты принимаются только до кнопки «Готово».")
 }
 
-// markRound помечает сообщение раунда принятым и снимает «Всё так»; запись
-// живёт до следующего раунда, каждый из ответов подряд получает отклик. false:
-// правка не вышла (раунд потерян рестартом, отказ Telegram на старом сообщении),
-// отклик даёт вызывающий, сам ответ автора в любом случае уже записан.
-func (b *Bot) markRound(cs *Case) bool {
-	state, ok := b.answerRound(cs.UserID)
-	if !ok {
+// markRound переписывает экран раунда пометкой по числу ответов вместо нового
+// сообщения на каждый ответ подряд. Правит только тот экран, что сейчас
+// показывает раунд ответа (иначе правка сядет на саммари или на экран
+// следующего раунда, ещё не доставленного - M1), и только если пометка не
+// раздувает текст выше предела Telegram (S7). false - правки не будет, ответ
+// идёт новым сообщением, его текст называет вызывающий.
+func (b *Bot) markRound(ctx context.Context, cs *Case, first string) bool {
+	if cs.Status != statusInterview || cs.Screen == 0 || cs.ScreenRound != cs.Round {
 		return false
 	}
 
-	note := "Ответ принят. Думаю дальше."
-	if state.answers > 1 {
-		note = fmt.Sprintf("Принято ответов: %d. Думаю дальше.", state.answers)
+	questions, answers, err := b.cases.RoundView(ctx, cs.ID)
+	if err != nil {
+		b.log.Warn("round_view_failed", "case_id", cs.ID, "error", err)
+		return false
 	}
-	if _, err := b.bot.Edit(state.StoredMessage, state.text+"\n\n---\n"+note); err != nil {
+	if len(questions) == 0 {
+		return false
+	}
+
+	note := first
+	if answers > 1 {
+		note = fmt.Sprintf("Принято ответов: %d. Думаю дальше.", answers)
+	}
+	text := roundMessage(questions) + "\n\n---\n" + note
+	if utf8.RuneCountInString(text) > maxMessage {
+		return false
+	}
+
+	msg := tele.StoredMessage{MessageID: strconv.Itoa(cs.Screen), ChatID: cs.UserID}
+	if _, err := b.bot.Edit(msg, text); err != nil {
 		if errors.Is(err, tele.ErrSameMessageContent) {
 			return true
 		}
@@ -1328,19 +1363,28 @@ func (b *Bot) markWaited(user int64, caseID string, round int) bool {
 }
 
 // onAllTrue - «Всё так»: предположения модели становятся ответом целиком.
+// Кнопка шага - хендлер читает обращение и сверяет его с живым экраном
+// (правило 3) раньше своего тоста. Отказ Active наверх не отвечает на callback
+// сам - это сделает OnError (S3); cs == nil - ожидаемый исход, а не сбой, и
+// отвечает здесь же, иначе кнопка крутится до таймаута Telegram.
 func (b *Bot) onAllTrue(c tele.Context) error {
-	b.toast(c, "Принято")
-
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
 	cs, err := b.cases.Active(ctx, senderID(c))
 	if err != nil {
+		// Callback не отвечен: OnError отвечает на него сам (bot.go), второй
+		// Respond на тот же callback_query_id Telegram отклонит.
 		return err
 	}
 	if cs == nil {
+		b.toast(c, "")
 		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
+	if !b.liveScreen(c, cs) {
+		return nil
+	}
+	b.toast(c, "Принято")
 
 	round, err := strconv.Atoi(c.Data())
 	if err != nil {
@@ -1364,15 +1408,18 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		return err
 	}
 
-	// Кнопка снимается сразу, тем же сообщением: следующий ход идёт секунды, и
-	// без видимой реакции человек жмёт её ещё раз. Каждое лишнее нажатие - ещё
-	// один ответ в истории и ещё один ход модели поверх незаконченного.
-	//
-	// Раунд помечен вручную, и запись о нём больше не нужна: следующий ответ
-	// автора относится уже к другому сообщению.
-	b.dropRound(senderID(c))
 	b.waitFor(cs)
-	return b.screen(c, markAnswered(c, "Принято: всё так. Думаю дальше."), nil)
+	// Экран раунда правится тем же способом, что и типизированный ответ (S4):
+	// счёт ответов один и честный, кто бы ни нажимал. Правка не вышла - ответ
+	// уходит новым сообщением, а нажатая кнопка снимается: AcceptRound уже
+	// принял ответ, второе нажатие той же кнопки его не изменит.
+	if !b.markRound(ctx, cs, "Принято: всё так. Думаю дальше.") {
+		if msg := c.Message(); msg != nil {
+			b.stripScreen(cs, msg.ID)
+		}
+		return c.Send("Принято: всё так. Думаю дальше.")
+	}
+	return nil
 }
 
 // markAnswered дописывает исход к сообщению раунда: вопросы остаются читаемыми
@@ -1415,10 +1462,10 @@ func (b *Bot) onToTicket(c tele.Context) error {
 	if !switched {
 		return b.sendState(c, cs)
 	}
-	// Сбор закончился: счётчик материала больше не этого обращения. Панель сбора
-	// снимает сообщение о переводе - оно идёт из очереди, одинаково для кнопки и
-	// для реплики, распознанной ходом lookup.
-	b.dropTally(senderID(c))
+	// Сбор закончился: живой экран сбора больше не этого обращения. Панель
+	// сбора снимает сообщение о переводе - оно идёт из очереди, одинаково для
+	// кнопки и для реплики, распознанной ходом lookup.
+	b.closeScreen(ctx, cs)
 	b.waitFor(cs)
 	return b.screen(c, markAnswered(c, "Перевожу в тикет."), nil)
 }
@@ -1446,7 +1493,7 @@ func (b *Bot) onEndAsk(c tele.Context) error {
 	if err := b.cases.EndAsk(ctx, cs); err != nil {
 		return err
 	}
-	b.dropTally(senderID(c))
+	b.closeScreen(ctx, cs)
 	if err := b.screen(c, markAnswered(c, "Разговор закончен."), nil); err != nil {
 		return err
 	}
@@ -1454,10 +1501,11 @@ func (b *Bot) onEndAsk(c tele.Context) error {
 }
 
 // onPublish - «Публикую»: подтверждение саммари, после которого тикет уходит в
-// GitHub, а файлы обращения удаляются.
+// GitHub, а файлы обращения удаляются. Кнопка шага - обращение читается и
+// сверяется с живым экраном (правило 3) раньше своего тоста. Отказ Active
+// наверх не отвечает на callback сам - это сделает OnError (S3); cs == nil -
+// ожидаемый исход, а не сбой, и отвечает здесь же.
 func (b *Bot) onPublish(c tele.Context) error {
-	b.toast(c, "Публикую")
-
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -1466,8 +1514,13 @@ func (b *Bot) onPublish(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
+		b.toast(c, "")
 		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
+	if !b.liveScreen(c, cs) {
+		return nil
+	}
+	b.toast(c, "Публикую")
 
 	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
 		if errors.Is(err, ErrNoSummary) {
@@ -1491,10 +1544,11 @@ func (b *Bot) onPublish(c tele.Context) error {
 // onFix - «Поправить»: состояние не меняет, правкой становится следующее
 // сообщение автора через тот же onAnswer (раздел 3 architecture.md). Гвардия
 // обязательна: кнопка живёт дольше обращения, и приглашение «напишите правку»
-// увело бы следующий текст автора в сырьё нового обращения.
+// увело бы следующий текст автора в сырьё нового обращения. Кнопка шага -
+// обращение читается и сверяется с живым экраном (правило 3) раньше своего
+// тоста. Отказ Active наверх не отвечает на callback сам - это сделает OnError
+// (S3); cs == nil - ожидаемый исход, а не сбой, и отвечает здесь же.
 func (b *Bot) onFix(c tele.Context) error {
-	b.toast(c, "Жду правку")
-
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -1503,8 +1557,14 @@ func (b *Bot) onFix(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
+		b.toast(c, "")
 		return b.screen(c, "Обращение уже закрыто.", backHome())
 	}
+	if !b.liveScreen(c, cs) {
+		return nil
+	}
+	b.toast(c, "Жду правку")
+
 	if !inDialog(cs.Status) {
 		return b.sendState(c, cs)
 	}
@@ -1551,8 +1611,9 @@ func (b *Bot) onDone(c tele.Context) error {
 	case err != nil:
 		return err
 	}
-	// Сбор закрыт: счётчик отработал, следующее обращение заведёт свой.
-	b.dropTally(senderID(c))
+	// Сбор закрыт: живой экран счётчика отработал, следующее обращение заведёт
+	// свой.
+	b.closeScreen(ctx, cs)
 	b.waitFor(cs)
 	// В режиме вопроса панель сбора остаётся: следующий вопрос задаётся тем же
 	// порядком, «написал - нажал Готово», и искать её заново автор не должен.
@@ -1617,13 +1678,11 @@ func (b *Bot) onReset(c tele.Context) error {
 		)
 		return c.Send("Обращение будет отменено безвозвратно, вместе с файлами. Сбросить?", markup)
 	}
-	// Обращение уходит целиком: и счётчик сбора, и раунд вопросов больше не
-	// его.
-	b.dropTally(senderID(c))
-	b.dropRound(senderID(c))
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		return err
 	}
+	// Обращение ушло целиком: живой экран больше не его.
+	b.closeScreen(ctx, cs)
 	return b.homeScreen(ctx, c, "Сброшено.")
 }
 
@@ -1646,16 +1705,14 @@ func (b *Bot) onResetYes(c tele.Context) error {
 		return b.screen(c, "Кнопка устарела: это подтверждение другого обращения. "+
 			"Чтобы сбросить текущее, нажмите «Сброс».", nil)
 	}
-	// Обращение уходит целиком: и счётчик сбора, и раунд вопросов больше не
-	// его.
-	b.dropTally(senderID(c))
-	b.dropRound(senderID(c))
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		if errors.Is(err, ErrPublishing) {
 			return b.screen(c, "Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.", nil)
 		}
 		return err
 	}
+	// Обращение ушло целиком: живой экран больше не его.
+	b.closeScreen(ctx, cs)
 	if err := b.screen(c, "Обращение отменено, файлы удалены.", nil); err != nil {
 		return err
 	}
