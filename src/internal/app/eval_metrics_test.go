@@ -2,8 +2,10 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -11,10 +13,29 @@ import (
 // caseRun - итог одного обращения в прогоне eval.
 type caseRun struct {
 	ID         string `json:"id"`
-	Kind       string `json:"kind"`       // тип после саммари
-	Questions  []int  `json:"questions"`  // число вопросов по раундам, пусто - без вопросов
-	Incomplete bool   `json:"incomplete"` // cases.incomplete после Summarize
+	Kind       string `json:"kind"`               // тип после саммари
+	Questions  []int  `json:"questions"`          // число вопросов по раундам, пусто - без вопросов
+	Incomplete bool   `json:"incomplete"`         // cases.incomplete после Summarize
+	Attempts   int    `json:"attempts,omitempty"` // сумма попыток шагов обращения
 	Failed     string `json:"failed,omitempty"`
+}
+
+// evalRun - метрики и обращения одного прогона.
+type evalRun struct {
+	Metrics evalMetrics            `json:"metrics"`
+	Kinds   map[string]evalMetrics `json:"kinds"`
+	Cases   []caseRun              `json:"cases,omitempty"`
+}
+
+// evalResult - итог набора прогонов: база или замер (Р-9).
+type evalResult struct {
+	Model     string    `json:"model"`
+	Reasoning string    `json:"reasoning"`
+	Rounds    int       `json:"rounds"`
+	Total     int       `json:"total"`
+	Excluded  int       `json:"excluded"`
+	Runs      []evalRun `json:"runs"`
+	Mean      evalRun   `json:"mean"`
 }
 
 // evalEvent - событие журнала исходника в наборе eval.
@@ -22,6 +43,19 @@ type evalEvent struct {
 	Kind    string          `json:"kind"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+// evalBaseRuns - прогонов базы и финала (Р-9): меньше не даёт устойчивого
+// среднего, больше тратит ключ без выигрыша в точности.
+const evalBaseRuns = 3
+
+// evalFailLimit - доля failed, выше которой прогон не мерит промты, а
+// упирается в поломку. Общая для проверки одного прогона (checkFailed, тег
+// eval) и для оценки готовности базы (runsValid, здесь).
+const evalFailLimit = 0.1
+
+// evalEps - допуск сравнения средних метрик с порогом: защита от шума float,
+// не от реальной разницы (Р-9, сценарий на границе).
+const evalEps = 1e-9
 
 // roundAnswers - ответы автора исходника по номеру раунда до первого саммари:
 // правки саммари отвечают на другое и в ответ раунда не попадают (Р-12).
@@ -102,6 +136,352 @@ func share(part, whole int) float64 {
 	return float64(part) / float64(whole)
 }
 
+func metricsLine(m evalMetrics) string {
+	return fmt.Sprintf("M1=%.3f M2=%.3f M3=%.3f (of %d) M4=%.3f (of %d) cases=%d failed=%d",
+		m.M1, m.M2, m.M3, m.Bugs, m.M4, m.Asked, m.Cases, m.Failed)
+}
+
+// runsValid - прогонов evalBaseRuns и в каждом failed не больше
+// evalFailLimit: сравнение с шумной или недособранной базой хуже отказа от
+// сравнения.
+func runsValid(runs []evalRun) bool {
+	if len(runs) != evalBaseRuns {
+		return false
+	}
+	for _, r := range runs {
+		total := r.Metrics.Cases + r.Metrics.Failed
+		if total == 0 || float64(r.Metrics.Failed) > evalFailLimit*float64(total) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameSetup - модель, reasoning, раунды и набор ID обращений совпадают с
+// базой: проверка до хода модели, чтобы не тратить дорогой прогон на
+// несравнимый замер.
+func sameSetup(base evalResult, model, reasoning string, rounds int, ids []string) error {
+	if base.Model != model || base.Reasoning != reasoning {
+		return fmt.Errorf("base is %s/%s, got %s/%s", base.Model, base.Reasoning, model, reasoning)
+	}
+	if base.Rounds != rounds {
+		return fmt.Errorf("base rounds=%d, got %d", base.Rounds, rounds)
+	}
+	if len(base.Runs) == 0 {
+		return fmt.Errorf("base has no runs")
+	}
+	want := caseIDs(base.Runs)
+	got := slices.Clone(ids)
+	slices.Sort(want)
+	slices.Sort(got)
+	if !slices.Equal(want, got) {
+		return fmt.Errorf("case set differs from base: %d ids in base, %d given", len(want), len(got))
+	}
+	return nil
+}
+
+// caseIDs - набор ID обращений первого прогона: набор входа не меняется между
+// прогонами, только их исход (failed, вопросы).
+func caseIDs(runs []evalRun) []string {
+	if len(runs) == 0 {
+		return nil
+	}
+	ids := make([]string, len(runs[0].Cases))
+	for i, c := range runs[0].Cases {
+		ids[i] = c.ID
+	}
+	return ids
+}
+
+// compareRuns - таблица база/замер и вердикт по порогу Р-9. Вызывающий уже
+// отсеял сломанную базу (runsValid, до хода модели): здесь она годна. reasons
+// пуст - pass; иначе каждая причина - непройденная проверка (§5
+// plan-prompts-eval).
+func compareRuns(base, after evalResult) (string, []string) {
+	var b strings.Builder
+	var reasons []string
+
+	if len(after.Runs) != evalBaseRuns {
+		reasons = append(reasons, fmt.Sprintf("runs %d of %d", len(after.Runs), evalBaseRuns))
+	}
+
+	bm, am := base.Mean.Metrics, after.Mean.Metrics
+	noBugs := bm.Bugs == 0 || am.Bugs == 0
+	m3ok, m3rule := am.M3 >= bm.M3-0.05-evalEps, ">= base-0.05"
+	if noBugs {
+		m3ok, m3rule = false, "n/a"
+		reasons = append(reasons, "M3: no bug cases")
+	}
+	rows := []struct {
+		name string
+		ok   bool
+		rule string
+		get  func(evalMetrics) float64
+	}{
+		{"M1", am.M1 >= bm.M1+0.10-evalEps, ">= base+0.10", func(m evalMetrics) float64 { return m.M1 }},
+		{"M2", am.M2 <= bm.M2+0.10+evalEps, "<= base+0.10", func(m evalMetrics) float64 { return m.M2 }},
+		{"M3", m3ok, m3rule, func(m evalMetrics) float64 { return m.M3 }},
+		{"M4", am.M4 < bm.M4-evalEps, "< base", func(m evalMetrics) float64 { return m.M4 }},
+	}
+	for _, row := range rows {
+		switch {
+		case row.name == "M3" && noBugs:
+			// причина уже добавлена одной строкой выше.
+		case !row.ok:
+			reasons = append(reasons, fmt.Sprintf("%s: %.3f vs base %.3f (need %s)",
+				row.name, row.get(am), row.get(bm), row.rule))
+		}
+		baseMin, baseMax := minMax(base.Runs, row.get)
+		afterMin, afterMax := minMax(after.Runs, row.get)
+		status := "ok"
+		if !row.ok {
+			status = "miss"
+		}
+		fmt.Fprintf(&b, "%-2s base=%.3f [%.3f-%.3f] after=%.3f [%.3f-%.3f] diff=%+.3f rule %s: %s\n",
+			row.name, row.get(bm), baseMin, baseMax, row.get(am), afterMin, afterMax,
+			row.get(am)-row.get(bm), row.rule, status)
+	}
+
+	b.WriteString("-- reference, not part of the verdict --\n")
+	writeKindRows(&b, base, after)
+	m3, ids := m3Intersection(base, after)
+	fmt.Fprintf(&b, "M3 bug(base)->bug/mixed(after): %.3f over %d ids\n", m3, ids)
+	fmt.Fprintf(&b, "attempts mean: base=- after=%.3f\n", meanAttempts(after))
+	fmt.Fprintf(&b, "asked in base, silent in after: %s\n", joinIDs(silentInAfter(base, after)))
+	fmt.Fprintf(&b, "failed on one side only: %s\n", joinIDs(failedOnlyOneSide(base, after)))
+
+	return b.String(), reasons
+}
+
+func joinIDs(ids []string) string {
+	if len(ids) == 0 {
+		return "-"
+	}
+	return strings.Join(ids, ", ")
+}
+
+// minMax - разброс метрики по прогонам (max-min по трём прогонам, Р-9).
+func minMax(runs []evalRun, get func(evalMetrics) float64) (float64, float64) {
+	if len(runs) == 0 {
+		return 0, 0
+	}
+	lo, hi := get(runs[0].Metrics), get(runs[0].Metrics)
+	for _, r := range runs[1:] {
+		v := get(r.Metrics)
+		lo = min(lo, v)
+		hi = max(hi, v)
+	}
+	return lo, hi
+}
+
+// writeKindRows - M1-M4 по типам, тип без базы отмечен «-» в её колонке.
+func writeKindRows(b *strings.Builder, base, after evalResult) {
+	kinds := map[string]bool{}
+	for k := range base.Mean.Kinds {
+		kinds[k] = true
+	}
+	for k := range after.Mean.Kinds {
+		kinds[k] = true
+	}
+	for _, kind := range slices.Sorted(maps.Keys(kinds)) {
+		baseLine, afterLine := "-", "-"
+		if m, ok := base.Mean.Kinds[kind]; ok {
+			baseLine = metricsLine(m)
+		}
+		if m, ok := after.Mean.Kinds[kind]; ok {
+			afterLine = metricsLine(m)
+		}
+		fmt.Fprintf(b, "type=%s base=%s after=%s\n", kind, baseLine, afterLine)
+	}
+}
+
+// majorityKind - тип обращения по большинству прогонов, где оно не упало:
+// один прогон может ошибиться с типом, большинство - нет.
+func majorityKind(runs []evalRun) map[string]string {
+	votes := map[string]map[string]int{}
+	order := map[string][]string{}
+	for _, r := range runs {
+		for _, c := range r.Cases {
+			if c.Failed != "" || c.Kind == "" {
+				continue
+			}
+			if votes[c.ID] == nil {
+				votes[c.ID] = map[string]int{}
+			}
+			if votes[c.ID][c.Kind] == 0 {
+				order[c.ID] = append(order[c.ID], c.Kind)
+			}
+			votes[c.ID][c.Kind]++
+		}
+	}
+	out := make(map[string]string, len(votes))
+	for id, counts := range votes {
+		best, bestN := "", 0
+		for _, k := range order[id] {
+			if counts[k] > bestN {
+				best, bestN = k, counts[k]
+			}
+		}
+		out[id] = best
+	}
+	return out
+}
+
+// m3Intersection - M3 на пересечении: ID с типом bug в базе и bug/mixed в
+// замере, доля закрытого ядра по всем прогонам замера этих ID. Ломается
+// знаменатель M3 у обычного расчёта, когда часть bug/feature уходит в mixed -
+// это подмножество остаётся сравнимым (plan-prompts-eval.md §4).
+func m3Intersection(base, after evalResult) (float64, int) {
+	baseKind := majorityKind(base.Runs)
+	afterKind := majorityKind(after.Runs)
+	var ids []string
+	for id, bk := range baseKind {
+		if bk != "bug" {
+			continue
+		}
+		if ak := afterKind[id]; ak == "bug" || ak == "mixed" {
+			ids = append(ids, id)
+		}
+	}
+	var closed, total int
+	idSet := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	for _, r := range after.Runs {
+		for _, c := range r.Cases {
+			if c.Failed != "" || !idSet[c.ID] {
+				continue
+			}
+			total++
+			if !c.Incomplete {
+				closed++
+			}
+		}
+	}
+	return share(closed, total), len(ids)
+}
+
+// meanAttempts - среднее Attempts на обращение замера. У базы поля нет
+// (записана срезом 1): колонка базы - «-» безусловно, а не 0 (plan §4).
+func meanAttempts(after evalResult) float64 {
+	var sum, n int
+	for _, r := range after.Runs {
+		for _, c := range r.Cases {
+			if c.Failed == "" {
+				sum += c.Attempts
+				n++
+			}
+		}
+	}
+	return share(sum, n)
+}
+
+// majorityBy - результат предиката yes по большинству прогонов для ID среди
+// записей, прошедших include; seen ложно, если include не подошёл ни разу.
+func majorityBy(runs []evalRun, id string, include, yes func(caseRun) bool) (majority, seen bool) {
+	var y, n int
+	for _, r := range runs {
+		for _, c := range r.Cases {
+			if c.ID != id || !include(c) {
+				continue
+			}
+			seen = true
+			if yes(c) {
+				y++
+			} else {
+				n++
+			}
+		}
+	}
+	return y > n, seen
+}
+
+func caseNotFailed(c caseRun) bool { return c.Failed == "" }
+func caseAsked(c caseRun) bool     { return len(c.Questions) > 0 }
+func caseAny(caseRun) bool         { return true }
+func caseFailed(c caseRun) bool    { return c.Failed != "" }
+
+// silentInAfter - ID, у которых база большинством прогонов спрашивала, а
+// замер большинством прогонов молчит.
+func silentInAfter(base, after evalResult) []string {
+	var ids []string
+	for _, id := range caseIDs(base.Runs) {
+		baseAsked, baseSeen := majorityBy(base.Runs, id, caseNotFailed, caseAsked)
+		afterAsked, afterSeen := majorityBy(after.Runs, id, caseNotFailed, caseAsked)
+		if baseSeen && afterSeen && baseAsked && !afterAsked {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// failedOnlyOneSide - ID, упавшие большинством прогонов только у базы или
+// только у замера.
+func failedOnlyOneSide(base, after evalResult) []string {
+	var ids []string
+	for _, id := range caseIDs(base.Runs) {
+		bf, _ := majorityBy(base.Runs, id, caseAny, caseFailed)
+		af, _ := majorityBy(after.Runs, id, caseAny, caseFailed)
+		if bf != af {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// measureKinds - метрики отдельно по типу обращения.
+func measureKinds(runs []caseRun) map[string]evalMetrics {
+	byKind := map[string][]caseRun{}
+	for _, r := range runs {
+		if r.Failed == "" {
+			byKind[r.Kind] = append(byKind[r.Kind], r)
+		}
+	}
+	out := make(map[string]evalMetrics, len(byKind))
+	for kind, list := range byKind {
+		out[kind] = measure(list)
+	}
+	return out
+}
+
+// meanOf - среднее метрик по прогонам (Р-9 сравнивает средние), по типу - по
+// прогонам, где тип встретился. Счётчики - суммы по прогонам.
+func meanOf(runs []evalRun) evalRun {
+	all := make([]evalMetrics, 0, len(runs))
+	byKind := map[string][]evalMetrics{}
+	for _, r := range runs {
+		all = append(all, r.Metrics)
+		for kind, m := range r.Kinds {
+			byKind[kind] = append(byKind[kind], m)
+		}
+	}
+	mean := evalRun{Metrics: average(all), Kinds: map[string]evalMetrics{}}
+	for kind, list := range byKind {
+		mean.Kinds[kind] = average(list)
+	}
+	return mean
+}
+
+func average(list []evalMetrics) evalMetrics {
+	var sum evalMetrics
+	for _, m := range list {
+		sum.M1 += m.M1
+		sum.M2 += m.M2
+		sum.M3 += m.M3
+		sum.M4 += m.M4
+		sum.Cases += m.Cases
+		sum.Bugs += m.Bugs
+		sum.Asked += m.Asked
+		sum.Failed += m.Failed
+	}
+	n := float64(len(list))
+	sum.M1, sum.M2, sum.M3, sum.M4 = sum.M1/n, sum.M2/n, sum.M3/n, sum.M4/n
+	return sum
+}
+
 // TestEvalMetrics: обращения без failed - без вопросов, два раунда, bug с
 // неполным ядром; failed в знаменатели не входит.
 func TestEvalMetrics(t *testing.T) {
@@ -158,4 +538,212 @@ func TestRoundAnswers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// evalCaseFixture - валидный прогон из трёх обращений для сборки evalResult в
+// тестах compareRuns: один silent, один bug с закрытым ядром, один mixed.
+func evalCaseFixture() []caseRun {
+	return []caseRun{
+		{ID: "c1", Kind: "feature"},
+		{ID: "c2", Kind: "bug", Questions: []int{2}},
+		{ID: "c3", Kind: "mixed", Questions: []int{1}},
+	}
+}
+
+// evalResultFixture - evalResult из evalBaseRuns одинаковых валидных
+// прогонов: удобная база для сценариев, которые правят одну метрику.
+func evalResultFixture(model, reasoning string, rounds int) evalResult {
+	runs := make([]evalRun, evalBaseRuns)
+	for i := range runs {
+		cases := evalCaseFixture()
+		runs[i] = evalRun{Metrics: measure(cases), Kinds: measureKinds(cases), Cases: cases}
+	}
+	res := evalResult{Model: model, Reasoning: reasoning, Rounds: rounds, Total: 3, Runs: runs}
+	res.Mean = meanOf(res.Runs)
+	return res
+}
+
+func hasReason(reasons []string, substr string) bool {
+	return slices.ContainsFunc(reasons, func(r string) bool { return strings.Contains(r, substr) })
+}
+
+// TestEvalThreshold - сценарии проверки eval-compare, plan-prompts-eval-3b.md.
+func TestEvalThreshold(t *testing.T) {
+	t.Run("boundaries pass exactly at the threshold (сценарий 1)", func(t *testing.T) {
+		base := evalResultFixture("m", "low", 2)
+		// Литералы, не арифметика правила: 0.1+0.2 != 0.3 в float64, и ровно на
+		// этих парах база+порог и буквальная граница расходятся на пару ULP.
+		// Удаление evalEps превращает все три ok в miss - тест это ловит.
+		base.Mean.Metrics = evalMetrics{M1: 0.2, M2: 0.7, M3: 0.34, M4: 0.3, Bugs: 10}
+		after := base
+		after.Mean.Metrics = evalMetrics{M1: 0.3, M2: 0.8, M3: 0.29, M4: 0.299, Bugs: 10}
+		_, reasons := compareRuns(base, after)
+		if len(reasons) != 0 {
+			t.Fatalf("want pass, got reasons: %v", reasons)
+		}
+	})
+
+	t.Run("one metric off at a time names only that metric (сценарий 2)", func(t *testing.T) {
+		base := evalResultFixture("m", "low", 2)
+		// passing - все четыре метрики с запасом внутри порога: подмена ровно
+		// одной ниже переводит в miss только её.
+		passing := evalMetrics{
+			M1: base.Mean.Metrics.M1 + 0.20, M2: base.Mean.Metrics.M2, M3: base.Mean.Metrics.M3,
+			M4: base.Mean.Metrics.M4 - 0.20, Bugs: base.Mean.Metrics.Bugs,
+		}
+		m4 := passing
+		m4.M4 = base.Mean.Metrics.M4
+		m1 := passing
+		m1.M1 = base.Mean.Metrics.M1 + 0.09
+		m2 := passing
+		m2.M2 = base.Mean.Metrics.M2 + 0.11
+		m3 := passing
+		m3.M3 = base.Mean.Metrics.M3 - 0.06
+
+		cases := []struct {
+			name  string
+			after evalMetrics
+		}{
+			{"M4", m4}, {"M1", m1}, {"M2", m2}, {"M3", m3},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				after := base
+				after.Mean.Metrics = c.after
+				_, reasons := compareRuns(base, after)
+				if len(reasons) != 1 || !strings.HasPrefix(reasons[0], c.name) {
+					t.Fatalf("want exactly one reason for %s, got %v", c.name, reasons)
+				}
+			})
+		}
+	})
+
+	t.Run("after has fewer runs than the base (сценарий 3)", func(t *testing.T) {
+		base := evalResultFixture("m", "low", 2)
+		after := base
+		after.Runs = after.Runs[:1]
+		after.Mean = meanOf(after.Runs)
+		// Пороги пройдены сами по себе: причина только в числе прогонов.
+		after.Mean.Metrics.M1 = base.Mean.Metrics.M1 + 0.2
+		after.Mean.Metrics.M4 = 0
+		_, reasons := compareRuns(base, after)
+		if len(reasons) != 1 || reasons[0] != "runs 1 of 3" {
+			t.Fatalf("want single reason \"runs 1 of 3\", got %v", reasons)
+		}
+	})
+
+	t.Run("broken or single-run base is caught by runsValid (сценарий 4)", func(t *testing.T) {
+		// runsValid проверяется в eval_test.go рядом с sameSetup, до первого
+		// вызова модели (не тратить ключ на сравнение с шумной базой) - здесь
+		// проверяем саму функцию отбора.
+		t.Run("single run", func(t *testing.T) {
+			base := evalResultFixture("m", "low", 2)
+			base.Runs = base.Runs[:1]
+			if runsValid(base.Runs) {
+				t.Fatal("want invalid for a single-run base")
+			}
+		})
+		t.Run("failed over 10 percent", func(t *testing.T) {
+			base := evalResultFixture("m", "low", 2)
+			base.Runs[0].Metrics.Failed = 10
+			base.Runs[0].Metrics.Cases = 0
+			if runsValid(base.Runs) {
+				t.Fatal("want invalid for a run with failed over the limit")
+			}
+		})
+	})
+
+	t.Run("no bug cases on either side (сценарий 5)", func(t *testing.T) {
+		base := evalResultFixture("m", "low", 2)
+		noBugs := base.Mean.Metrics
+		noBugs.Bugs = 0
+		t.Run("after has no bugs", func(t *testing.T) {
+			after := base
+			after.Mean.Metrics = noBugs
+			_, reasons := compareRuns(base, after)
+			if !hasReason(reasons, "M3: no bug cases") {
+				t.Fatalf("want \"M3: no bug cases\", got %v", reasons)
+			}
+		})
+		t.Run("base has no bugs", func(t *testing.T) {
+			b := base
+			b.Mean.Metrics = noBugs
+			_, reasons := compareRuns(b, base)
+			if !hasReason(reasons, "M3: no bug cases") {
+				t.Fatalf("want \"M3: no bug cases\", got %v", reasons)
+			}
+		})
+	})
+
+	t.Run("kind seen only in after keeps its row with a dash for base (сценарий 6)", func(t *testing.T) {
+		base := evalResultFixture("m", "low", 2)
+		delete(base.Mean.Kinds, "mixed")
+		after := evalResultFixture("m", "low", 2)
+		table, _ := compareRuns(base, after)
+		if !strings.Contains(table, "type=mixed base=-") {
+			t.Fatalf("want mixed row with base=-, got:\n%s", table)
+		}
+	})
+
+	t.Run("M3 intersection keeps only bug-base cases (сценарий 7)", func(t *testing.T) {
+		base := evalResult{Runs: []evalRun{
+			{Cases: []caseRun{{ID: "bug1", Kind: "bug"}, {ID: "feat1", Kind: "feature"}}},
+		}}
+		after := evalResult{Runs: []evalRun{
+			{Cases: []caseRun{{ID: "bug1", Kind: "mixed"}, {ID: "feat1", Kind: "mixed"}}},
+		}}
+		_, ids := m3Intersection(base, after)
+		if ids != 1 {
+			t.Fatalf("want 1 id in the intersection (bug1 only), got %d", ids)
+		}
+	})
+
+	t.Run("both silent-in-after and failed-only-one-side ids are reported (сценарий 8)", func(t *testing.T) {
+		base := evalResult{Runs: []evalRun{
+			{Cases: []caseRun{{ID: "asked1", Questions: []int{1}}, {ID: "ok1"}}},
+			{Cases: []caseRun{{ID: "asked1", Questions: []int{1}}, {ID: "ok1"}}},
+			{Cases: []caseRun{{ID: "asked1", Questions: []int{1}}, {ID: "ok1"}}},
+		}}
+		after := evalResult{Runs: []evalRun{
+			{Cases: []caseRun{{ID: "asked1"}, {ID: "ok1", Failed: "err"}}},
+			{Cases: []caseRun{{ID: "asked1"}, {ID: "ok1", Failed: "err"}}},
+			{Cases: []caseRun{{ID: "asked1"}, {ID: "ok1", Failed: "err"}}},
+		}}
+		silent := silentInAfter(base, after)
+		if !slices.Contains(silent, "asked1") {
+			t.Fatalf("want asked1 in silent-in-after, got %v", silent)
+		}
+		failedOnly := failedOnlyOneSide(base, after)
+		if !slices.Contains(failedOnly, "ok1") {
+			t.Fatalf("want ok1 in failed-only-one-side, got %v", failedOnly)
+		}
+		if slices.Contains(silent, "ok1") || slices.Contains(failedOnly, "asked1") {
+			t.Fatalf("ids mixed up between rows: silent=%v failedOnly=%v", silent, failedOnly)
+		}
+	})
+
+	t.Run("sameSetup rejects a mismatched setup or case set (сценарий 9)", func(t *testing.T) {
+		base := evalResultFixture("m1", "low", 2)
+		t.Run("different model", func(t *testing.T) {
+			if err := sameSetup(base, "m2", "low", 2, caseIDs(base.Runs)); err == nil {
+				t.Fatal("want error for a different model")
+			}
+		})
+		t.Run("different reasoning", func(t *testing.T) {
+			if err := sameSetup(base, "m1", "high", 2, caseIDs(base.Runs)); err == nil {
+				t.Fatal("want error for a different reasoning")
+			}
+		})
+		t.Run("different rounds", func(t *testing.T) {
+			if err := sameSetup(base, "m1", "low", 3, caseIDs(base.Runs)); err == nil {
+				t.Fatal("want error for a different rounds count")
+			}
+		})
+		t.Run("case set missing an id", func(t *testing.T) {
+			ids := caseIDs(base.Runs)[:len(caseIDs(base.Runs))-1]
+			if err := sameSetup(base, "m1", "low", 2, ids); err == nil {
+				t.Fatal("want error for a case set missing an id")
+			}
+		})
+	})
 }

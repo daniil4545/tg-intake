@@ -34,8 +34,6 @@ const (
 	// Ходов интервью на обращение: при двух раундах их три, запас ловит
 	// зацикливание, а не обрывает разговор.
 	evalTurns = 6
-	// Доля failed, выше которой прогон не мерит промты, а упирается в поломку.
-	evalFailLimit = 0.1
 	// Дефолты диалоговой модели из config.go, держать равными ему: сравнению до
 	// и после нужна одна модель в обоих прогонах, а не модель прода.
 	evalModel     = "deepseek/deepseek-v4-flash-0731"
@@ -55,22 +53,6 @@ type evalCase struct {
 	Events   []evalEvent `json:"events"`
 }
 
-type evalRun struct {
-	Metrics evalMetrics            `json:"metrics"`
-	Kinds   map[string]evalMetrics `json:"kinds"`
-	Cases   []caseRun              `json:"cases,omitempty"`
-}
-
-type evalResult struct {
-	Model     string    `json:"model"`
-	Reasoning string    `json:"reasoning"`
-	Rounds    int       `json:"rounds"`
-	Total     int       `json:"total"`
-	Excluded  int       `json:"excluded"`
-	Runs      []evalRun `json:"runs"`
-	Mean      evalRun   `json:"mean"`
-}
-
 func TestEvalRun(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -80,7 +62,7 @@ func TestEvalRun(t *testing.T) {
 	if key == "" {
 		t.Fatal("OPENROUTER_API_KEY is not set")
 	}
-	runs := evalNumber(t, "EVAL_RUNS", "3")
+	runs := evalNumber(t, "EVAL_RUNS", fmt.Sprint(evalBaseRuns))
 	parallel := evalNumber(t, "EVAL_PARALLEL", "6")
 	model := valueOr(os.Getenv("EVAL_MODEL"), evalModel)
 	reasoning, err := parseReasoning(valueOr(os.Getenv("EVAL_REASONING"), evalReasoning))
@@ -88,6 +70,10 @@ func TestEvalRun(t *testing.T) {
 		t.Fatalf("EVAL_REASONING: %v", err)
 	}
 	out := valueOr(os.Getenv("EVAL_OUT"), time.Now().Format("2006-01-02"))
+	baseName := os.Getenv("EVAL_BASE")
+	if baseName != "" && filepath.Clean(baseName) == filepath.Clean(out) {
+		t.Fatal("EVAL_OUT must differ from EVAL_BASE: the run would overwrite the base it compares to")
+	}
 
 	all := loadEvalCases(t)
 	// Из «Спросить» модель видела ответ по документации, которого в наборе нет:
@@ -97,6 +83,25 @@ func TestEvalRun(t *testing.T) {
 	})
 	t.Logf("cases=%d excluded=%d model=%s reasoning=%s rounds=%d runs=%d parallel=%d",
 		len(cases), len(all)-len(cases), model, reasoning, evalRounds, runs, parallel)
+
+	var base evalResult
+	haveBase := baseName != ""
+	if haveBase {
+		base = readEvalResult(t, baseName)
+		// До первого вызова модели: дорогой прогон не запускается на сломанную
+		// базу или заведомо несравнимый замер (другая модель, раунды, набор).
+		if !runsValid(base.Runs) {
+			t.Fatalf("EVAL_BASE %s: base broken (want %d runs with failed <= %.0f%%)",
+				baseName, evalBaseRuns, evalFailLimit*100)
+		}
+		ids := make([]string, len(cases))
+		for i, c := range cases {
+			ids[i] = c.ID
+		}
+		if err := sameSetup(base, model, reasoning, evalRounds, ids); err != nil {
+			t.Fatalf("EVAL_BASE %s: %v", baseName, err)
+		}
+	}
 
 	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -160,6 +165,21 @@ func TestEvalRun(t *testing.T) {
 	if broken != "" {
 		t.Fatal(broken)
 	}
+
+	if !haveBase {
+		return
+	}
+	table, reasons := compareRuns(base, result)
+	for _, line := range strings.Split(strings.TrimRight(table, "\n"), "\n") {
+		t.Log(line)
+	}
+	if len(reasons) == 0 {
+		t.Log("verdict: pass")
+		return
+	}
+	// Порог не взят - код выхода не 0 (§3 plan-prompts-eval.md), последняя
+	// строка называет причины: t.Fatalf логирует их сам, второй раз не пишем.
+	t.Fatalf("verdict: fail: %s", strings.Join(reasons, "; "))
 }
 
 func evalNumber(t *testing.T, name, fallback string) int {
@@ -249,7 +269,9 @@ func runEvalCase(ctx context.Context, pool *pgxpool.Pool, iv *Interview, user in
 
 	var seen int64
 	for range evalTurns {
-		if err := evalStep(ctx, iv.Run, Job{Kind: JobInterview, Payload: payload}); err != nil {
+		attempts, err := evalStep(ctx, iv.Run, Job{Kind: JobInterview, Payload: payload})
+		run.Attempts += attempts
+		if err != nil {
 			run.Failed = "interview: " + err.Error()
 			return run
 		}
@@ -279,7 +301,9 @@ func runEvalCase(ctx context.Context, pool *pgxpool.Pool, iv *Interview, user in
 			continue
 		}
 
-		if err := evalStep(ctx, iv.Summarize, Job{Kind: JobSummarize, Payload: payload}); err != nil {
+		attempts, err = evalStep(ctx, iv.Summarize, Job{Kind: JobSummarize, Payload: payload})
+		run.Attempts += attempts
+		if err != nil {
 			run.Failed = "summary: " + err.Error()
 			return run
 		}
@@ -316,11 +340,12 @@ func loadEvalCase(ctx context.Context, iv *Interview, caseID string) (*Case, err
 // maxAttempts попыток. На проде таймаут модели и невалидный ответ повторяет
 // очередь, и без повтора прогон мерил бы сеть, а не промты. Состояние
 // обращения между попытками не трогаем: Run и Summarize сверяют версию сами.
-func evalStep(ctx context.Context, step JobHandler, job Job) error {
+// Возвращает число потраченных попыток - caseRun.Attempts копит их по шагам.
+func evalStep(ctx context.Context, step JobHandler, job Job) (int, error) {
 	var err error
 	for job.Attempts = 1; job.Attempts <= maxAttempts; job.Attempts++ {
 		if err = evalAttempt(ctx, step, job); err == nil {
-			return nil
+			return job.Attempts, nil
 		}
 		// Готовой функции отсрочки у воркера нет (она в SQL FailJob), а
 		// растущая пауза до 16 с на пять попыток прогону не нужна.
@@ -328,7 +353,8 @@ func evalStep(ctx context.Context, step JobHandler, job Job) error {
 			break
 		}
 	}
-	return fmt.Errorf("%d attempts, last: %w", min(job.Attempts, maxAttempts), err)
+	attempts := min(job.Attempts, maxAttempts)
+	return attempts, fmt.Errorf("%d attempts, last: %w", attempts, err)
 }
 
 func evalAttempt(ctx context.Context, step JobHandler, job Job) error {
@@ -396,61 +422,6 @@ func checkFailed(n int, done []caseRun) string {
 	return ""
 }
 
-// measureKinds - метрики отдельно по типу обращения.
-func measureKinds(runs []caseRun) map[string]evalMetrics {
-	byKind := map[string][]caseRun{}
-	for _, r := range runs {
-		if r.Failed == "" {
-			byKind[r.Kind] = append(byKind[r.Kind], r)
-		}
-	}
-	out := make(map[string]evalMetrics, len(byKind))
-	for kind, list := range byKind {
-		out[kind] = measure(list)
-	}
-	return out
-}
-
-// meanOf - среднее метрик по прогонам (Р-9 сравнивает средние), по типу - по
-// прогонам, где тип встретился. Счётчики - суммы по прогонам.
-func meanOf(runs []evalRun) evalRun {
-	all := make([]evalMetrics, 0, len(runs))
-	byKind := map[string][]evalMetrics{}
-	for _, r := range runs {
-		all = append(all, r.Metrics)
-		for kind, m := range r.Kinds {
-			byKind[kind] = append(byKind[kind], m)
-		}
-	}
-	mean := evalRun{Metrics: average(all), Kinds: map[string]evalMetrics{}}
-	for kind, list := range byKind {
-		mean.Kinds[kind] = average(list)
-	}
-	return mean
-}
-
-func average(list []evalMetrics) evalMetrics {
-	var sum evalMetrics
-	for _, m := range list {
-		sum.M1 += m.M1
-		sum.M2 += m.M2
-		sum.M3 += m.M3
-		sum.M4 += m.M4
-		sum.Cases += m.Cases
-		sum.Bugs += m.Bugs
-		sum.Asked += m.Asked
-		sum.Failed += m.Failed
-	}
-	n := float64(len(list))
-	sum.M1, sum.M2, sum.M3, sum.M4 = sum.M1/n, sum.M2/n, sum.M3/n, sum.M4/n
-	return sum
-}
-
-func metricsLine(m evalMetrics) string {
-	return fmt.Sprintf("M1=%.3f M2=%.3f M3=%.3f (of %d) M4=%.3f (of %d) cases=%d failed=%d",
-		m.M1, m.M2, m.M3, m.Bugs, m.M4, m.Asked, m.Cases, m.Failed)
-}
-
 func writeEvalResult(t *testing.T, name string, result evalResult) {
 	t.Helper()
 	dir := filepath.Join(evalDir, "results")
@@ -466,4 +437,20 @@ func writeEvalResult(t *testing.T, name string, result evalResult) {
 		t.Fatalf("write result: %v", err)
 	}
 	t.Logf("result: eval/results/%s.json", name)
+}
+
+// readEvalResult - база для EVAL_BASE: без файла сравнивать не с чем, и
+// прогон замера был бы часом без смысла.
+func readEvalResult(t *testing.T, name string) evalResult {
+	t.Helper()
+	path := filepath.Join(evalDir, "results", name+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("open base %s: %v (снят ли make eval EVAL_OUT=%s?)", path, err, name)
+	}
+	var result evalResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("decode base %s: %v", path, err)
+	}
+	return result
 }

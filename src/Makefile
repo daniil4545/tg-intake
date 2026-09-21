@@ -9,7 +9,7 @@ endif
 GOOSE := go run -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.27.3
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: run build test test-fast eval vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
+.PHONY: run build test test-fast eval eval-compare vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
 
 run:
 	go run ./cmd/intake
@@ -31,6 +31,12 @@ test-fast:
 # TRUNCATE базы TEST_DATABASE_URL. EVAL_OUT - имя файла в eval/results/.
 eval:
 	go test -tags eval -count=1 -timeout 3h -v -run '^TestEvalRun$$' ./internal/app
+
+# Тот же прогон со сравнением с базой (Р-9): EVAL_BASE и EVAL_OUT по умолчанию
+# base/after, переопределяются как обычно - make eval-compare EVAL_OUT=iterN.
+eval-compare: export EVAL_BASE ?= base
+eval-compare: export EVAL_OUT ?= after
+eval-compare: eval
 
 # Тег eval: иначе vet и линтер не видят прогон, и он ломается молча.
 vet:
