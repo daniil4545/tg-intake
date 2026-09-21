@@ -30,7 +30,7 @@ test-fast:
 # Прогон набора eval/cases.jsonl через текущие промты: реальный OpenRouter и
 # TRUNCATE базы TEST_DATABASE_URL. EVAL_OUT - имя файла в eval/results/.
 eval:
-	go test -tags eval -count=1 -timeout 3h -v -run '^TestEvalRun$$' ./internal/app
+	go test -tags eval -count=1 -timeout 8h -v -run '^TestEvalRun$$' ./internal/app
 
 # Тот же прогон со сравнением с базой (Р-9): EVAL_BASE и EVAL_OUT по умолчанию
 # base/after, переопределяются как обычно - make eval-compare EVAL_OUT=iterN.
