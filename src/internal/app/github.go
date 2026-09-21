@@ -569,6 +569,9 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 
 	marker := caseMarker(cs.ID)
 	number, url := 0, ""
+	// Метка неполноты и строка «Не уточнено» в теле считаются одной функцией по
+	// ядру: расходиться им не с чего.
+	incomplete := p.rules.Unclear(cs.Kind, cs.Filled) != ""
 	// На первой попытке дубля быть не может: создание issue повторов не делает,
 	// и до второй попытки очереди тикета в GitHub нет. Лишний запрос стоил бы
 	// секунды на каждом тикете.
@@ -578,8 +581,8 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		}
 	}
 	if number == 0 {
-		labels := []string{"type:" + cs.Kind, labelNew, "author:" + author.Slug}
-		if cs.Incomplete {
+		labels := append(typeLabels(cs.Kind), labelNew, "author:"+author.Slug)
+		if incomplete {
 			labels = append(labels, "incomplete")
 		}
 		body := p.body(cs, author, collectLinks(items), marker)
@@ -607,14 +610,14 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 		published = true
 
 		if err := addEvent(ctx, tx, cs.ID, "published", map[string]any{
-			"issue": number, "incomplete": cs.Incomplete,
+			"issue": number, "incomplete": incomplete,
 		}); err != nil {
 			return err
 		}
 		// Панель возвращается в исходное состояние тем же сообщением: обращение
 		// доиграно, «Готово» больше не по чему нажимать.
 		if err := putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			publishedMessage(number, url, cs.Incomplete), keysHome); err != nil {
+			publishedMessage(number, url, incomplete), keysHome); err != nil {
 			return err
 		}
 		if p.alertChat == 0 {
@@ -631,7 +634,7 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	}
 
 	p.log.Info("issue_created", "case_id", cs.ID, "project", project.Slug,
-		"issue", number, "incomplete", cs.Incomplete)
+		"issue", number, "incomplete", incomplete)
 
 	// Медиа не переживает обращение; удаление здесь, а не в нормализации: до
 	// подтверждения саммари файл ловит неверно прочитанный скриншот. Сбой не
@@ -642,7 +645,7 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	return nil
 }
 
-// body собирает тело тикета: авторство, разделы контракта, пробелы и маркер.
+// body собирает тело тикета: авторство, разделы саммари, незакрытое ядро и маркер.
 //
 // Авторство фиксируется телом, а не полем API: GitHub не даёт создать issue от
 // чужого имени, автором станет владелец токена.
@@ -676,19 +679,23 @@ func (p *Publisher) body(cs *Case, author User, links []string, marker string) s
 			"список и всё равно завёл тикет.")
 	}
 
-	if len(cs.Gaps) > 0 {
-		b.WriteString("\n\n## Не разобрано\n\n")
-		for _, key := range cs.Gaps {
-			if title := p.rules.Title(cs.Kind, key); title != "" {
-				b.WriteString("- " + title + "\n")
-			}
-		}
-		b.WriteString("\nАвтор этого не уточнил. Пробел назван явно: правдоподобная " +
-			"выдумка была бы принята за факт.")
+	// Незакрытое ядро - одной строкой в конце: пробел назван явно, правдоподобная
+	// выдумка была бы принята за факт. Считается так же, как метка incomplete.
+	if unclear := p.rules.Unclear(cs.Kind, cs.Filled); unclear != "" {
+		b.WriteString("\n\n---\n" + unclear)
 	}
 
 	b.WriteString("\n\n" + marker)
 	return b.String()
+}
+
+// typeLabels - метки типа тикета. Смесь - один тикет с метками обоих типов:
+// делить обращение на два - решение разработчика, а не бота (Р-2 ticket-form).
+func typeLabels(kind string) []string {
+	if kind == "mixed" {
+		return []string{"type:bug", "type:feature"}
+	}
+	return []string{"type:" + kind}
 }
 
 // caseMarker - скрытая метка обращения в теле тикета. По ней повтор работы

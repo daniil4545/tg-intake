@@ -1,23 +1,19 @@
 {
   "bug": [
-    { "key": "case", "title": "Конкретный случай", "required": true },
-    { "key": "expected", "title": "Что должно было произойти", "required": true },
-    { "key": "actual", "title": "Что произошло на самом деле", "required": true },
-    { "key": "where", "title": "Где это видно", "required": false },
-    { "key": "when", "title": "Когда повторяется, а когда нет", "required": false },
-    { "key": "impact", "title": "Чем это мешает работе", "required": false }
+    { "key": "case", "title": "Конкретный случай" },
+    { "key": "wrong", "title": "Что пошло не так" }
   ],
   "feature": [
-    { "key": "problem", "title": "Какую задачу это решает", "required": true },
-    { "key": "today", "title": "Как это делают сейчас", "required": true },
-    { "key": "result", "title": "Каким должен быть результат", "required": true },
-    { "key": "done", "title": "Как поймём, что готово", "required": true },
-    { "key": "volume", "title": "Как часто это происходит", "required": false },
-    { "key": "edge", "title": "Нестандартные случаи и исключения", "required": false },
-    { "key": "who", "title": "Кого это касается", "required": false }
+    { "key": "need", "title": "Что нужно" },
+    { "key": "why", "title": "Зачем" }
   ],
   "question": [
-    { "key": "question", "title": "Вопрос", "required": true },
-    { "key": "context", "title": "Что уже пробовали", "required": false }
+    { "key": "question", "title": "Вопрос" }
+  ],
+  "mixed": [
+    { "key": "case", "title": "Конкретный случай" },
+    { "key": "wrong", "title": "Что пошло не так" },
+    { "key": "need", "title": "Что нужно" },
+    { "key": "why", "title": "Зачем" }
   ]
 }

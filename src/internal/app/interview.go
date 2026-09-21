@@ -27,6 +27,13 @@ const (
 	// третий автор читает как испорченную пластинку.
 	maxAsks  = 2
 	maxTitle = 80
+	// Разделов саммари не больше шести, заголовок - одна строка: длиннее уже
+	// не заголовок, а пересказ (Р-6 спеки ticket-form).
+	maxSections = 6
+	maxHeading  = 60
+	// detailKey - вопрос-уточнение вне ядра: адрес объекта, дословный образец.
+	// Одно на обращение и только в первом раунде, держит это Go (dropDetails).
+	detailKey = "detail"
 	// Предел краткого содержания. Два-три предложения о сути помещаются с
 	// запасом; всё, что длиннее, - уже пересказ разделов.
 	briefLimit = 400
@@ -100,18 +107,24 @@ type interviewTurn struct {
 	Ready     bool       `json:"ready"`
 }
 
-// section - раздел саммари: ключ пункта контракта и текст. Заголовок берётся из
-// правил, а не от модели: тикет одного типа должен выглядеть одинаково.
-type section struct {
-	Key  string `json:"key"`
-	Text string `json:"text"`
+// Section - раздел саммари под заголовком модели: форма тикета идёт от
+// материала, а не от анкеты. Key - пункт ядра, который раздел покрывает, или
+// пусто: по нему Go видит, какой закрытый пункт модель не упомянула.
+type Section struct {
+	Key     string `json:"key"`
+	Heading string `json:"heading"`
+	Text    string `json:"text"`
 }
 
 type summaryOut struct {
 	Title    string    `json:"title"`
 	Brief    string    `json:"brief"`
-	Sections []section `json:"sections"`
+	Sections []Section `json:"sections"`
 }
+
+// reservedHeadings - разделы тела, которые пишет Go: второй такой же заголовок
+// от модели сделал бы тело тикета неоднозначным.
+var reservedHeadings = []string{"Кратко", "Ссылки", "Пересечения"}
 
 // turnSchema строится из правил: список типов обращения задаётся ими же, и
 // захардкоженный enum разошёлся бы с контрактом при первой правке.
@@ -163,8 +176,12 @@ var summarySchema = json.RawMessage(`{
 			"type": "array",
 			"items": {
 				"type": "object",
-				"properties": {"key": {"type": "string"}, "text": {"type": "string"}},
-				"required": ["key", "text"],
+				"properties": {
+					"key": {"type": "string"},
+					"heading": {"type": "string"},
+					"text": {"type": "string"}
+				},
+				"required": ["key", "heading", "text"],
 				"additionalProperties": false
 			}
 		}
@@ -261,6 +278,13 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		}
 		turn.Questions = kept
 	}
+	// Правка саммари тоже может открыть раунд, и уточнение там подчиняется
+	// тому же пределу: номер раунда модели не сообщается.
+	kept, dropped := dropDetails(turn.Questions, cs.Round)
+	if dropped > 0 {
+		i.log.Info("detail_dropped", "case_id", cs.ID, "round", cs.Round+1, "dropped", dropped)
+	}
+	turn.Questions = kept
 
 	// Предел считается по уже заданным раундам: исчерпав их, ход не спрашивает
 	// ничего, а собирает саммари с тем, что есть. Правка саммари предел не
@@ -423,6 +447,24 @@ func hasSuggestion(questions []Question) bool {
 	return slices.ContainsFunc(questions, func(q Question) bool { return !isStub(q.Suggested) })
 }
 
+// dropDetails снимает лишние уточнения вне ядра: одно на обращение и только в
+// первом раунде (Р-3). round - номер последнего заданного раунда до этого хода,
+// так что первый раунд задаётся только при round == 0.
+func dropDetails(questions []Question, round int) ([]Question, int) {
+	allowed := round == 0
+	kept := make([]Question, 0, len(questions))
+	for _, q := range questions {
+		if q.Key == detailKey {
+			if !allowed {
+				continue
+			}
+			allowed = false
+		}
+		kept = append(kept, q)
+	}
+	return kept, len(questions) - len(kept)
+}
+
 // mergeFilled - состояние контракта после хода: накопленное прошлыми раундами
 // плюс свежее. Ключ в gaps переоткрывает пункт, смена типа обращения снимает
 // ключи чужого контракта.
@@ -456,10 +498,10 @@ func lostKeys(prior, filled map[string]string) []string {
 }
 
 // checkTurn - проверки недоверенного вывода модели. Схема гарантирует форму, а
-// смысл проверяет Go: ключи вне контракта, вопрос про закрытый пункт и
-// готовность при незакрытых обязательных пунктах прошли бы схему насквозь.
-// Обязательность считается по слитому состоянию: контракт копится, и пункт,
-// закрытый прошлым раундом, модель повторять не обязана.
+// смысл проверяет Go: ключи вне ядра, вопрос про закрытый пункт и готовность
+// при незакрытом ядре прошли бы схему насквозь. Ядро считается по слитому
+// состоянию: контракт копится, и пункт, закрытый прошлым раундом, модель
+// повторять не обязана.
 func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error {
 	items := i.rules.Items(turn.Kind)
 	if len(items) == 0 {
@@ -481,15 +523,17 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	}
 	// Два вопроса об одном пункте в одном раунде сожгли бы его предел за раз:
 	// счётчик заданных вопросов считает по журналу, а не по раундам.
+	// Уточнение вне ядра ключа в gaps не имеет, а лишние уточнения снимает
+	// dropDetails: ход из-за них не отклоняется.
 	seen := make(map[string]bool, len(turn.Questions))
 	for _, q := range turn.Questions {
-		if !slices.Contains(turn.Gaps, q.Key) {
+		if q.Key != detailKey && !slices.Contains(turn.Gaps, q.Key) {
 			return fmt.Errorf("question about closed key %q", q.Key)
 		}
 		if strings.TrimSpace(q.Text) == "" {
 			return fmt.Errorf("question about %q is empty", q.Key)
 		}
-		if seen[q.Key] {
+		if seen[q.Key] && q.Key != detailKey {
 			return fmt.Errorf("two questions about key %q", q.Key)
 		}
 		// Отписку вместо догадки промт запрещает прямо, а ловил её только
@@ -500,19 +544,12 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		}
 		seen[q.Key] = true
 	}
-	// Готовность держат только обязательные пункты. Необязательный остаётся в
-	// gaps и уходит в тикет строкой «не разобрано»: требовать пустой gaps
-	// значило бы либо не давать разговору закончиться, либо заставлять модель
-	// прятать непрочитанное - именно на этом противоречии контур выбрасывал
-	// готовые генерации (наблюдение 2026-08-12).
 	missing := i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn))
 	if turn.Ready && len(missing) > 0 {
-		return fmt.Errorf("turn is ready with %d required gaps", len(missing))
+		return fmt.Errorf("turn is ready with %d core gaps", len(missing))
 	}
-	// Готовность обрывает разговор, и заданные тем же ходом вопросы автору уже
-	// не уйдут. Раньше это исключалось само собой (готовность требовала пустых
-	// gaps, а вопрос - ключа из них); теперь необязательный пункт остаётся в
-	// gaps, и модель может спросить про него, объявив разговор законченным.
+	// Готовность обрывает разговор, и заданное тем же ходом уточнение автору
+	// уже не уйдёт: уточнение допустимо и при закрытом ядре.
 	if turn.Ready && len(turn.Questions) > 0 {
 		return fmt.Errorf("turn is ready with %d questions", len(turn.Questions))
 	}
@@ -520,11 +557,17 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	if !turn.Ready && len(turn.Questions) == 0 {
 		return errors.New("turn is not ready and has no questions")
 	}
-	// Обязательный пункт, не закрытый и не названный пробелом, ушёл бы в тикет
+	// Открытое ядро спрашивается раньше уточнения: раунд из одного detail при
+	// пробеле в ядре тратит вопрос автора мимо того, без чего тикет неполон.
+	if !turn.Ready && len(turn.Gaps) > 0 &&
+		!slices.ContainsFunc(turn.Questions, func(q Question) bool { return slices.Contains(turn.Gaps, q.Key) }) {
+		return errors.New("turn has core gaps but no question about them")
+	}
+	// Пункт ядра, не закрытый и не названный пробелом, ушёл бы в тикет
 	// молчанием. Признаваться в непрочитанном модель обязана.
 	for _, key := range missing {
 		if !slices.Contains(turn.Gaps, key) {
-			return fmt.Errorf("required key %q is neither filled nor in gaps", key)
+			return fmt.Errorf("core key %q is neither filled nor in gaps", key)
 		}
 	}
 	return nil
@@ -567,12 +610,11 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	title := scrubContacts(strings.TrimSpace(out.Title))
 	body := i.renderSections(cs, out.Sections)
 	brief := briefOf(out.Brief, body)
-	// Недобран контракт или нет, решают обязательные пункты: необязательный
-	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
-	// иначе её носил бы каждый тикет.
-	incomplete := len(i.rules.Missing(cs.Kind, cs.Filled)) > 0
-	// Ни одной строки ни от модели, ни из контракта: показывать автору нечего,
-	// и работа уходит в повторы, а исчерпав их - скажет ему об этом.
+	// Метку неполноты и строку «Не уточнено» считает Go по ядру, а не модель.
+	unclear := i.rules.Unclear(cs.Kind, cs.Filled)
+	incomplete := unclear != ""
+	// Пусто только при пустом протоколе: показывать автору нечего, и работа
+	// уходит в повторы, а исчерпав их - скажет ему об этом.
 	if body == "" {
 		return fmt.Errorf("summary of case %s has no content", cs.ID)
 	}
@@ -618,7 +660,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// переписанное саммари упёрлось бы в ключ прошлого - автор не увидел бы
 		// собственную правку.
 		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			summaryMessage(title, brief, body, i.gapTitles(cs), incomplete, overlap), keysSummary)
+			summaryMessage(title, brief, body, unclear, overlap), keysSummary)
 	})
 	if err != nil {
 		return err
@@ -707,59 +749,73 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 		return fmt.Errorf("summary brief is %d runes long", utf8.RuneCountInString(brief))
 	}
 
+	// Пустой список разделов не ошибка: тело соберёт renderSections из ядра.
+	if len(out.Sections) > maxSections {
+		return fmt.Errorf("summary has %d sections", len(out.Sections))
+	}
 	for _, s := range out.Sections {
-		if i.rules.Title(cs.Kind, s.Key) == "" {
+		if err := checkHeading(s.Heading); err != nil {
+			return err
+		}
+		if s.Key != "" && i.rules.Title(cs.Kind, s.Key) == "" {
 			return fmt.Errorf("section key %q is not in contract", s.Key)
 		}
 		if strings.TrimSpace(s.Text) == "" {
-			return fmt.Errorf("section %q is empty", s.Key)
+			return fmt.Errorf("section %q is empty", s.Heading)
+		}
+		// Строка «## Ссылки» внутри текста стала бы в теле тикета вторым
+		// заголовком и спорила бы с разделом, который пишет Go.
+		if headingLineRe.MatchString(s.Text) {
+			return fmt.Errorf("section %q text has a heading line", s.Heading)
 		}
 	}
 	return nil
 }
 
-// renderSections собирает тело саммари в markdown - тот же текст уходит и в
-// issue, и автору. Порядок разделов задают правила, а не ответ модели: тикет
-// одного типа выглядит одинаково. Раздел, который модель не написала,
-// достраивается из контракта - почему так, раздел 7 architecture.md.
-func (i *Interview) renderSections(cs *Case, sections []section) string {
-	texts := make(map[string]string, len(sections))
-	for _, s := range sections {
-		// Пробел остаётся пробелом: раздел по незакрытому пункту - догадка,
-		// которой автор не давал, а сообщение о пробелах тут же ей противоречит.
-		if slices.Contains(cs.Gaps, s.Key) {
-			continue
-		}
-		texts[s.Key] = scrubContacts(strings.TrimSpace(s.Text))
+// checkHeading - заголовок раздела от модели становится строкой «## ...» в
+// теле issue: перевод строки, решётка или разметка в нём ломают тело, а
+// занятое имя спорит с разделом, который пишет Go.
+func checkHeading(heading string) error {
+	heading = strings.TrimSpace(heading)
+	switch {
+	case heading == "":
+		return errors.New("section has no heading")
+	case utf8.RuneCountInString(heading) > maxHeading:
+		return fmt.Errorf("section heading is %d runes long", utf8.RuneCountInString(heading))
+	case strings.ContainsAny(heading, "\n\r#<"):
+		return fmt.Errorf("section heading %q has markup", heading)
+	case slices.ContainsFunc(reservedHeadings, func(r string) bool { return strings.EqualFold(r, heading) }):
+		return fmt.Errorf("section heading %q is reserved", heading)
 	}
-	for key, value := range cs.Filled {
-		if texts[key] != "" || slices.Contains(cs.Gaps, key) {
-			continue
-		}
-		texts[key] = scrubContacts(strings.TrimSpace(value))
-	}
-
-	var b strings.Builder
-	for _, item := range i.rules.Items(cs.Kind) {
-		text := texts[item.Key]
-		if text == "" {
-			continue
-		}
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", item.Title, text)
-	}
-	return strings.TrimSpace(b.String())
+	return nil
 }
 
-// gapTitles - незакрытые пункты человеческими названиями. Автор видит их до
-// публикации: недобранный контракт даёт тикет с пометкой, а не отказ.
-func (i *Interview) gapTitles(cs *Case) []string {
-	var titles []string
-	for _, key := range cs.Gaps {
-		if title := i.rules.Title(cs.Kind, key); title != "" {
-			titles = append(titles, title)
-		}
+// renderSections собирает тело саммари в markdown - тот же текст уходит и в
+// issue, и автору. Разделы идут в порядке модели под её заголовками: форма
+// тикета следует материалу. Закрытый пункт ядра, который модель не покрыла
+// разделом, дописывается из собранного интервью, а нет ни разделов, ни ядра -
+// тело собирается из протокола сырья: ни одна идея не выбрасывается, и держит
+// это Go, а не промт. Раздел по незакрытому пункту остаётся: это слова автора,
+// а строка «Не уточнено» всё равно называет пункт пробелом.
+func (i *Interview) renderSections(cs *Case, sections []Section) string {
+	var b strings.Builder
+	covered := make(map[string]bool, len(sections))
+	for _, s := range sections {
+		covered[s.Key] = true
+		fmt.Fprintf(&b, "## %s\n\n%s\n\n", scrubContacts(strings.TrimSpace(s.Heading)),
+			scrubContacts(strings.TrimSpace(s.Text)))
 	}
-	return titles
+	for _, item := range i.rules.Items(cs.Kind) {
+		text := strings.TrimSpace(cs.Filled[item.Key])
+		if covered[item.Key] || text == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n\n%s\n\n", item.Title, scrubContacts(text))
+	}
+	if b.Len() == 0 && strings.TrimSpace(cs.Protocol) != "" {
+		fmt.Fprintf(&b, "## Материал обращения\n\n%s", scrubContacts(strings.TrimSpace(cs.Protocol)))
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // dialog собирает сообщения запроса. Порядок обязателен: стабильный префикс
@@ -1182,7 +1238,7 @@ func questionList(questions []Question) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func summaryMessage(title, brief, body string, gaps []string, incomplete bool, overlap string) string {
+func summaryMessage(title, brief, body, unclear, overlap string) string {
 	var b strings.Builder
 	b.WriteString("Вот что уйдёт в тикет.\n\n")
 	b.WriteString(title + "\n\n")
@@ -1192,14 +1248,10 @@ func summaryMessage(title, brief, body string, gaps []string, incomplete bool, o
 		b.WriteString(brief + "\n\n")
 	}
 	b.WriteString(plainText(body))
-	if len(gaps) > 0 {
-		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") + ".")
-		// Пометку о неполноте несёт только незакрытый обязательный пункт:
-		// обещать её на необязательном пробеле значит пугать автора тем, чего
-		// в тикете не будет.
-		if incomplete {
-			b.WriteString(" Тикет уйдёт с пометкой о неполноте.")
-		}
+	// Строка есть ровно тогда, когда тикет уйдёт с меткой неполноты: обе
+	// считаются по незакрытому ядру.
+	if unclear != "" {
+		b.WriteString("\n\n" + unclear + " Тикет уйдёт с пометкой о неполноте.")
 	}
 	// Пересечения идут перед вопросом о правке: это то, чего автор не знал, и
 	// решать ему сразу после - публиковать или бросить обращение.
@@ -1295,9 +1347,11 @@ func tableRow(line string) string {
 }
 
 var (
-	headingRe   = regexp.MustCompile(`^#{1,6}\s+`)
-	tableRuleRe = regexp.MustCompile(`^[\s|:-]+$`)
-	mdLinkRe    = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	headingRe = regexp.MustCompile(`^#{1,6}\s+`)
+	// headingLineRe - строка текста, которую markdown прочтёт заголовком.
+	headingLineRe = regexp.MustCompile(`(?m)^\s*#`)
+	tableRuleRe   = regexp.MustCompile(`^[\s|:-]+$`)
+	mdLinkRe      = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 )
 
 // Структурные персональные данные вырезаются детерминированно до записи в

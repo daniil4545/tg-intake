@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Правила поведения - блок «Изменяемое»: состав пунктов правится без единой
@@ -18,15 +20,15 @@ var ruleFiles embed.FS
 // caseKinds - типы обращения, которые принимает CHECK в cases.kind. Новый тип
 // в правилах без миграции упал бы на первой же записи, поэтому список сверяется
 // при загрузке.
-var caseKinds = []string{"bug", "feature", "question"}
+var caseKinds = []string{"bug", "feature", "question", "mixed"}
 
-// ContractItem - пункт контракта готовности. Title работает дважды: вопрос
-// интервью и заголовок раздела в теле issue. Одно место задаёт и что
-// спрашиваем, и как это выглядит в тикете.
+// ContractItem - пункт ядра контракта готовности: всё, что в нём есть,
+// обязательно. Остальное автор рассказывает сам, и оно живёт в свободных
+// разделах тикета, а не в анкете. Title - название пункта в строке «Не
+// уточнено» и в разделе, который Go дописывает за модель.
 type ContractItem struct {
-	Key      string `json:"key"`
-	Title    string `json:"title"`
-	Required bool   `json:"required"`
+	Key   string `json:"key"`
+	Title string `json:"title"`
 }
 
 // Contract - пункты по типу обращения.
@@ -67,7 +69,6 @@ func LoadContract() (Contract, error) {
 
 func checkItems(kind string, items []ContractItem) error {
 	seen := make(map[string]bool, len(items))
-	required := 0
 	for _, it := range items {
 		switch {
 		case it.Key == "":
@@ -78,14 +79,6 @@ func checkItems(kind string, items []ContractItem) error {
 			return fmt.Errorf("contract kind %q has duplicate key %q", kind, it.Key)
 		}
 		seen[it.Key] = true
-		if it.Required {
-			required++
-		}
-	}
-	// Тип без единого обязательного пункта означает, что готовым считается любое
-	// обращение: интервью тогда не задаёт ни одного вопроса.
-	if required == 0 {
-		return fmt.Errorf("contract kind %q has no required items", kind)
 	}
 	return nil
 }
@@ -104,15 +97,11 @@ func (c Contract) Title(kind, key string) string {
 	return ""
 }
 
-// Missing - обязательные пункты типа, которых нет в filled. Это второй,
-// независимый от модели счёт пробелов: её собственный список gaps проверяется
-// против него.
+// Missing - пункты ядра типа, которых нет в filled. Это второй, независимый от
+// модели счёт пробелов: её собственный список gaps проверяется против него.
 func (c Contract) Missing(kind string, filled map[string]string) []string {
 	var gaps []string
 	for _, it := range c[kind] {
-		if !it.Required {
-			continue
-		}
 		if strings.TrimSpace(filled[it.Key]) == "" {
 			gaps = append(gaps, it.Key)
 		}
@@ -134,12 +123,29 @@ func (c Contract) Prompt() string {
 	for _, kind := range kinds {
 		fmt.Fprintf(&b, "\n%s:\n", kind)
 		for _, it := range c[kind] {
-			mark := "необязателен"
-			if it.Required {
-				mark = "обязателен"
-			}
-			fmt.Fprintf(&b, "- %s (%s): %s\n", it.Key, mark, it.Title)
+			fmt.Fprintf(&b, "- %s: %s\n", it.Key, it.Title)
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// Unclear - строка о незакрытом ядре для саммари и тела тикета: «Не уточнено:
+// конкретный случай, что нужно.». Ядро закрыто - пусто. Счёт по Missing, а не
+// по gaps модели: строку, от которой зависит метка неполноты, считает Go.
+func (c Contract) Unclear(kind string, filled map[string]string) string {
+	var titles []string
+	for _, key := range c.Missing(kind, filled) {
+		titles = append(titles, lowerFirst(c.Title(kind, key)))
+	}
+	if len(titles) == 0 {
+		return ""
+	}
+	return "Не уточнено: " + strings.Join(titles, ", ") + "."
+}
+
+// lowerFirst - название пункта внутри фразы: «Конкретный случай» в правилах,
+// «..., конкретный случай» в строке.
+func lowerFirst(text string) string {
+	r, size := utf8.DecodeRuneInString(text)
+	return string(unicode.ToLower(r)) + text[size:]
 }
