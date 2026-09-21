@@ -1,0 +1,12 @@
+# Секреты прод-контура: имя, уровень, источник значения.
+#   2 - запись Keychain; account записи равен имени переменной
+#   3 - путь секрета для galera-secret-read
+#
+# В карте только то, что доставляет sync-env. Имени здесь нет - значит это
+# несекретный конфиг уровня 1: он живёт в самом контуре и правится set-env.
+# Источник назван по сущности Coolify intake-dev: имя историческое, контур боевой.
+ALERT_BOT_TOKEN 3 galera/intake-dev
+GITHUB_TOKEN 3 galera/intake-dev
+OPENROUTER_API_KEY 3 galera/intake-dev
+POSTGRES_PASSWORD 3 galera/intake-dev
+TELEGRAM_BOT_TOKEN 3 galera/intake-dev
