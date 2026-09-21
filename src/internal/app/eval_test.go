@@ -40,6 +40,8 @@ const (
 	// и после нужна одна модель в обоих прогонах, а не модель прода.
 	evalModel     = "deepseek/deepseek-v4-flash-0731"
 	evalReasoning = "low"
+	// Пауза между попытками шага.
+	evalRetryDelay = 5 * time.Second
 	// Ответ, когда в журнале исходника на этот раунд ответа нет (Р-12).
 	evalNoAnswer = "Не знаю"
 )
@@ -310,8 +312,26 @@ func loadEvalCase(ctx context.Context, iv *Interview, caseID string) (*Case, err
 	return cs, nil
 }
 
-// evalStep - шаг с бюджетом работы очереди, как у воркера.
+// evalStep - шаг как работа очереди: бюджет воркера на попытку и повтор до
+// maxAttempts попыток. На проде таймаут модели и невалидный ответ повторяет
+// очередь, и без повтора прогон мерил бы сеть, а не промты. Состояние
+// обращения между попытками не трогаем: Run и Summarize сверяют версию сами.
 func evalStep(ctx context.Context, step JobHandler, job Job) error {
+	var err error
+	for job.Attempts = 1; job.Attempts <= maxAttempts; job.Attempts++ {
+		if err = evalAttempt(ctx, step, job); err == nil {
+			return nil
+		}
+		// Готовой функции отсрочки у воркера нет (она в SQL FailJob), а
+		// растущая пауза до 16 с на пять попыток прогону не нужна.
+		if job.Attempts < maxAttempts && !wait(ctx, evalRetryDelay) {
+			break
+		}
+	}
+	return fmt.Errorf("%d attempts, last: %w", min(job.Attempts, maxAttempts), err)
+}
+
+func evalAttempt(ctx context.Context, step JobHandler, job Job) error {
 	ctx, cancel := context.WithTimeout(ctx, jobTimeout)
 	defer cancel()
 	return step(ctx, job)
