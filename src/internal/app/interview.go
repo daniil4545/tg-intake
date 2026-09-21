@@ -305,7 +305,7 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 			"lost_keys", strings.Join(lostKeys(cs.Filled, filled), ","))
 	}
 
-	saved, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
+	saved, actualRound, actualToSummary, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
 	if err != nil {
 		return err
 	}
@@ -316,24 +316,33 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return nil
 	}
 
+	// Вопросов в правдивом логе нет, если ход всё же ушёл в саммари (в том
+	// числе из-за пропуска, обнаруженного уже внутри saveTurn) - раунда с ними
+	// не было.
+	questions := len(turn.Questions)
+	if actualToSummary {
+		questions = 0
+	}
 	// Ключи пробелов, а не только их число: решение «оставлять ли пункт
 	// обязательным» принимается по тому, какой из них не закрывается чаще
 	// прочих, и по счётчику этого не увидеть. Ключ - имя пункта контракта,
 	// содержимого обращения в нём нет.
-	i.log.Info("interview_round", "case_id", cs.ID, "round", round, "kind", turn.Kind,
-		"questions", len(turn.Questions), "gaps", len(turn.Gaps),
-		"gap_keys", strings.Join(turn.Gaps, ","), "to_summary", toSummary)
+	i.log.Info("interview_round", "case_id", cs.ID, "round", actualRound, "kind", turn.Kind,
+		"questions", questions, "gaps", len(turn.Gaps),
+		"gap_keys", strings.Join(turn.Gaps, ","), "to_summary", actualToSummary)
 	return nil
 }
 
 // saveTurn кладёт ход разговора: состояние контракта, событие раунда и то, что
 // уходит автору либо в следующую работу. Одной транзакцией - иначе вопрос
 // уходит автору, а раунд в базе не сохранён.
-// Второе значение - лёг ли результат в базу. Ложь означает, что ход устарел:
-// обращение отменили или автор дописал, пока модель думала.
-func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool, version int) (bool, error) {
-	saved := false
-	err := i.cases.inTx(ctx, func(tx pgx.Tx) error {
+// saved - лёг ли результат в базу. Ложь означает, что ход устарел: обращение
+// отменили или автор дописал, пока модель думала - actualRound/actualToSummary
+// тогда не определены. Иначе они называют то, что реально записано: пропуск,
+// случившийся, пока модель думала, эта же транзакция обязана увидеть раньше
+// записи round (Р-15) - round остаётся прежним, а не round+1 из аргумента.
+func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool, version int) (saved bool, actualRound int, actualToSummary bool, err error) {
+	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
 		// Версия разговора сверяется внутри той же транзакции: между её чтением
 		// и записью автор мог прислать ещё один ответ, и тогда писать этот ход
 		// поверх свежего нельзя.
@@ -345,6 +354,35 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 			return nil
 		}
 
+		// Строка блокируется раньше решения "какой раунд писать": так пропуск,
+		// случившийся конкурентно, обязан лечь в эту же транзакцию до того, как
+		// мы выберем round и toSummary, а не после.
+		var status string
+		err = tx.QueryRow(ctx, `SELECT status FROM cases WHERE id = $1 FOR UPDATE`, cs.ID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock case %s for turn: %w", cs.ID, err)
+		}
+		// Обращение отменили, пока модель думала: ни вопроса, ни саммари.
+		if status != statusInterview {
+			return nil
+		}
+
+		actualRound, actualToSummary = round, toSummary
+		if !toSummary {
+			skipped, err := i.cases.skipped(ctx, tx, cs.ID)
+			if err != nil {
+				return err
+			}
+			if skipped {
+				actualToSummary = true
+				actualRound = cs.Round
+				i.log.Info("skip_dropped", "case_id", cs.ID, "dropped", len(turn.Questions))
+			}
+		}
+
 		contract, err := json.Marshal(filled)
 		if err != nil {
 			return fmt.Errorf("encode contract of case %s: %w", cs.ID, err)
@@ -354,21 +392,16 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 			return fmt.Errorf("encode gaps of case %s: %w", cs.ID, err)
 		}
 
-		tag, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE cases SET kind = $2, contract = $3, gaps = $4, round = $5, updated_at = now()
-			WHERE id = $1 AND status = 'interview'`, cs.ID, turn.Kind, contract, gaps, round)
-		if err != nil {
+			WHERE id = $1`, cs.ID, turn.Kind, contract, gaps, actualRound); err != nil {
 			return fmt.Errorf("save turn of case %s: %w", cs.ID, err)
-		}
-		// Обращение отменили, пока модель думала: ни вопроса, ни саммари.
-		if tag.RowsAffected() == 0 {
-			return nil
 		}
 		saved = true
 
-		if toSummary {
+		if actualToSummary {
 			if err := addEvent(ctx, tx, cs.ID, "interview_done", map[string]any{
-				"round": round, "gaps": turn.Gaps,
+				"round": actualRound, "gaps": turn.Gaps,
 			}); err != nil {
 				return err
 			}
@@ -376,7 +409,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		}
 
 		if err := addEvent(ctx, tx, cs.ID, "round_asked", map[string]any{
-			"round": round, "questions": turn.Questions,
+			"round": actualRound, "questions": turn.Questions,
 		}); err != nil {
 			return err
 		}
@@ -386,9 +419,9 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		if hasSuggestion(turn.Questions) {
 			keys = keysRound
 		}
-		return putNotifyRound(ctx, tx, cs.ID, round, roundMessage(turn.Questions), keys)
+		return putNotifyRound(ctx, tx, cs.ID, actualRound, roundMessage(turn.Questions), keys)
 	})
-	return saved, err
+	return saved, actualRound, actualToSummary, err
 }
 
 // askTurn спрашивает модель и проверяет её ответ. Невалидный ответ - один
@@ -1045,21 +1078,105 @@ var (
 		"уточнить не удалось", "не сообщается"}
 )
 
-// roundAnswered - последним событием разговора идёт ответ, а не вопрос. Значит
-// текущий раунд закрыт и подтверждать в нём нечего.
+// roundAnswered - последним событием разговора идёт ответ или пропуск, а не
+// вопрос. Значит текущий раунд закрыт и подтверждать в нём нечего.
 func (c *Cases) roundAnswered(ctx context.Context, caseID string) (bool, error) {
+	kind, err := lastRoundEvent(ctx, c.pool, caseID)
+	if err != nil {
+		return false, err
+	}
+	return kind != "" && kind != "round_asked", nil
+}
+
+// lastRoundEvent - последнее событие раунда среди троицы §4 плана
+// plan-skip-questions.md: вопрос, ответ, пропуск. Пустая строка - раунда с
+// таким событием ещё не было.
+func lastRoundEvent(ctx context.Context, db txRunner, caseID string) (string, error) {
 	var kind string
-	err := c.pool.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT kind FROM case_events
-		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given')
+		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given', 'questions_skipped')
 		ORDER BY id DESC LIMIT 1`, caseID).Scan(&kind)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return "", nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check last event of case %s: %w", caseID, err)
+		return "", fmt.Errorf("check last round event of case %s: %w", caseID, err)
 	}
-	return kind == "answer_given", nil
+	return kind, nil
+}
+
+// skipped - в обращении уже случился пропуск вопросов (Р-15): раунд не
+// открывается больше ни ходом, ни правкой саммари до самой публикации.
+// db - пул или транзакция: saveTurn обязан увидеть пропуск в своей же
+// транзакции, остальные вызовы читают вне неё.
+func (c *Cases) skipped(ctx context.Context, db txRunner, caseID string) (bool, error) {
+	var exists bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM case_events WHERE case_id = $1 AND kind = 'questions_skipped')`,
+		caseID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check skip of case %s: %w", caseID, err)
+	}
+	return exists, nil
+}
+
+// SkipQuestions - «Отправить как есть»: раунд закрывается без ответа, дальше
+// работу довершает саммари (Р-5 ticket-form: саммари - последняя точка перед
+// публикацией). Статус и cases.round не трогает - их меняет Summarize.
+func (c *Cases) SkipQuestions(ctx context.Context, cs *Case, round int) error {
+	if cs.Status != statusInterview {
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "not_interview")
+		return ErrNotInterview
+	}
+	if round != cs.Round {
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "stale_round")
+		return ErrStaleRound
+	}
+
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		// Блокировка строки через updated_at, как у ответа: пропуск - тоже
+		// действие автора, таймер черновика сдвигается так же.
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET updated_at = now()
+			WHERE id = $1 AND status = 'interview' AND round = $2`, cs.ID, round)
+		if err != nil {
+			return fmt.Errorf("lock case %s for skip: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrStaleRound
+		}
+
+		kind, err := lastRoundEvent(ctx, tx, cs.ID)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case "":
+			return ErrStaleRound
+		case "round_asked":
+		default:
+			return ErrRoundAnswered
+		}
+
+		if err := addEvent(ctx, tx, cs.ID, "questions_skipped", map[string]any{"round": round}); err != nil {
+			return err
+		}
+		return replaceJob(ctx, tx, JobSummarize, cs.ID, casePayload{CaseID: cs.ID})
+	})
+	switch {
+	case errors.Is(err, ErrStaleRound):
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "stale_round")
+		return err
+	case errors.Is(err, ErrRoundAnswered):
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "round_answered")
+		return err
+	case err != nil:
+		return err
+	}
+
+	c.log.Info("questions_skipped", "case_id", cs.ID, "round", round)
+	return nil
 }
 
 // askedKeys - сколько раз каждый пункт контракта уже становился вопросом.

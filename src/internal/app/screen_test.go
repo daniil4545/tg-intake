@@ -997,6 +997,7 @@ func TestStepButtonAlwaysAnswers(t *testing.T) {
 		{"публикую", (*Bot).onPublish},
 		{"всё так", (*Bot).onAllTrue},
 		{"поправить", (*Bot).onFix},
+		{"пропуск", (*Bot).onSkip},
 	}
 
 	t.Run("без активного обращения", func(t *testing.T) {

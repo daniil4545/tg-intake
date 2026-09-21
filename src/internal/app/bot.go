@@ -66,13 +66,15 @@ const (
 // поймается. Кнопки сбора - reply-клавиатура, они маршрутизируются по тексту,
 // поэтому один и тот же Btn идёт и в Handle, и в клавиатуру.
 var (
-	projectBtn    = &tele.Btn{Unique: "project"}
-	createBtn     = &tele.Btn{Unique: "create"}
-	askBtn        = &tele.Btn{Unique: "ask"}
-	toTicketBtn   = &tele.Btn{Unique: "to_ticket"}
-	endAskBtn     = &tele.Btn{Unique: "end_ask"}
-	continueBtn   = &tele.Btn{Unique: "continue"}
-	allTrueBtn    = &tele.Btn{Unique: "all_true"}
+	projectBtn  = &tele.Btn{Unique: "project"}
+	createBtn   = &tele.Btn{Unique: "create"}
+	askBtn      = &tele.Btn{Unique: "ask"}
+	toTicketBtn = &tele.Btn{Unique: "to_ticket"}
+	endAskBtn   = &tele.Btn{Unique: "end_ask"}
+	continueBtn = &tele.Btn{Unique: "continue"}
+	allTrueBtn  = &tele.Btn{Unique: "all_true"}
+	// skipBtn - «Отправить как есть», data несёт номер раунда, как у allTrueBtn.
+	skipBtn       = &tele.Btn{Unique: "skip"}
 	publishBtn    = &tele.Btn{Unique: "publish"}
 	fixBtn        = &tele.Btn{Unique: "fix"}
 	ticketsBtn    = &tele.Btn{Unique: "tickets"}
@@ -204,6 +206,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 	tb.Handle(endAskBtn, b.onEndAsk)
 	tb.Handle(continueBtn, b.onContinue)
 	tb.Handle(allTrueBtn, b.onAllTrue)
+	tb.Handle(skipBtn, b.onSkip)
 	tb.Handle(publishBtn, b.onPublish)
 	tb.Handle(fixBtn, b.onFix)
 	tb.Handle(addProjectBtn, b.onAddProject)
@@ -486,11 +489,7 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	switch p.Buttons {
 	case keysRound, keysAsk:
 		if cs.Status == statusInterview && p.Round >= cs.Round {
-			var opts []any
-			if p.Buttons == keysRound {
-				opts = append(opts, roundKeyboard(cs.Round))
-			}
-			return b.showStep(ctx, cs, cs.Round, p.Text, opts...)
+			return b.showStep(ctx, cs, cs.Round, p.Text, roundKeyboard(cs.Round, p.Buttons == keysRound))
 		}
 		_, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text)
 		return err
@@ -1384,30 +1383,43 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 	if !b.liveScreen(c, cs) {
 		return nil
 	}
-	b.toast(c, "Принято")
 
 	round, err := strconv.Atoi(c.Data())
 	if err != nil {
+		b.toast(c, "Принято")
 		return b.screen(c, "Кнопка устарела. Ответьте, пожалуйста, текстом.", nil)
 	}
 
-	switch err := b.cases.AcceptRound(ctx, cs, round); {
-	case errors.Is(err, ErrStaleRound):
+	// Тост зовёт каждая ветка сама, а не общий вызов до разбора ошибки: на
+	// неизвестной ошибке AcceptRound хендлер обязан выйти без тоста вовсе -
+	// ответит OnError, а тост здесь стал бы вторым ответом на тот же
+	// callback_query_id.
+	switch acceptErr := b.cases.AcceptRound(ctx, cs, round); {
+	case errors.Is(acceptErr, ErrRoundAnswered):
+		// Раунд уже закрыт - ответом или пропуском. Обещать «готовлю следующий
+		// вопрос» здесь было бы неправдой после «Отправить как есть» (Р-15).
+		b.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "round_answered")
+		b.toast(c, "Этот экран устарел")
+		if msg := c.Message(); msg != nil {
+			b.stripScreen(cs, msg.ID)
+		}
+		return nil
+	case errors.Is(acceptErr, ErrStaleRound):
 		// Кнопка прошлого раунда осталась в чате: закрывать ею текущие вопросы
 		// нельзя, автор подтвердил бы не то, что видит.
+		b.toast(c, "Принято")
 		return c.Send("Это кнопка от прошлого вопроса. Ответьте на последний - текстом или голосовым.")
-	case errors.Is(err, ErrRoundAnswered):
-		// Вопрос тот же самый, и ответ по нему уже принят: говорить про прошлый
-		// вопрос здесь значит спорить с тем, что автор видит на экране.
-		return c.Send("Ответ уже принят, готовлю следующий вопрос.")
-	case errors.Is(err, ErrNotInterview):
+	case errors.Is(acceptErr, ErrNotInterview):
+		b.toast(c, "Принято")
 		return c.Send("Обращение уже ушло дальше.")
-	case errors.Is(err, ErrNoSuggestion):
+	case errors.Is(acceptErr, ErrNoSuggestion):
+		b.toast(c, "Принято")
 		return c.Send("Догадок у меня нет, подтверждать нечего. Ответьте, пожалуйста, текстом или голосовым.")
-	case err != nil:
-		return err
+	case acceptErr != nil:
+		return acceptErr
 	}
 
+	b.toast(c, "Принято")
 	b.waitFor(cs)
 	// Экран раунда правится тем же способом, что и типизированный ответ (S4):
 	// счёт ответов один и честный, кто бы ни нажимал. Правка не вышла - ответ
@@ -1419,6 +1431,58 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		}
 		return c.Send("Принято: всё так. Думаю дальше.")
 	}
+	return nil
+}
+
+// onSkip - «Отправить как есть»: раунд закрывается без ответа автора, дальше
+// саммари собирается тем, что уже сказано (Р-5, Р-15 ticket-form). Тот же
+// порядок проверок, что у onAllTrue: Active раньше тоста (отказ отвечает
+// OnError сам, S3). Номер раунда разбирается до liveScreen - порядок §5 плана
+// среза.
+func (b *Bot) onSkip(c tele.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	cs, err := b.cases.Active(ctx, senderID(c))
+	if err != nil {
+		return err
+	}
+	if cs == nil {
+		b.toast(c, "")
+		return b.screen(c, "Обращение уже закрыто.", backHome())
+	}
+
+	round, err := strconv.Atoi(c.Data())
+	if err != nil {
+		b.toast(c, "Этот экран устарел")
+		if msg := c.Message(); msg != nil {
+			b.stripScreen(cs, msg.ID)
+		}
+		return nil
+	}
+
+	if !b.liveScreen(c, cs) {
+		return nil
+	}
+
+	switch err := b.cases.SkipQuestions(ctx, cs, round); {
+	case errors.Is(err, ErrNotInterview), errors.Is(err, ErrStaleRound), errors.Is(err, ErrRoundAnswered):
+		// Раунд отвечен, пропущен раньше, не текущий или обращение ушло дальше -
+		// автор видит один и тот же тост (решение 3 плана среза).
+		b.toast(c, "Этот экран устарел")
+		if msg := c.Message(); msg != nil {
+			b.stripScreen(cs, msg.ID)
+		}
+		return nil
+	case err != nil:
+		return err
+	}
+
+	b.toast(c, "Принято")
+	if err := b.screen(c, markAnswered(c, "Отправляю как есть. Собираю саммари."), nil); err != nil {
+		return err
+	}
+	b.waitFor(cs)
 	return nil
 }
 
@@ -1751,12 +1815,20 @@ func collectKeyboard() *tele.ReplyMarkup {
 	return markup
 }
 
-// roundKeyboard - «Всё так» под раундом вопросов. Номер раунда уезжает в
-// callback_data: кнопки прошлых раундов остаются в переписке, и по нажатию надо
-// понять, к каким вопросам оно относится.
-func roundKeyboard(round int) *tele.ReplyMarkup {
+// roundKeyboard - кнопки под раундом вопросов: «Отправить как есть» есть
+// всегда (R5 ticket-form), «Всё так» - только когда есть догадка, которую она
+// подтверждает (иначе обещание кнопки разошлось бы с текстом). Номер раунда
+// уезжает в callback_data обеих: кнопки прошлых раундов остаются в переписке,
+// и по нажатию надо понять, к каким вопросам оно относится.
+func roundKeyboard(round int, suggested bool) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("Всё так", allTrueBtn.Unique, strconv.Itoa(round))))
+	data := strconv.Itoa(round)
+	row := make([]tele.Btn, 0, 2)
+	if suggested {
+		row = append(row, markup.Data("Всё так", allTrueBtn.Unique, data))
+	}
+	row = append(row, markup.Data("Отправить как есть", skipBtn.Unique, data))
+	markup.Inline(markup.Row(row...))
 	return markup
 }
 

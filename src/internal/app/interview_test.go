@@ -1054,7 +1054,7 @@ func TestStaleTurnIsDropped(t *testing.T) {
 		Gaps:      []string{"wrong"},
 		Questions: []Question{{Key: "wrong", Text: "что ожидали?"}},
 	}
-	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 2, false, version)
+	saved, _, _, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 2, false, version)
 	if err != nil {
 		t.Fatalf("save turn: %v", err)
 	}
@@ -1088,7 +1088,7 @@ func TestRoundLimitGoesToSummary(t *testing.T) {
 	}
 	// Предел исчерпан (round=3 при пределе 3), поэтому ход идёт в саммари, а не
 	// задаёт четвёртый раунд.
-	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 3, true, version)
+	saved, _, _, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 3, true, version)
 	if err != nil {
 		t.Fatalf("save turn: %v", err)
 	}

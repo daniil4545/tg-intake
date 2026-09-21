@@ -204,3 +204,19 @@ func textCtx(tb *tele.Bot, userID int64, text string) tele.Context {
 		},
 	})
 }
+
+// inlineRows декодирует инлайн-клавиатуру вызова Bot API: telebot кладёт
+// reply_markup JSON-строкой внутри тела запроса, а не вложенным объектом.
+func inlineRows(t *testing.T, call tgCall) [][]tele.InlineButton {
+	t.Helper()
+
+	raw, _ := call.body["reply_markup"].(string)
+	if raw == "" {
+		return nil
+	}
+	var markup tele.ReplyMarkup
+	if err := json.Unmarshal([]byte(raw), &markup); err != nil {
+		t.Fatalf("decode reply_markup: %v", err)
+	}
+	return markup.InlineKeyboard
+}
