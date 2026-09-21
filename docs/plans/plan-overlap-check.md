@@ -3,7 +3,7 @@
 Реализовано, релиз 0.1.13. Замысел - `docs/prd.md` (раздел 4Б), схема ответа
 модели и проверки Go - `docs/llm.md`, поле `cases.overlap` и место шага в
 потоке - `docs/architecture.md`, паспорт приёмки -
-[acceptance/overlap-check.md](../acceptance/overlap-check.md). Здесь остаётся
+`acceptance/overlap-check.md` (в git). Здесь остаётся
 то, чего в них нет: что срез сознательно не закрыл.
 
 ## Известные ограничения

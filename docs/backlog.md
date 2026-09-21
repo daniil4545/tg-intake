@@ -8,7 +8,7 @@
 
 - [x] **M0-M4** каркас, приём сырья, интервью, публикация, просмотр тикетов, проекты: релиз 0.1.0, принят 2026-08-09, состав - в [CHANGELOG](../CHANGELOG.md).
 - [x] **M7** Вопросы по проекту, режим «Спросить»: [plans/plan-ask.md](plans/plan-ask.md), [acceptance/ask.md](acceptance/ask.md), ждёт живого прогона.
-- [x] **M8** Уведомления о статусе: релизы 0.1.11 и 0.1.12, [plans/plan-ticket-news.md](plans/plan-ticket-news.md), [acceptance/ticket-news.md](acceptance/ticket-news.md).
+- [x] **M8** Уведомления о статусе: релизы 0.1.11 и 0.1.12, [plans/plan-ticket-news.md](plans/plan-ticket-news.md).
 - [ ] Ответ автора комментарием в тикет - galera-tasks#31
 - [ ] Тикеты в galera-tasks, остаток сверки дублей из tg-intake#32 - galera-tasks#2
 

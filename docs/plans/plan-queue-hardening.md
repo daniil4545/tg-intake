@@ -2,7 +2,7 @@
 
 Реализовано, релиз 0.1.7. Устройство очереди, восстановление и политика повторов
 - `docs/architecture.md` (разделы 4 и 5), паспорт приёмки -
-[acceptance/queue-hardening.md](../acceptance/queue-hardening.md). Здесь остаётся
+`acceptance/queue-hardening.md` (в git). Здесь остаётся
 то, чего в них нет.
 
 ## Два решения среза
