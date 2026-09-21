@@ -8,7 +8,7 @@ Architecture review: pass with fixes, 2 must-fix и 7 should-fix закрыты 
 ## 1. Цель и границы
 
 - Цель: цифры M1-M4 текущих промтов на реальных обращениях, с которыми срез 3 сравнит новые.
-- Готовый результат: `withkey galera/intake -- make -C src eval EVAL_OUT=base` печатает M1-M4
+- Готовый результат: `make -C src eval EVAL_OUT=base` печатает M1-M4
   по трём прогонам, среднее и среднее по типам, пишет `eval/results/base.json`.
 - Делаем: read-only действие `safe-ssh.sh eval-export`, набор в `eval/` вне git, прогон с
   тегом `eval`.
@@ -97,7 +97,7 @@ reasoning, раунды, исключённые, `runs[]` (M1-M4, по типа�
 
 ## 7. Критерий приёмки
 
-- Команда: `make -C src ci-check && withkey galera/intake -- make -C src eval EVAL_OUT=base`.
+- Команда: `make -C src ci-check && make -C src eval EVAL_OUT=base`.
 - Тестовый сценарий: вывод печатает M1-M4 трёх прогонов, среднее и по типам,
   `eval/results/base.json` есть, `failed` не больше 10%; `git status` не видит `eval/`.
 - Не автоматизируется: ничего.
