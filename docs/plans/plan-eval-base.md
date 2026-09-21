@@ -1,0 +1,116 @@
+# Спека среза: набор обращений и базовый прогон
+
+Статус: draft
+Issue: galera-tasks#32, срез 1 из 8
+Каноны: `docs/specs/ticket-form.md` (Р-9, Р-10, Р-12, Р-14, Р-16, R7), `docs/architecture.md`
+Architecture review: pass with fixes, 2 must-fix и 7 should-fix закрыты текстом
+
+## 1. Цель и границы
+
+- Цель: цифры M1-M4 текущих промтов на реальных обращениях, с которыми срез 3 сравнит новые.
+- Готовый результат: `withkey galera/intake -- make -C src eval EVAL_OUT=base` печатает M1-M4
+  по трём прогонам, среднее и среднее по типам, пишет `eval/results/base.json`.
+- Делаем: read-only действие `safe-ssh.sh eval-export`, набор в `eval/` вне git, прогон с
+  тегом `eval`.
+- Не делаем: `eval-compare` (срез 3), правку промтов и кода бота, прод.
+
+## 2. Архитектура
+
+| Блок | Ответственность | Взаимодействует с |
+|---|---|---|
+| `safe-ssh.sh eval-export` | одна JSON-строка на обращение `mode='ticket'` с непустым `protocol`: `id`, `project` (slug), `context` проекта, `protocol`, `kind`, события `round_asked`, `answer_given`, `interview_done`, `summary_ready`, `switched_to_ticket` с payload по порядку `id`. `user_id` не выгружается | прод-БД, чтение |
+| `eval/` | `cases.jsonl` (набор), `results/<имя>.json`; целиком в `.gitignore` (Р-10) | - |
+| `eval_test.go`, тег `eval` | прогон набора через `Interview.Run`, `Cases.AddAnswer`, `Interview.Summarize` на `TEST_DATABASE_URL`, реальный `OpenRouter`, `overlap = nil`, `rounds = 2` в `NewInterview` всегда (Р-9) | OpenRouter, локальная БД |
+| `eval_metrics_test.go`, без тега | подсчёт M1-M4 из `[]caseRun` и `TestEvalMetrics`, идёт в `ci-check` | - |
+
+- Выгрузка: `deploy/safe-ssh.sh eval-export > eval/cases.jsonl`, текст сразу в файл, не в
+  терминал. Контур по умолчанию `intake-dev` - это прод (исторические имена, карточка
+  `intake-prod`).
+- Модель: `EVAL_MODEL`, `EVAL_REASONING`, по умолчанию дефолты `config.go`
+  (`deepseek/deepseek-v4-flash-0731`, `low`). Значение модели прода скрыто, а сравнению до и
+  после нужна одна модель в обоих прогонах, а не совпадение с продом. Обе пишутся в результат.
+- Источник истины прогона - таблицы локальной БД; результат - файл в `eval/results/`.
+
+## 3. Сценарии
+
+| Сценарий | Шаги | Результат |
+|---|---|---|
+| Happy path | экспорт, `make eval EVAL_OUT=base` | M1-M4 трёх прогонов, среднее и по типам в выводе и `base.json` |
+| Ответ по раунду | модель задала раунд N | ответ - тексты `answer_given` исходника с `round = N` до его первого `interview_done` или `summary_ready`, через перевод строки: правки саммари в ответ не попадают (Р-12). Таких нет - «Не знаю»; допущение одно для до и после |
+| Из «Спросить» | у обращения есть `switched_to_ticket` | исключается: модель видела ответ по документации (`answer_ready`), которого нет в наборе; число исключённых печатается |
+| Повтор | `make eval` ещё раз | каждый из трёх прогонов начинается с `TRUNCATE`, файл результата перезаписывается |
+| Нет хода | `Run` вернул nil без нового события | обращение `failed: no progress` |
+| Временная ошибка | ход модели упал после повторов клиента | обращение `failed` с текстом ошибки, в метрики не входит |
+| Постоянная ошибка | `failed` больше 10% прогона | тест красный с числом и первой ошибкой |
+
+## 3a. Рубежи молчания
+
+Не применимо: срез не добавляет действий наружу. Бот и воркер не поднимаются: работы
+`notify` и `summarize` остаются в локальной `jobs` невыполненными; GitHub не вызывается
+(`overlap = nil`).
+
+## 3b. Сценарии проверки
+
+Не применимо: рабочий путь сервиса не меняется, срез - измерительный инструмент. Проверка
+метрик - `TestEvalMetrics` на ручных записях: без вопросов, два раунда, `bug` с
+`incomplete`, `failed`.
+
+## 4. Данные и состояния
+
+- Прогон: `TRUNCATE` как `testPool`; `projects` - upsert по slug с `context` из набора и
+  заглушками `title`, `github_owner`, `github_repo`; на обращение свой `users` (индекс одного
+  активного обращения на автора); `cases` в `status='interview'`, `mode='ticket'`, `round=0`.
+- Цикл обращения, последовательный внутри обращения: `Run` -> `Load` -> новый `round_asked` -
+  `AddAnswer` с ответом по свежему `cases.round` -> `Run` ...; `interview_done` - `Summarize`
+  собранной вручную `Job`; конец на `status='summary'`. Предохранитель - 6 ходов.
+- Параллельно 6 обращений (`EVAL_PARALLEL`). Оценка: около 55 обращений по 2-4 вызова, ход
+  20 секунд - 3 минуты, три прогона - до двух часов; цель `eval` ставит `-timeout 3h`.
+
+## 5. Кодовая модель
+
+```go
+// caseRun - итог одного обращения в прогоне.
+type caseRun struct {
+    ID         string `json:"id"`
+    Kind       string `json:"kind"`       // тип после саммари
+    Questions  []int  `json:"questions"`  // число вопросов по раундам, пусто - без вопросов
+    Incomplete bool   `json:"incomplete"` // cases.incomplete после Summarize
+    Failed     string `json:"failed,omitempty"`
+}
+```
+
+Метрики (Р-9), по обращениям без `failed`: M1 - доля с пустым `Questions`; M2 - среднее
+`len(Questions)`; M3 - доля `bug`/`mixed` с `Incomplete=false`; M4 - среднее `Questions[0]`
+по обращениям с раундом 1. M3 берёт `cases.incomplete`: его считает Go через
+`Contract.Missing` (`interview.go:572`), а не модель, и для старого контракта бага (`case`,
+`expected`, `actual` обязательны) это то же, что ядро по карте Р-14. Результат: модель,
+reasoning, раунды, исключённые, `runs[]` (M1-M4, по типам, `cases[]`), `mean`.
+
+## 6. Этапы реализации
+
+| Этап | Проверяемый результат | Проверка |
+|---|---|---|
+| 1. Экспорт | `eval/cases.jsonl` не меньше 50 строк | `wc -l` |
+| 2. Метрики | `TestEvalMetrics` зелёный | `make -C src test-fast` |
+| 3. Прогон | `base.json` с тремя прогонами | `make eval EVAL_OUT=base` |
+| 4. Сборка | тег в `vet` и `build-tags` линтера (Р-16), цель `eval`, строка в `docs/architecture.md` про набор и прогон | `make -C src ci-check` |
+
+## 7. Критерий приёмки
+
+- Команда: `make -C src ci-check && withkey galera/intake -- make -C src eval EVAL_OUT=base`.
+- Тестовый сценарий: вывод печатает M1-M4 трёх прогонов, среднее и по типам,
+  `eval/results/base.json` есть, `failed` не больше 10%; `git status` не видит `eval/`.
+- Не автоматизируется: ничего.
+- Не проверяем: прод, качество саммари (гейт B функции), лимиты OpenRouter заранее - их
+  покажет прогон.
+
+## 8. Обязательный хвост среза
+
+| Шаг | Что именно | Отметка |
+|---|---|---|
+| Триаж тикета | #32 сверена со спекой функции, в работе | in-progress |
+| Регрессор | не применимо: рабочий путь не меняется | - |
+| Ревью и PR | `code-reviewer` по диффу, коммит в `feature/ticket-form` | |
+| Полный прогон | `make -C src ci-check` | |
+| Журнал | `docs/state.md` одним заходом в конце | |
+| Деплой | нет: инструмент локальный | - |
