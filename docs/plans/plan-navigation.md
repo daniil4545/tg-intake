@@ -12,7 +12,7 @@ Architecture review: pass with fixes, находки M1, M2, S1-S4, S6 закр�
 - Результат: команды §7 зелёные; домашний экран - одно сообщение.
 - Делаем: общий путь правки (правило 2, длина), домашний экран, переходы с панелью, отмену
   тикета через `screen_msg`, `staleButton` на всех отказах устаревшей кнопки, канон.
-- Не делаем: «Отправить как есть» (5); тексты, кроме toast из §11 (7).
+- Не делаем: «Отправить как есть» (5); тексты кроме toast §11 (7).
 
 ## 2. Архитектура
 
@@ -20,15 +20,15 @@ Architecture review: pass with fixes, находки M1, M2, S1-S4, S6 закр�
 
 | Место | Изменение |
 |---|---|
-| `Bot`, `killScreen`, `setKill`, `getKill`, `dropKill`, литерал в `NewBot`; `kills:` в `screenBot` (`screen_harness_test.go`) | удаляются (Р-8) |
-| `NewBot`: замыкание `tele.OnCallback` | `staleButton` |
+| `Bot.kills`, `killScreen`, `setKill`/`getKill`/`dropKill` | удаляются (Р-8) |
+| `NewBot`: регистрация хендлеров | вынесена в `routes(tb)`; фолбэк `tele.OnCallback` - `staleButton` |
 | `Notify`: ветка `keysCancel` | `b.finishKill(ctx, cs, p.Text)` |
-| `finishKill` | экран из `cs.Screen`, «К списку» на первую страницу |
-| `tickets.go`: `Tickets.Cancel` | параметр `msgID`, пишет `screen_msg` в своей транзакции |
-| `onKill` | `setKill` уходит, `msg.ID` идёт в `Cancel` |
+| `finishKill` | экран из `cs.Screen`; отказ правки - `SetScreen` на новое (M2, как `onFix`) |
+| `tickets.go`: `Tickets.Cancel` | параметр `msgID`, пишет `screen_msg` своей транзакцией |
+| `onKill` | `setKill` уходит, `msg.ID` - в `Cancel` |
 | `screen` | обёртка над `editScreen`, сигнатура прежняя |
 | `stripScreen` | тело - вызов `stripButtons`, сигнатура и лог прежние |
-| `liveScreen`; `onSkip` и ветка `ErrRoundAnswered` в `onAllTrue` (срез 5) | toast и снятие заменяются вызовом `staleButton` |
+| `liveScreen`; `onSkip` и ветка `ErrRoundAnswered` в `onAllTrue` (срез 5) | toast и снятие - `staleButton` |
 | `onAllTrue`, `onResetYes`, `onCard`, `onKill`, `cardTarget` | порядок: разбор, отказ - `staleButton`, затем toast действия |
 | `onFix` | запасной путь правки записывает экран |
 | `showTickets`, `onCard` | ветка «длиннее `maxMessage` - `sendLong`» уходит в `editScreen` |
@@ -88,14 +88,15 @@ func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userI
 - `stripButtons`: `EditReplyMarkup(msg, nil)`; «not modified» - nil.
 - `staleButton`: `toast("Этот экран устарел")`; `c.Message() != nil` - `stripButtons`, отказ -
   `Warn screen_strip_failed`; возвращает nil. Единственный ответ на callback в этом нажатии.
-- `onAllTrue`: `Active` (ошибка - `toast("")`, возврат); `cs == nil` - как было;
-  `liveScreen`; `Atoi` - ошибка `staleButton`; `AcceptRound`: `ErrStaleRound`,
-  `ErrNotInterview`, `ErrRoundAnswered` - `staleButton`; `ErrNoSuggestion` - прежний ответ;
-  прочая ошибка - `toast("")`, возврат; успех - `toast("Принято")` и прежнее.
+- `onAllTrue`: `Active` - без toast, наверх, отвечает `OnError` (второй `Respond` Telegram
+  отклонил бы, автору не видно); `cs == nil` - `toast("")`, `screen`; `liveScreen`; `Atoi` -
+  ошибка `staleButton`; `AcceptRound`: `ErrStaleRound`, `ErrNotInterview`, `ErrRoundAnswered` -
+  `staleButton`; `ErrNoSuggestion` - прежний ответ; прочая ошибка - тем же путём; успех -
+  `toast("Принято")`, прежнее.
 - `onCard`, `onKill`: `parseCard(c.Data())` - не ok: `staleButton`, возврат; затем toast
   действия; `cardTarget` оставляет поиск проекта.
-- `onResetYes`: `Active` (ошибка - `toast("")`); `data != cs.ID` - `staleButton`, возврат;
-  затем toast «Сбрасываю».
+- `onResetYes`: `Active` - тем же путём; `cs == nil` - `toast("")`, `screen`; `data != cs.ID` -
+  `staleButton`, возврат; затем toast «Сбрасываю».
 - `sendPanel`: `c.Send(text, homeKeyboard())`. `homeScreen`: `homeText`, при непустом
   `intro` - `intro + "\n\n" + homeText`; `projectsMarkup`; один `c.Send`.
 - `Cancel`: в транзакции после проверки автора - `UPDATE cases SET screen_msg = $2`
@@ -107,7 +108,7 @@ func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userI
 `staleButton`, `screen`, `stripScreen`, `liveScreen`, `onSkip`, `onFix`, гвардии списка и
 карточки. 3. Порядок toast в `onAllTrue`, `onResetYes`, `onCard`, `onKill`, `parseCard`.
 4. `homeScreen`, `sendPanel`, переходы. 5. `Cancel`, `onKill`, `finishKill`, удаление `kills`.
-6. `contracts.md`, Telegram: правила 2, 4, устаревшая кнопка.
+6. `contracts.md`: правила 2, 4, staleButton.
 
 ## 7. Критерий приёмки
 
@@ -141,9 +142,9 @@ func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userI
    который отменяет черновик молча.
 3. `sendState` в сборе и «Готово» в режиме вопроса оставляют «Готово | Сброс»: смены нет.
 4. Остаточный риск S1: исход отмены может прийти раньше, чем `onKill` поправит карточку в
-   «Отменяю...», и правка его затрёт. Окно - одна правка Telegram против хода работы с
-   GitHub; цена - «Отменяю...» вместо исхода, исход виден в карточке.
+   «Отменяю...», и правка его затрёт. Окно - одна правка Telegram против работы с GitHub;
+   цена - «Отменяю...» вместо исхода, исход виден в карточке.
 5. Две карточки одного тикета, отмена с обеих: исход на нажатую последней, работа одна.
-6. Исход отмены - на первую страницу списка (Р-8); экран «Отменяю...» хранит страницу нажатия.
+6. Исход отмены - на первую страницу списка (Р-8); «Отменяю...» хранит страницу нажатия.
 7. Устаревшая кнопка отвечает только toast: toast действия ставится после разбора, иначе
    второй ответ на callback Telegram отклоняет.

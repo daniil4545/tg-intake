@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,11 @@ type fakeTelegram struct {
 	// fail проверяется после записи вызова в calls: тест видит вызов, даже
 	// если Bot API его отклонил. nil - вызов проходит успешно.
 	fail func(tgCall) *tele.Error
+	// answered - callback_query_id, на которые уже был ответ: настоящий
+	// Telegram второй answerCallbackQuery на тот же id отклоняет (ErrQueryTooOld),
+	// и тесты кнопок опираются именно на этот факт - "ровно один ответ на
+	// нажатие", а не только на счёт вызовов.
+	answered map[string]bool
 }
 
 func newFakeTelegram(t *testing.T) (*fakeTelegram, *tele.Bot) {
@@ -49,11 +55,43 @@ func newFakeTelegram(t *testing.T) (*fakeTelegram, *tele.Bot) {
 	server := httptest.NewServer(http.HandlerFunc(ft.handle))
 	t.Cleanup(server.Close)
 
-	tb, err := tele.NewBot(tele.Settings{Token: "test", URL: server.URL, Offline: true})
+	// Synchronous нужен маршрутам (routes + tb.ProcessUpdate, TestUnknownButtonStale):
+	// без него хендлер идёт в горутине, и ProcessUpdate возвращает раньше, чем
+	// он отработал. Прямые вызовы хендлеров (b.onCard и подобные) поле не видят.
+	tb, err := tele.NewBot(tele.Settings{Token: "test", URL: server.URL, Offline: true, Synchronous: true})
 	if err != nil {
 		t.Fatalf("new bot: %v", err)
 	}
+	// Правило 3 §2.1 централизованно: настоящий Telegram второй
+	// answerCallbackQuery на тот же callback_query_id отклоняет, и каждое
+	// нажатие обязано получить ровно один ответ. Проверка тут, а не в каждом
+	// тесте отдельно - иначе хендлер с двойным ответом ловит только тот тест,
+	// что сам считает answerCallbackQuery.
+	t.Cleanup(func() { ft.assertSingleAnswers(t) })
 	return ft, tb
+}
+
+// assertSingleAnswers - на каждый callback_query_id за весь тест пришёлся не
+// больше одного answerCallbackQuery.
+func (f *fakeTelegram) assertSingleAnswers(t *testing.T) {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	counts := map[string]int{}
+	for _, c := range f.calls {
+		if c.method != "answerCallbackQuery" {
+			continue
+		}
+		qid, _ := c.body["callback_query_id"].(string)
+		counts[qid]++
+	}
+	for qid, n := range counts {
+		if n > 1 {
+			t.Errorf("двойной ответ на callback %q: %d раз", qid, n)
+		}
+	}
 }
 
 func (f *fakeTelegram) handle(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +103,19 @@ func (f *fakeTelegram) handle(w http.ResponseWriter, r *http.Request) {
 	call := tgCall{method: method, body: body}
 	f.calls = append(f.calls, call)
 	var fail *tele.Error
-	if f.fail != nil {
+	if method == "answerCallbackQuery" {
+		if qid, _ := body["callback_query_id"].(string); qid != "" {
+			if f.answered == nil {
+				f.answered = map[string]bool{}
+			}
+			if f.answered[qid] {
+				fail = tele.ErrQueryTooOld
+			} else {
+				f.answered[qid] = true
+			}
+		}
+	}
+	if fail == nil && f.fail != nil {
 		fail = f.fail(call)
 	}
 	id := f.nextID
@@ -155,9 +205,11 @@ func (f *fakeTelegram) indexOf(method string) int {
 // поллера, ни регистрация хендлеров, только сам объект с рабочими полями.
 // tally и rounds сюда не входят - экран живёт в БД, а не в памяти процесса
 // (раздел 1 плана среза), и «новый Bot» в сценариях 3b - это как раз такой
-// объект без прежней памяти: свежий screenBot на тех же pool/cases.
-func screenBot(tb *tele.Bot, pool *pgxpool.Pool, cases *Cases, log *slog.Logger) *Bot {
-	return &Bot{
+// объект без прежней памяти: свежий screenBot на тех же pool/cases. tickets -
+// опционален: только тестам карточки и отмены тикета (onCard, onKill) нужен
+// живой Tickets над той же базой; остальным он не нужен вовсе.
+func screenBot(tb *tele.Bot, pool *pgxpool.Pool, cases *Cases, log *slog.Logger, tickets ...*Tickets) *Bot {
+	b := &Bot{
 		bot:       tb,
 		pool:      pool,
 		cases:     cases,
@@ -165,8 +217,11 @@ func screenBot(tb *tele.Bot, pool *pgxpool.Pool, cases *Cases, log *slog.Logger)
 		menuAt:    map[int64]time.Time{},
 		awaitLink: map[int64]time.Time{},
 		waited:    map[int64]string{},
-		kills:     map[string]killScreen{},
 	}
+	if len(tickets) > 0 {
+		b.tickets = tickets[0]
+	}
+	return b
 }
 
 // screenLog - логгер, пишущий в буфер: тесты снятия экрана проверяют факт
@@ -176,12 +231,18 @@ func screenLog() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
 }
 
+// callbackSeq нумерует callback_query_id нажатий: у каждого свой, как у
+// настоящего Telegram - иначе фейк принял бы два разных нажатия в одном
+// тесте за повторный ответ на одно и то же.
+var callbackSeq int64
+
 // callbackCtx - контекст нажатия инлайн-кнопки: сообщение с этим msgID несёт
 // кнопку, data - её callback_data (номер раунда, id обращения и т.п.).
 func callbackCtx(tb *tele.Bot, userID int64, msgID int, data string) tele.Context {
+	id := strconv.FormatInt(atomic.AddInt64(&callbackSeq, 1), 10)
 	return tele.NewContext(tb, tele.Update{
 		Callback: &tele.Callback{
-			ID:     "cb1",
+			ID:     id,
 			Sender: &tele.User{ID: userID},
 			Data:   data,
 			Message: &tele.Message{
