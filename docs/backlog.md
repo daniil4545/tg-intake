@@ -9,16 +9,15 @@
 - [x] **M0-M4** каркас, приём сырья, интервью, публикация, просмотр тикетов, проекты: релиз 0.1.0, принят 2026-08-09, состав - в [CHANGELOG](../CHANGELOG.md).
 - [x] **M7** Вопросы по проекту, режим «Спросить»: [plans/plan-ask.md](plans/plan-ask.md), [acceptance/ask.md](acceptance/ask.md), ждёт живого прогона.
 - [x] **M8** Уведомления о статусе: релизы 0.1.11 и 0.1.12, [plans/plan-ticket-news.md](plans/plan-ticket-news.md), [acceptance/ticket-news.md](acceptance/ticket-news.md).
-- [ ] Брифинг нового проекта - galera-tasks#30
 - [ ] Ответ автора комментарием в тикет - galera-tasks#31
-- [ ] daniil4545/tg-intake#32, переносится в galera-tasks по galera-tasks#2
+- [ ] Тикеты в galera-tasks, остаток сверки дублей из tg-intake#32 - galera-tasks#2
 
 Сроки плавающие по решению владельца 2026-08-08: за датами нет внешнего события.
 
 ## Активные задачи
 
 - [x] Закрытые пачки: очередь (0.1.7, срез queue-hardening), мелочи UX (0.1.8), раунд без предположений (0.1.9); состав - в [CHANGELOG](../CHANGELOG.md).
-- [ ] Качество интервью - galera-tasks#32
+- [ ] Тикет без лишних кругов, достаточный для расследования бага - galera-tasks#32
 - [ ] Уборка документации - galera-tasks#17
 
 Границы продукта - раздел «Сервис не делает» в [prd.md](prd.md); схема контуров
