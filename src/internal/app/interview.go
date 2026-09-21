@@ -122,10 +122,6 @@ type summaryOut struct {
 	Sections []Section `json:"sections"`
 }
 
-// reservedHeadings - разделы тела, которые пишет Go: второй такой же заголовок
-// от модели сделал бы тело тикета неоднозначным.
-var reservedHeadings = []string{"Кратко", "Ссылки", "Пересечения"}
-
 // turnSchema строится из правил: список типов обращения задаётся ими же, и
 // захардкоженный enum разошёлся бы с контрактом при первой правке.
 func turnSchema(rules Contract) json.RawMessage {
@@ -822,34 +818,6 @@ func checkHeading(heading string) error {
 	return nil
 }
 
-// renderSections собирает тело саммари в markdown - тот же текст уходит и в
-// issue, и автору. Разделы идут в порядке модели под её заголовками: форма
-// тикета следует материалу. Закрытый пункт ядра, который модель не покрыла
-// разделом, дописывается из собранного интервью, а нет ни разделов, ни ядра -
-// тело собирается из протокола сырья: ни одна идея не выбрасывается, и держит
-// это Go, а не промт. Раздел по незакрытому пункту остаётся: это слова автора,
-// а строка «Не уточнено» всё равно называет пункт пробелом.
-func (i *Interview) renderSections(cs *Case, sections []Section) string {
-	var b strings.Builder
-	covered := make(map[string]bool, len(sections))
-	for _, s := range sections {
-		covered[s.Key] = true
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", scrubContacts(strings.TrimSpace(s.Heading)),
-			scrubContacts(strings.TrimSpace(s.Text)))
-	}
-	for _, item := range i.rules.Items(cs.Kind) {
-		text := strings.TrimSpace(cs.Filled[item.Key])
-		if covered[item.Key] || text == "" {
-			continue
-		}
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", item.Title, scrubContacts(text))
-	}
-	if b.Len() == 0 && strings.TrimSpace(cs.Protocol) != "" {
-		fmt.Fprintf(&b, "## Материал обращения\n\n%s", scrubContacts(strings.TrimSpace(cs.Protocol)))
-	}
-	return strings.TrimSpace(b.String())
-}
-
 // dialog собирает сообщения запроса. Порядок обязателен: стабильный префикс
 // первым сообщением, протокол сырья вторым, история раундов последней. Любая
 // изменяющаяся строка перед промтом молча гасит кэш провайдера.
@@ -859,98 +827,13 @@ func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Mess
 		return nil, Project{}, err
 	}
 
-	messages := []Message{
-		{Role: "system", Parts: []Part{TextPart(prefix + "\n\n## Проект\n\n" + project.Context)}},
-		{Role: "user", Parts: []Part{TextPart("Протокол сырья:\n\n" + cs.Protocol)}},
-	}
+	messages := dialogMessages(prefix, project.Context, cs.Protocol)
 
 	history, err := i.cases.history(ctx, cs.ID)
 	if err != nil {
 		return nil, Project{}, err
 	}
 	return append(messages, history...), project, nil
-}
-
-// history восстанавливает разговор из журнала. Отдельной таблицы у него нет:
-// диалог по природе append-only, а case_events уже пишется в тех же
-// транзакциях, что и смена статуса. Показанное саммари - такая же реплика бота,
-// как вопрос раунда: автор правит именно его. Ответ по документации идёт сюда
-// же - разговор, пришедший из режима вопроса, уже установил факты, и
-// переспрашивать их интервью не должно. Вопроса автора здесь нет: его слова
-// целиком лежат в протоколе сырья, который подаётся отдельным сообщением.
-func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
-	rows, err := c.pool.Query(ctx, `
-		SELECT kind, payload FROM case_events
-		WHERE case_id = $1
-		  AND kind IN ('round_asked', 'answer_given', 'summary_ready', 'answer_ready')
-		ORDER BY id`, caseID)
-	if err != nil {
-		return nil, fmt.Errorf("query history of case %s: %w", caseID, err)
-	}
-	defer rows.Close()
-
-	var messages []Message
-	for rows.Next() {
-		var kind string
-		var payload []byte
-		if err := rows.Scan(&kind, &payload); err != nil {
-			return nil, fmt.Errorf("scan history event: %w", err)
-		}
-
-		switch kind {
-		case "round_asked":
-			var p struct {
-				Questions []Question `json:"questions"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode asked round: %w", err)
-			}
-			messages = append(messages, Message{
-				Role:  "assistant",
-				Parts: []Part{TextPart(questionList(p.Questions))},
-			})
-		case "answer_given", "answer_ready":
-			var p struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", kind, err)
-			}
-			if p.Text == "" {
-				continue
-			}
-			role := "user"
-			if kind == "answer_ready" {
-				role = "assistant"
-			}
-			messages = append(messages, Message{Role: role, Parts: []Part{TextPart(p.Text)}})
-		case "summary_ready":
-			var p struct {
-				Title   string `json:"title"`
-				Body    string `json:"body"`
-				Overlap string `json:"overlap"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode shown summary: %w", err)
-			}
-			// Обращение начато до выката: снимка в событии нет, и подставить
-			// вместо него нечего.
-			if p.Body == "" {
-				continue
-			}
-			shown := p.Title + "\n\n" + p.Body
-			// Пересечения показаны автору той же репликой, и следующий его ответ
-			// часто отвечает именно им: без них ход переспросит мимо.
-			if p.Overlap != "" {
-				shown += "\n\nПохоже, часть этого уже есть:\n\n" + p.Overlap
-			}
-			messages = append(messages, Message{
-				Role:  "assistant",
-				Parts: []Part{TextPart(shown)},
-			})
-		}
-	}
-	return messages, rows.Err()
 }
 
 // AddAnswer принимает ответ автора: текстом, расшифровкой голосового или
@@ -1069,14 +952,6 @@ func isStub(text string) bool {
 	}
 	return slices.ContainsFunc(stubPhrases, func(p string) bool { return strings.Contains(text, p) })
 }
-
-var (
-	stubTails = []string{"не указано", "не указан", "не указана", "не указаны", "неизвестно",
-		"не известно", "не разобрано", "неясно", "не ясно", "не сообщил", "не сообщила"}
-	stubPhrases = []string{"нет данных", "данных нет", "нет информации", "информации нет",
-		"информация отсутствует", "данные отсутствуют", "не удалось определить",
-		"уточнить не удалось", "не сообщается"}
-)
 
 // roundAnswered - последним событием разговора идёт ответ или пропуск, а не
 // вопрос. Значит текущий раунд закрыт и подтверждать в нём нечего.
@@ -1352,54 +1227,9 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 	}
 	if cs.Status == statusInterview || cs.Status == statusSummary {
 		return putNotifyKey(ctx, c.pool, caseID, fmt.Sprintf("voicefail-%d", itemID),
-			"Не разобрал голосовое. Повторите, пожалуйста, текстом или запишите ещё раз.", "")
+			msgVoiceUnrecognized, "")
 	}
 	return c.AdvanceNormalize(ctx, caseID)
-}
-
-func roundMessage(questions []Question) string {
-	tail := "\n\nОтветьте своими словами - текстом или голосовым."
-	if hasSuggestion(questions) {
-		tail += " Если предположения верны, нажмите «Всё так»."
-	}
-	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) + tail
-}
-
-func questionList(questions []Question) string {
-	var b strings.Builder
-	for n, q := range questions {
-		fmt.Fprintf(&b, "%d. %s\n", n+1, q.Text)
-		if suggested := strings.TrimSpace(q.Suggested); suggested != "" {
-			fmt.Fprintf(&b, "   Предполагаю: %s\n", suggested)
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func summaryMessage(title, brief, body, unclear, overlap string) string {
-	var b strings.Builder
-	b.WriteString("Вот что уйдёт в тикет.\n\n")
-	b.WriteString(title + "\n\n")
-	// Краткое содержание показывается вместе с разделами: оно уедет в тикет, а
-	// подтверждает автор именно то, что уйдёт.
-	if brief != "" {
-		b.WriteString(brief + "\n\n")
-	}
-	b.WriteString(plainText(body))
-	// Строка есть ровно тогда, когда тикет уйдёт с меткой неполноты: обе
-	// считаются по незакрытому ядру.
-	if unclear != "" {
-		b.WriteString("\n\n" + unclear + " Тикет уйдёт с пометкой о неполноте.")
-	}
-	// Пересечения идут перед вопросом о правке: это то, чего автор не знал, и
-	// решать ему сразу после - публиковать или бросить обращение.
-	if overlap != "" {
-		b.WriteString("\n\nПохоже, часть этого уже есть:\n\n" + plainText(overlap))
-		b.WriteString("\n\nЕсли это оно - нажмите «Сброс», тикет не понадобится. " +
-			"Если нет - напишите, чего не хватает.")
-	}
-	b.WriteString("\n\nГде я ошибся? Напишите правку - или публикуем.")
-	return b.String()
 }
 
 // briefOf - краткое содержание: своё от модели или начало первого раздела
@@ -1503,16 +1333,6 @@ var (
 	phoneRe = regexp.MustCompile(`(?:\+\d{1,3}[\s(-]?)?\d{3}[\s)-]\d{3}[\s-]\d{2}[\s-]\d{2}|\b[78]\d{10}\b`)
 	cardRe  = regexp.MustCompile(`\b\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{4}\b`)
 )
-
-func scrubContacts(text string) string {
-	text = emailRe.ReplaceAllString(text, "[почта]")
-	text = cardRe.ReplaceAllString(text, "[карта]")
-	return phoneRe.ReplaceAllString(text, "[телефон]")
-}
-
-// titleStopWords - служебные слова, с которых заголовок начинать нельзя: тип
-// тикета виден по метке, а в списке видно только заголовок.
-var titleStopWords = []string{"проблема", "баг", "ошибка", "просьба", "вопрос", "запрос"}
 
 func kindList(rules Contract) []string {
 	kinds := make([]string, 0, len(rules))

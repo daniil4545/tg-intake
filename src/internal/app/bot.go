@@ -48,9 +48,6 @@ const (
 	waitNotice = time.Minute
 	// Сколько живёт обещание «пришлю ссылку» после «Добавить проект».
 	linkWait = 10 * time.Minute
-	// Начальный экран: один текст и для первого показа, и для возврата, иначе
-	// правка сообщения даёт другой заголовок на том же месте.
-	homeText = "Выберите проект или добавьте новый:"
 	// Сколько getUpdates держит соединение, пауза после отказа опроса и шаг
 	// записи отметки живости.
 	pollTimeout = 10 * time.Second
@@ -87,9 +84,9 @@ var (
 	backBtn     = &tele.Btn{Unique: "back"}
 	resetYesBtn = &tele.Btn{Unique: "reset_yes"}
 	resetNoBtn  = &tele.Btn{Unique: "reset_no"}
-	doneBtn     = &tele.Btn{Text: "Готово"}
-	menuBtn     = &tele.Btn{Text: "Меню"}
-	resetBtn    = &tele.Btn{Text: "Сброс"}
+	doneBtn     = &tele.Btn{Text: buttonDone}
+	menuBtn     = &tele.Btn{Text: buttonMenu}
+	resetBtn    = &tele.Btn{Text: buttonReset}
 )
 
 type Bot struct {
@@ -147,7 +144,7 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 				if c.Callback() != nil {
 					_ = c.Respond()
 				}
-				_ = c.Send("Действие не прошло: внутренняя ошибка. Попробуйте ещё раз, детали уже в логе.")
+				_ = c.Send(msgHandlerFailed)
 			}
 		},
 	}, log)
@@ -160,10 +157,10 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 
 	// Меню «/» в клиенте. Отказ не роняет старт: бот работает и без него.
 	if err := tb.SetCommands([]tele.Command{
-		{Text: "start", Description: "Меню"},
-		{Text: "tickets", Description: "Мои тикеты"},
-		{Text: "project", Description: "Добавить проект"},
-		{Text: "cancel", Description: "Сброс"},
+		{Text: "start", Description: commandMenu},
+		{Text: "tickets", Description: commandTickets},
+		{Text: "project", Description: commandAddProject},
+		{Text: "cancel", Description: commandReset},
 	}); err != nil {
 		log.Warn("set_commands_failed", "error", err)
 	}
@@ -226,8 +223,7 @@ func (b *Bot) routes(tb *tele.Bot) {
 	// переписывается, поэтому учесть её нечем. Без хендлера апдейт не доходит
 	// никуда, и автор считает, что бот прочитал исправленное.
 	tb.Handle(tele.OnEdited, func(c tele.Context) error {
-		return c.Send("Правку прежнего сообщения я не вижу. Пришлите исправленное " +
-			"отдельным сообщением - оно добавится к обращению.")
+		return c.Send(msgEditNotSeen)
 	})
 
 	tb.Handle(tele.OnText, b.onItem)
@@ -512,7 +508,7 @@ func (b *Bot) sendNews(ctx context.Context, cs *Case, text string) error {
 		return err
 	}
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data(fmt.Sprintf("Открыть тикет #%d", cs.IssueNumber),
+	markup.Inline(markup.Row(markup.Data(buttonOpenTicket(cs.IssueNumber),
 		cardBtn.Unique, cardData(project.Slug, cs.IssueNumber))))
 	_, err = b.sendLong(&tele.User{ID: cs.UserID}, text, markup)
 	return err
@@ -662,7 +658,7 @@ func (b *Bot) liveScreen(c tele.Context, cs *Case) bool {
 // Telegram отклоняет, поэтому вызывающий не должен отвечать на него ни до,
 // ни после - это всегда последний шаг обработчика.
 func (b *Bot) staleButton(c tele.Context) error {
-	b.toast(c, "Этот экран устарел")
+	b.toast(c, toastStale)
 	if msg := c.Message(); msg != nil {
 		if err := b.stripButtons(msg); err != nil {
 			b.log.Warn("screen_strip_failed", "user_id", senderID(c), "error", err)
@@ -684,11 +680,11 @@ func (b *Bot) allow(next tele.HandlerFunc) tele.HandlerFunc {
 			// обязателен: без него этот отказ - единственный, которого не видно
 			// в контуре, и разбор жалобы «бот меня не пустил» упирается в пустоту.
 			b.log.Warn("access_denied", "user_id", sender.ID, "reason", "not_private")
-			return refuse(c, "Бот работает только в личной переписке.")
+			return refuse(c, msgPrivateOnly)
 		}
 		if !slices.Contains(b.allowed, sender.ID) {
 			b.log.Warn("access_denied", "user_id", sender.ID)
-			return refuse(c, "Доступ к боту закрыт. Напишите владельцу сервиса.")
+			return refuse(c, msgAccessDenied)
 		}
 		// Ожидание ссылки после «Добавить проект» разбирается до маршрутизации.
 		// Команда, кнопка и слово панели его снимают: скрытый режим не должен
@@ -819,7 +815,7 @@ func (b *Bot) onStart(c tele.Context) error {
 	}
 
 	b.log.Info("start", "user_id", senderID(c))
-	return b.homeScreen(ctx, c, "Я завожу тикеты по обращениям сотрудников.")
+	return b.homeScreen(ctx, c, msgBotIntro)
 }
 
 // homeScreen - домашняя навигация: список проектов, одним сообщением (правило
@@ -840,7 +836,7 @@ func (b *Bot) homeScreen(ctx context.Context, c tele.Context, intro string) erro
 // onHome - «К проектам» с любого экрана. Возврат правкой того же сообщения:
 // экран без пути назад автор читает как тупик и идёт искать команду.
 func (b *Bot) onHome(c tele.Context) error {
-	b.toast(c, "Открываю проекты")
+	b.toast(c, toastOpeningProjects)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -862,7 +858,7 @@ func (b *Bot) projectsMarkup(ctx context.Context) (*tele.ReplyMarkup, error) {
 	for _, p := range projects {
 		rows = append(rows, markup.Row(markup.Data(p.Title, projectBtn.Unique, p.Slug)))
 	}
-	rows = append(rows, markup.Row(markup.Data("Добавить проект", addProjectBtn.Unique)))
+	rows = append(rows, markup.Row(markup.Data(buttonAddProject, addProjectBtn.Unique)))
 	markup.Inline(rows...)
 	return markup, nil
 }
@@ -871,13 +867,13 @@ func (b *Bot) projectsMarkup(ctx context.Context) (*tele.ReplyMarkup, error) {
 // проекта. Дальше вглубь возврат уже есть у карточки тикета.
 func backHome() *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("К проектам", homeBtn.Unique)))
+	markup.Inline(markup.Row(markup.Data(buttonToProjects, homeBtn.Unique)))
 	return markup
 }
 
 func backProject(slug string) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("Назад", backBtn.Unique, slug)))
+	markup.Inline(markup.Row(markup.Data(buttonProjectMenu, backBtn.Unique, slug)))
 	return markup
 }
 
@@ -886,10 +882,10 @@ func backProject(slug string) *tele.ReplyMarkup {
 func projectMenu(slug string) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
-		markup.Row(markup.Data("Создать тикет", createBtn.Unique, slug)),
-		markup.Row(markup.Data("Спросить", askBtn.Unique, slug)),
-		markup.Row(markup.Data("Посмотреть тикеты", ticketsBtn.Unique, slug)),
-		markup.Row(markup.Data("К проектам", homeBtn.Unique)),
+		markup.Row(markup.Data(buttonCreateTicket, createBtn.Unique, slug)),
+		markup.Row(markup.Data(buttonAsk, askBtn.Unique, slug)),
+		markup.Row(markup.Data(buttonViewTickets, ticketsBtn.Unique, slug)),
+		markup.Row(markup.Data(buttonToProjects, homeBtn.Unique)),
 	)
 	return markup
 }
@@ -897,7 +893,7 @@ func projectMenu(slug string) *tele.ReplyMarkup {
 // onProjectMenu - «Назад» со списка тикетов. Проект активного обращения не
 // трогает: возврат по экранам не должен переставлять цель сбора.
 func (b *Bot) onProjectMenu(c tele.Context) error {
-	b.toast(c, "Открываю проект")
+	b.toast(c, toastOpeningProject)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -907,9 +903,9 @@ func (b *Bot) onProjectMenu(c tele.Context) error {
 		return err
 	}
 	if !ok {
-		return b.screen(c, "Проект недоступен: его выключили.", backHome())
+		return b.screen(c, msgProjectDisabled, backHome())
 	}
-	return b.screen(c, "Проект «"+project.Title+"». Что делаем?", projectMenu(project.Slug))
+	return b.screen(c, msgProjectOpened(project.Title), projectMenu(project.Slug))
 }
 
 // askProject показывает меню проектов. Вопрос задаётся ровно один раз за
@@ -929,8 +925,8 @@ func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, bt
 	if len(projects) == 0 {
 		b.log.Warn("no_projects", "user_id", senderID(c))
 		markup := &tele.ReplyMarkup{}
-		markup.Inline(markup.Row(markup.Data("Добавить проект", addProjectBtn.Unique)))
-		return c.Send("Проекты ещё не заведены. Добавьте первый:", markup)
+		markup.Inline(markup.Row(markup.Data(buttonAddProject, addProjectBtn.Unique)))
+		return c.Send(msgNoProjectsYet, markup)
 	}
 
 	markup := &tele.ReplyMarkup{}
@@ -947,7 +943,7 @@ func (b *Bot) askProjectFor(ctx context.Context, c tele.Context, text string, bt
 // состояние в БД, а не то, какой экран автор видел последним.
 func (b *Bot) onProject(c tele.Context) error {
 	// Первым делом: иначе у автора висит спиннер на кнопке.
-	b.toast(c, "Открываю проект")
+	b.toast(c, toastOpeningProject)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -961,7 +957,7 @@ func (b *Bot) onProject(c tele.Context) error {
 	index := slices.IndexFunc(projects, func(p Project) bool { return p.Slug == slug })
 	if index < 0 {
 		b.log.Warn("unknown_project", "user_id", senderID(c), "slug", slug)
-		return b.screen(c, "Проект недоступен: его выключили.", backHome())
+		return b.screen(c, msgProjectDisabled, backHome())
 	}
 	title := projects[index].Title
 
@@ -975,7 +971,7 @@ func (b *Bot) onProject(c tele.Context) error {
 		// Экран проектов превращается в экран проекта: то же сообщение, другие
 		// кнопки. Автор видит, что нажатие сработало, а список не остаётся
 		// висеть кликабельным выше по переписке.
-		return b.screen(c, "Проект «"+title+"». Что делаем?", projectMenu(slug))
+		return b.screen(c, msgProjectOpened(title), projectMenu(slug))
 	}
 
 	if err := b.cases.SetProject(ctx, cs, slug); err != nil {
@@ -983,15 +979,15 @@ func (b *Bot) onProject(c tele.Context) error {
 			return b.sendState(c, cs)
 		}
 		if errors.Is(err, ErrUnknownProject) {
-			return b.screen(c, "Проект недоступен: его выключили.", backHome())
+			return b.screen(c, msgProjectDisabled, backHome())
 		}
 		return err
 	}
-	if err := b.screen(c, "Проект «"+title+"» выбран.", nil); err != nil {
+	if err := b.screen(c, msgProjectChosen(title), nil); err != nil {
 		return err
 	}
 	// Панель сбора - reply-клавиатура, в правку сообщения она не помещается.
-	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
+	return c.Send(msgSendMaterial, collectKeyboard())
 }
 
 // onCreate - «Создать тикет», onAsk - «Спросить». Вход один и тот же сбор
@@ -1006,9 +1002,9 @@ func (b *Bot) onAsk(c tele.Context) error { return b.startCase(c, modeAsk) }
 // и молча подменять его нельзя - в нём уже лежит сырьё.
 func (b *Bot) startCase(c tele.Context, mode string) error {
 	if mode == modeAsk {
-		b.toast(c, "Слушаю вопрос")
+		b.toast(c, toastListening)
 	} else {
-		b.toast(c, "Собираю обращение")
+		b.toast(c, toastCollecting)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
@@ -1028,41 +1024,23 @@ func (b *Bot) startCase(c tele.Context, mode string) error {
 			return b.sendState(c, cs)
 		}
 		markup := &tele.ReplyMarkup{}
-		markup.Inline(markup.Row(markup.Data("Продолжить", continueBtn.Unique, slug)))
+		markup.Inline(markup.Row(markup.Data(buttonContinue, continueBtn.Unique, slug)))
 		return b.screen(c, continueText(cs.Mode, mode), markup)
 	}
 	if mode == modeAsk {
-		if err := b.screen(c, "Отвечаю по документации проекта.", nil); err != nil {
+		if err := b.screen(c, msgAnsweringDocs, nil); err != nil {
 			return err
 		}
-		return c.Send("Что хотите узнать? Напишите или наговорите вопрос и нажмите «Готово».",
-			collectKeyboard())
+		return c.Send(msgAskWhatToKnow, collectKeyboard())
 	}
-	if err := b.screen(c, "Собираю обращение.", nil); err != nil {
+	if err := b.screen(c, msgCollectingCase, nil); err != nil {
 		return err
 	}
-	return c.Send("Присылайте текст, голосовые и скриншоты. Когда закончите, нажмите «Готово».", collectKeyboard())
-}
-
-// continueText - экран продолжения при живом обращении. Режим называется вслух,
-// и выход назван по жанру, за которым автор пришёл: разговор по документации
-// висит в сборе до «Закончить разговор», и «Продолжить» продолжает именно его.
-func continueText(live, wanted string) string {
-	now := "У вас уже собирается обращение для тикета."
-	if live == modeAsk {
-		now = "У вас уже идёт разговор по документации."
-	}
-	switch {
-	case live == wanted:
-		return now + " Продолжайте его или нажмите «Сброс», чтобы начать заново."
-	case wanted == modeAsk:
-		return now + " Продолжайте его или нажмите «Сброс», чтобы вместо него спросить по документации."
-	}
-	return now + " Продолжайте его или нажмите «Сброс», чтобы вместо него завести тикет."
+	return c.Send(msgSendMaterialCollect, collectKeyboard())
 }
 
 func (b *Bot) onContinue(c tele.Context) error {
-	b.toast(c, "Продолжаем")
+	b.toast(c, toastContinuing)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -1072,7 +1050,7 @@ func (b *Bot) onContinue(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 	if cs.Status != statusCollecting {
 		return b.sendState(c, cs)
@@ -1088,8 +1066,7 @@ func (b *Bot) onContinue(c tele.Context) error {
 		case err != nil:
 			return err
 		case known != nil && known.Slug != slug:
-			return b.screen(c, "Это обращение уже собирается в проекте «"+known.Title+"». "+
-				"Продолжайте его или нажмите «Сброс», чтобы завести новое.", nil)
+			return b.screen(c, msgContinueOtherProject(known.Title), nil)
 		case known == nil:
 			if err := b.cases.SetProject(ctx, cs, slug); err != nil && !errors.Is(err, ErrUnknownProject) {
 				return err
@@ -1100,10 +1077,10 @@ func (b *Bot) onContinue(c tele.Context) error {
 	// счётчик материала прежнего захода больше не в счёт, следующий элемент
 	// заведёт свой.
 	b.closeScreen(ctx, cs)
-	if err := b.screen(c, "Продолжаем прежнее обращение.", nil); err != nil {
+	if err := b.screen(c, msgResumingCase, nil); err != nil {
 		return err
 	}
-	return c.Send("Присылайте материал и нажмите «Готово».", collectKeyboard())
+	return c.Send(msgSendMaterial, collectKeyboard())
 }
 
 // projectOf - проект обращения либо nil, если он ещё не выбран.
@@ -1139,8 +1116,7 @@ func (b *Bot) onItem(c tele.Context) error {
 			return nil
 		}
 		b.menuAt[senderID(c)] = time.Now()
-		return b.homeScreen(ctx, c, "Это сообщение я не сохраняю: сбор начинается кнопкой. "+
-			"Выберите проект, нажмите «Создать тикет» и пришлите материал ещё раз.")
+		return b.homeScreen(ctx, c, msgNotSaved)
 	}
 	switch cs.Status {
 	case statusInterview, statusSummary:
@@ -1173,7 +1149,7 @@ func (b *Bot) collect(ctx context.Context, c tele.Context, cs *Case) error {
 	// Вопрос задаётся и при неудачном приёме: строка элемента уже вставлена, и
 	// на следующем сообщении признак вопроса не сработает.
 	if askProject {
-		if askErr := b.askProject(ctx, c, "Принял. "+projectAsk(cs)); askErr != nil {
+		if askErr := b.askProject(ctx, c, msgAcceptedItem+projectAsk(cs)); askErr != nil {
 			return askErr
 		}
 	}
@@ -1194,7 +1170,7 @@ func (b *Bot) countItem(ctx context.Context, cs *Case) {
 		b.log.Warn("tally_count_failed", "case_id", cs.ID, "error", err)
 		return
 	}
-	text := fmt.Sprintf("Принято сообщений: %d. Закончите - нажмите «Готово».", count)
+	text := msgItemsAccepted(count)
 
 	if cs.Screen != 0 {
 		msg := tele.StoredMessage{MessageID: strconv.Itoa(cs.Screen), ChatID: cs.UserID}
@@ -1210,37 +1186,6 @@ func (b *Bot) countItem(ctx context.Context, cs *Case) {
 	}
 }
 
-// itemReply - что ответить автору на неудачный приём и надо ли тащить ошибку
-// наверх: известный отказ - не сбой хендлера.
-func itemReply(err error, maxItems int) (text string, internal bool) {
-	switch {
-	case err == nil, errors.Is(err, errLimitReported):
-		// Про исчерпанный лимит автору сказали один раз; повторять на каждое
-		// следующее сообщение бот не должен.
-		return "", false
-	case errors.Is(err, ErrUnsupportedItem):
-		return "Пришлите текстом, голосовым или скриншотом.", false
-	case errors.Is(err, ErrTooManyItems):
-		return fmt.Sprintf("В обращении уже %d сообщений. Нажмите «Готово».", maxItems), false
-	case errors.Is(err, ErrFileTooBig):
-		return "Файл тяжелее 20 МБ, Telegram не отдаёт его боту. Пришлите скриншот или фрагмент.", false
-	case errors.Is(err, ErrNotCollecting):
-		return "Сбор по этому обращению закрыт, разбираю материал.", false
-	}
-	// Скачивание не удалось либо отказала база: элемент уже помечен failed,
-	// обращение живо, и молчать нельзя - автор считает, что отправил.
-	return "Не получилось принять сообщение. Пришлите его иначе.", true
-}
-
-// projectAsk - зачем обращению проект. В режиме вопроса тикет не заводится, и
-// обещать его нельзя: проект нужен ради своей документации.
-func projectAsk(cs *Case) string {
-	if cs.Mode == modeAsk {
-		return "Выберите проект, по документации которого отвечать."
-	}
-	return "Выберите проект, в который заводим тикет."
-}
-
 // sendState объясняет автору, где стоит его обращение и чем оно двигается
 // дальше. Один ответ на все входы, где человек упирается в занятый слот:
 // активное обращение у автора одно, и без объяснения тупик читается как
@@ -1254,26 +1199,6 @@ func (b *Bot) sendState(c tele.Context, cs *Case) error {
 	return c.Send(stateReply(cs.Status))
 }
 
-func stateReply(status string) string {
-	switch status {
-	case statusCollecting:
-		return "Идёт сбор обращения. Присылайте материал и нажмите «Готово»."
-	case statusInterview:
-		return "У вас идёт разбор обращения. Ответьте на последний вопрос - текстом " +
-			"или голосовым. Если вопросов не видно, напишите, что хотели добавить, " +
-			"и я спрошу заново."
-	case statusSummary:
-		return "Обращение ждёт вашего решения по саммари: «Публикую» или «Поправить» " +
-			"под последним сообщением."
-	case statusAnswering:
-		return "Смотрю документацию проекта. Отвечу, как найду."
-	case statusPublishing:
-		return "Публикую тикет. Пришлю номер и ссылку, как только он заведётся."
-	default:
-		return "Разбираю обращение, минуту. Отвечу, как закончу."
-	}
-}
-
 // onAnswer - ответ автора в разговоре. Голосовое уходит на расшифровку работой,
 // текст записывается сразу: синхронный вызов модели остановил бы бота для всех
 // авторов, апдейты обрабатываются последовательно.
@@ -1283,19 +1208,19 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 	case msg.Voice != nil:
 		if err := b.cases.AddVoiceAnswer(ctx, b.bot, cs, msg); err != nil {
 			if errors.Is(err, ErrFileTooBig) {
-				return c.Send("Запись тяжелее 20 МБ, Telegram не отдаёт её боту. Ответьте текстом или короче.")
+				return c.Send(msgVoiceTooBig)
 			}
-			if sendErr := c.Send("Не получилось принять запись. Ответьте, пожалуйста, ещё раз."); sendErr != nil {
+			if sendErr := c.Send(msgVoiceFailed); sendErr != nil {
 				return sendErr
 			}
 			return err
 		}
 		b.waitFor(cs)
-		return c.Send("Расшифровываю ответ.")
+		return c.Send(msgTranscribing)
 	case strings.TrimSpace(msg.Text) != "":
 		if err := b.cases.AddAnswer(ctx, cs, msg.Text); err != nil {
 			if errors.Is(err, ErrNotInterview) {
-				return c.Send("Обращение уже ушло дальше. Нажмите «Меню» и заведите новое.")
+				return c.Send(msgCaseMovedOn)
 			}
 			return err
 		}
@@ -1304,12 +1229,12 @@ func (b *Bot) onAnswer(ctx context.Context, c tele.Context, cs *Case) error {
 		// кнопка «Всё так» снимается (ответ уже дан), и видно, что ответ принят.
 		// Экран не тот (потерян рестартом, чужой раунд, отказ Telegram) -
 		// отвечаем словами, молчания быть не должно.
-		if !b.markRound(ctx, cs, "Ответ принят. Думаю дальше.") {
-			return c.Send("Ответ принят. Думаю дальше.")
+		if !b.markRound(ctx, cs, msgAnswerAccepted) {
+			return c.Send(msgAnswerAccepted)
 		}
 		return nil
 	}
-	return c.Send("Ответьте текстом или голосовым. Скриншоты принимаются только до кнопки «Готово».")
+	return c.Send(msgAnswerNeedText)
 }
 
 // markRound переписывает экран раунда пометкой по числу ответов вместо нового
@@ -1334,7 +1259,7 @@ func (b *Bot) markRound(ctx context.Context, cs *Case, first string) bool {
 
 	note := first
 	if answers > 1 {
-		note = fmt.Sprintf("Принято ответов: %d. Думаю дальше.", answers)
+		note = msgAnswersAccepted(answers)
 	}
 	text := roundMessage(questions) + "\n\n---\n" + note
 	if utf8.RuneCountInString(text) > maxMessage {
@@ -1377,8 +1302,7 @@ func (b *Bot) waitFor(cs *Case) {
 		}
 		// Срок называется с запасом: обещание «минуту» на восьмиминутном ходе
 		// автор читает как поломку, и следом приходит жалоба на зависший бот.
-		if _, err := b.bot.Send(&tele.User{ID: user},
-			"Всё ещё разбираю. Иногда это занимает до 5-10 минут - отвечу, как закончу."); err != nil {
+		if _, err := b.bot.Send(&tele.User{ID: user}, msgStillWorking); err != nil {
 			b.log.Warn("wait_notice_failed", "case_id", caseID, "error", err)
 		}
 		b.log.Info("wait_notice", "case_id", caseID, "round", round)
@@ -1415,7 +1339,7 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 	}
 	if cs == nil {
 		b.toast(c, "")
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 	if !b.liveScreen(c, cs) {
 		return nil
@@ -1437,23 +1361,23 @@ func (b *Bot) onAllTrue(c tele.Context) error {
 		b.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", acceptErr.Error())
 		return b.staleButton(c)
 	case errors.Is(acceptErr, ErrNoSuggestion):
-		b.toast(c, "Принято")
-		return c.Send("Догадок у меня нет, подтверждать нечего. Ответьте, пожалуйста, текстом или голосовым.")
+		b.toast(c, toastAccepted)
+		return c.Send(msgNoSuggestion)
 	case acceptErr != nil:
 		return acceptErr
 	}
 
-	b.toast(c, "Принято")
+	b.toast(c, toastAccepted)
 	b.waitFor(cs)
 	// Экран раунда правится тем же способом, что и типизированный ответ (S4):
 	// счёт ответов один и честный, кто бы ни нажимал. Правка не вышла - ответ
 	// уходит новым сообщением, а нажатая кнопка снимается: AcceptRound уже
 	// принял ответ, второе нажатие той же кнопки его не изменит.
-	if !b.markRound(ctx, cs, "Принято: всё так. Думаю дальше.") {
+	if !b.markRound(ctx, cs, msgAllTrueAccepted) {
 		if msg := c.Message(); msg != nil {
 			b.stripScreen(cs, msg.ID)
 		}
-		return c.Send("Принято: всё так. Думаю дальше.")
+		return c.Send(msgAllTrueAccepted)
 	}
 	return nil
 }
@@ -1473,7 +1397,7 @@ func (b *Bot) onSkip(c tele.Context) error {
 	}
 	if cs == nil {
 		b.toast(c, "")
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 
 	round, err := strconv.Atoi(c.Data())
@@ -1494,29 +1418,19 @@ func (b *Bot) onSkip(c tele.Context) error {
 		return err
 	}
 
-	b.toast(c, "Принято")
-	if err := b.screen(c, markAnswered(c, "Отправляю как есть. Собираю саммари."), nil); err != nil {
+	b.toast(c, toastAccepted)
+	if err := b.screen(c, markAnswered(c, msgSkippedSummary), nil); err != nil {
 		return err
 	}
 	b.waitFor(cs)
 	return nil
 }
 
-// markAnswered дописывает исход к сообщению раунда: вопросы остаются читаемыми
-// в истории, а под ними видно, что ответ принят и бот работает дальше.
-func markAnswered(c tele.Context, note string) string {
-	text := "Раунд вопросов"
-	if msg := c.Message(); msg != nil && msg.Text != "" {
-		text = msg.Text
-	}
-	return text + "\n\n---\n" + note
-}
-
 // onToTicket - «Создать тикет» под ответом из документации. Тикет тут не
 // заводится: разговор продолжается обычным интервью по уже сказанному, и
 // подтверждение саммари остаётся на месте.
 func (b *Bot) onToTicket(c tele.Context) error {
-	b.toast(c, "Перевожу в тикет")
+	b.toast(c, toastToTicket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -1526,7 +1440,7 @@ func (b *Bot) onToTicket(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Разговор уже закрыт.", backHome())
+		return b.screen(c, msgTalkClosedToTicket, backHome())
 	}
 	// Кнопка живёт в переписке дольше экрана: разговор мог стать тикетом сам,
 	// репликой автора, или прошлым нажатием этой же кнопки. В разборе перевод
@@ -1547,13 +1461,13 @@ func (b *Bot) onToTicket(c tele.Context) error {
 	// кнопки и для реплики, распознанной ходом lookup.
 	b.closeScreen(ctx, cs)
 	b.waitFor(cs)
-	return b.screen(c, markAnswered(c, "Перевожу в тикет."), nil)
+	return b.screen(c, markAnswered(c, msgToTicketDone), nil)
 }
 
 // onEndAsk - «Закончить разговор»: вопрос закрыт ответом, слот активного
 // обращения свободен, автор возвращается в меню.
 func (b *Bot) onEndAsk(c tele.Context) error {
-	b.toast(c, "Заканчиваю")
+	b.toast(c, toastEndingAsk)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -1563,7 +1477,7 @@ func (b *Bot) onEndAsk(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.screen(c, "Разговор уже закончен.", backHome())
+		return b.screen(c, msgTalkAlreadyEnded, backHome())
 	}
 	// Разговор уже стал тикетом: этой кнопкой его не закрыть, выход - «Сброс».
 	if cs.Mode != modeAsk {
@@ -1574,10 +1488,10 @@ func (b *Bot) onEndAsk(c tele.Context) error {
 		return err
 	}
 	b.closeScreen(ctx, cs)
-	if err := b.screen(c, markAnswered(c, "Разговор закончен."), nil); err != nil {
+	if err := b.screen(c, markAnswered(c, msgTalkEnded), nil); err != nil {
 		return err
 	}
-	if err := b.sendPanel(c, "Готово. Что дальше?"); err != nil {
+	if err := b.sendPanel(c, msgReadyWhatNext); err != nil {
 		return err
 	}
 	return b.homeScreen(ctx, c, "")
@@ -1598,12 +1512,12 @@ func (b *Bot) onPublish(c tele.Context) error {
 	}
 	if cs == nil {
 		b.toast(c, "")
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 	if !b.liveScreen(c, cs) {
 		return nil
 	}
-	b.toast(c, "Публикую")
+	b.toast(c, toastPublishing)
 
 	if err := b.cases.ConfirmSummary(ctx, cs); err != nil {
 		if errors.Is(err, ErrNoSummary) {
@@ -1611,9 +1525,9 @@ func (b *Bot) onPublish(c tele.Context) error {
 			// другое обращение того же автора: слот один, кнопка вечная.
 			switch cs.Status {
 			case statusInterview:
-				return c.Send("Переписываю саммари с вашей правкой. Покажу заново - тогда и опубликуем.")
+				return c.Send(msgSummaryRewriting)
 			case statusPublishing:
-				return c.Send("Уже публикую. Пришлю номер, как только тикет заведётся.")
+				return c.Send(msgAlreadyPublishing)
 			}
 			return b.sendState(c, cs)
 		}
@@ -1621,7 +1535,7 @@ func (b *Bot) onPublish(c tele.Context) error {
 	}
 	// Кнопки саммари снимаются: тикет уже уходит, второе нажатие только
 	// путало бы. Номер придёт отдельным сообщением из очереди.
-	return b.screen(c, markAnswered(c, "Публикую. Пришлю номер и ссылку."), nil)
+	return b.screen(c, markAnswered(c, msgPublishingNow), nil)
 }
 
 // onFix - «Поправить»: состояние не меняет, правкой становится следующее
@@ -1641,12 +1555,12 @@ func (b *Bot) onFix(c tele.Context) error {
 	}
 	if cs == nil {
 		b.toast(c, "")
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 	if !b.liveScreen(c, cs) {
 		return nil
 	}
-	b.toast(c, "Жду правку")
+	b.toast(c, toastAwaitingFix)
 
 	if !inDialog(cs.Status) {
 		return b.sendState(c, cs)
@@ -1654,8 +1568,8 @@ func (b *Bot) onFix(c tele.Context) error {
 	// Кнопка «Публикую» остаётся: автор мог передумать править, и без неё
 	// пришлось бы искать саммари выше по переписке.
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("Публикую", publishBtn.Unique)))
-	text := markAnswered(c, "Жду правку: напишите или наговорите, перепишу и покажу снова.")
+	markup.Inline(markup.Row(markup.Data(buttonPublish, publishBtn.Unique)))
+	text := markAnswered(c, msgAwaitingFixNote)
 
 	// editScreen зовётся напрямую, а не через screen(): отказ правки саммари
 	// (M2) уводит screen_msg на запасное сообщение - иначе «Публикую» на
@@ -1679,7 +1593,7 @@ func (b *Bot) onDone(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return c.Send("Сейчас нечего завершать. Нажмите «Меню» и начните с проекта.", homeKeyboard())
+		return c.Send(msgNothingToFinish, homeKeyboard())
 	}
 	// Слово «Готово» в разговоре - обычный ответ («статус заказа - Готово»), а
 	// не команда сбора: reply-кнопка маршрутизируется по точному тексту раньше
@@ -1690,11 +1604,11 @@ func (b *Bot) onDone(c tele.Context) error {
 
 	switch err := b.cases.FinishCollect(ctx, cs); {
 	case errors.Is(err, ErrNoItems):
-		return c.Send("Пока нечего разбирать. Пришлите текст, голосовое или скриншот.")
+		return c.Send(msgNothingToParse)
 	case errors.Is(err, ErrNoNewItems):
 		// Сырьё прошлого вопроса на месте, нового нет: молчание тут читалось бы
 		// как принятое «Готово», а второй поход в документацию повторил бы ответ.
-		return c.Send("Нового вопроса не вижу. Напишите или наговорите его и нажмите «Готово».")
+		return c.Send(msgNoNewQuestion)
 	case errors.Is(err, ErrNoProject):
 		// Сырьё на месте, статус не менялся: не хватает только проекта.
 		return b.askProject(ctx, c, projectAsk(cs))
@@ -1712,9 +1626,9 @@ func (b *Bot) onDone(c tele.Context) error {
 	// В режиме вопроса панель сбора остаётся: следующий вопрос задаётся тем же
 	// порядком, «написал - нажал Готово», и искать её заново автор не должен.
 	if cs.Mode == modeAsk {
-		return c.Send("Принял вопрос, смотрю документацию.", collectKeyboard())
+		return c.Send(msgQuestionAccepted, collectKeyboard())
 	}
-	return c.Send("Разбираю материал. Пришлю протокол, как закончу.", homeKeyboard())
+	return c.Send(msgParsingMaterial, homeKeyboard())
 }
 
 // onMenu - «Меню» с панели: показать начало или объяснить, где автор стоит.
@@ -1729,7 +1643,7 @@ func (b *Bot) onMenu(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		return b.homeScreen(ctx, c, "Начнём.")
+		return b.homeScreen(ctx, c, msgLetsStart)
 	}
 	if cs.Status == statusCollecting {
 		return b.collect(ctx, c, cs)
@@ -1749,7 +1663,7 @@ func (b *Bot) onReset(c tele.Context) error {
 		return err
 	}
 	if cs == nil {
-		if err := b.sendPanel(c, "Сбрасывать нечего."); err != nil {
+		if err := b.sendPanel(c, msgNothingToReset); err != nil {
 			return err
 		}
 		return b.homeScreen(ctx, c, "")
@@ -1757,7 +1671,7 @@ func (b *Bot) onReset(c tele.Context) error {
 	if cs.Status == statusPublishing {
 		// Работа publish уже в очереди: погасив обращение здесь, мы получили
 		// бы issue по отменённому.
-		return c.Send("Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.")
+		return c.Send(msgTicketLeaving)
 	}
 
 	// Пустой сбор сбрасывается без подтверждения: терять нечего.
@@ -1770,17 +1684,17 @@ func (b *Bot) onReset(c tele.Context) error {
 		// чем слот, и без привязки отменяла бы уже другое обращение автора.
 		markup := &tele.ReplyMarkup{}
 		markup.Inline(
-			markup.Row(markup.Data("Да, сбросить", resetYesBtn.Unique, cs.ID)),
-			markup.Row(markup.Data("Оставить", resetNoBtn.Unique)),
+			markup.Row(markup.Data(buttonResetYes, resetYesBtn.Unique, cs.ID)),
+			markup.Row(markup.Data(buttonResetNo, resetNoBtn.Unique)),
 		)
-		return c.Send("Обращение будет отменено безвозвратно, вместе с файлами. Сбросить?", markup)
+		return c.Send(msgConfirmReset, markup)
 	}
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		return err
 	}
 	// Обращение ушло целиком: живой экран больше не его.
 	b.closeScreen(ctx, cs)
-	if err := b.sendPanel(c, "Сброшено."); err != nil {
+	if err := b.sendPanel(c, msgResetDone); err != nil {
 		return err
 	}
 	return b.homeScreen(ctx, c, "")
@@ -1801,35 +1715,35 @@ func (b *Bot) onResetYes(c tele.Context) error {
 	}
 	if cs == nil {
 		b.toast(c, "")
-		return b.screen(c, "Обращение уже закрыто.", backHome())
+		return b.screen(c, msgCaseClosed, backHome())
 	}
 	if c.Data() != cs.ID {
 		return b.staleButton(c)
 	}
-	b.toast(c, "Сбрасываю")
+	b.toast(c, toastResetting)
 
 	if err := b.cases.CancelCase(ctx, cs, "reset"); err != nil {
 		if errors.Is(err, ErrPublishing) {
-			return b.screen(c, "Тикет уже уходит в GitHub, отменить не получится. Пришлю номер.", nil)
+			return b.screen(c, msgTicketLeaving, nil)
 		}
 		return err
 	}
 	// Обращение ушло целиком: живой экран больше не его.
 	b.closeScreen(ctx, cs)
-	if err := b.screen(c, "Обращение отменено, файлы удалены.", nil); err != nil {
+	if err := b.screen(c, msgCaseReset, nil); err != nil {
 		return err
 	}
-	if err := b.sendPanel(c, "Начнём заново."); err != nil {
+	if err := b.sendPanel(c, msgStartOver); err != nil {
 		return err
 	}
 	return b.homeScreen(ctx, c, "")
 }
 
 func (b *Bot) onResetNo(c tele.Context) error {
-	b.toast(c, "Оставляю")
+	b.toast(c, toastKeeping)
 	// Правка вместо нового сообщения: кнопки подтверждения снимаются, чтобы
 	// «Да, сбросить» не сработала неделю спустя.
-	return b.screen(c, "Оставил, продолжаем.", nil)
+	return b.screen(c, msgKeptGoing, nil)
 }
 
 // isCommand отличает набранную команду от текста reply-кнопки: у них общий
@@ -1867,9 +1781,9 @@ func roundKeyboard(round int, suggested bool) *tele.ReplyMarkup {
 	data := strconv.Itoa(round)
 	row := make([]tele.Btn, 0, 2)
 	if suggested {
-		row = append(row, markup.Data("Всё так", allTrueBtn.Unique, data))
+		row = append(row, markup.Data(buttonAllTrue, allTrueBtn.Unique, data))
 	}
-	row = append(row, markup.Data("Отправить как есть", skipBtn.Unique, data))
+	row = append(row, markup.Data(buttonSkip, skipBtn.Unique, data))
 	markup.Inline(markup.Row(row...))
 	return markup
 }
@@ -1879,8 +1793,8 @@ func roundKeyboard(round int, suggested bool) *tele.ReplyMarkup {
 func summaryKeyboard() *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(markup.Row(
-		markup.Data("Публикую", publishBtn.Unique),
-		markup.Data("Поправить", fixBtn.Unique),
+		markup.Data(buttonPublish, publishBtn.Unique),
+		markup.Data(buttonFix, fixBtn.Unique),
 	))
 	return markup
 }
@@ -1890,8 +1804,8 @@ func summaryKeyboard() *tele.ReplyMarkup {
 func answerKeyboard() *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
 	markup.Inline(
-		markup.Row(markup.Data("Создать тикет", toTicketBtn.Unique)),
-		markup.Row(markup.Data("Закончить разговор", endAskBtn.Unique)),
+		markup.Row(markup.Data(buttonCreateTicket, toTicketBtn.Unique)),
+		markup.Row(markup.Data(buttonEndAsk, endAskBtn.Unique)),
 	)
 	return markup
 }
@@ -1902,14 +1816,14 @@ func answerKeyboard() *tele.ReplyMarkup {
 func (b *Bot) onTicketList(c tele.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
-	return b.askProjectFor(ctx, c, "Тикеты какого проекта показать?", ticketsBtn)
+	return b.askProjectFor(ctx, c, msgWhichProjectTickets, ticketsBtn)
 }
 
 // onTickets - список тикетов проекта. Список, карточка и возврат к списку
 // живут одним сообщением-экраном: оно переписывается на каждом шаге, и автор
 // видит отклик там же, куда смотрит.
 func (b *Bot) onTickets(c tele.Context) error {
-	b.toast(c, "Открываю тикеты")
+	b.toast(c, toastOpeningTickets)
 
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -1920,7 +1834,7 @@ func (b *Bot) onTickets(c tele.Context) error {
 		return err
 	}
 	if !ok {
-		return b.screen(c, "Проект недоступен: его выключили.", backHome())
+		return b.screen(c, msgProjectDisabled, backHome())
 	}
 	return b.showTickets(ctx, c, project, page)
 }
@@ -1937,7 +1851,7 @@ func (b *Bot) showTickets(ctx context.Context, c tele.Context, project Project, 
 		if page > 0 {
 			return b.showTickets(ctx, c, project, 0)
 		}
-		return b.screen(c, "По проекту «"+project.Title+"» тикетов ещё нет.",
+		return b.screen(c, msgNoTickets(project.Title),
 			backProject(project.Slug))
 	}
 	pages := (total + ticketsLimit - 1) / ticketsLimit
@@ -1947,9 +1861,9 @@ func (b *Bot) showTickets(ctx context.Context, c tele.Context, project Project, 
 	markup := &tele.ReplyMarkup{}
 	rows := make([]tele.Row, 0, len(tickets)+2)
 	var text strings.Builder
-	text.WriteString("Тикеты проекта «" + project.Title + "»")
+	text.WriteString(msgTicketsOfProject(project.Title))
 	if pages > 1 {
-		fmt.Fprintf(&text, ", страница %d из %d", page+1, pages)
+		fmt.Fprintf(&text, msgTicketsPageSuffix, page+1, pages)
 	}
 	text.WriteString(":\n\n")
 	for _, t := range tickets {
@@ -1961,17 +1875,17 @@ func (b *Bot) showTickets(ctx context.Context, c tele.Context, project Project, 
 	// которая ничего не делает, читается как поломка.
 	var nav tele.Row
 	if page > 0 {
-		nav = append(nav, markup.Data("Предыдущие", ticketsBtn.Unique, listData(project.Slug, page-1)))
+		nav = append(nav, markup.Data(buttonPrevPage, ticketsBtn.Unique, listData(project.Slug, page-1)))
 	}
 	if page+1 < pages {
-		nav = append(nav, markup.Data("Следующие", ticketsBtn.Unique, listData(project.Slug, page+1)))
+		nav = append(nav, markup.Data(buttonNextPage, ticketsBtn.Unique, listData(project.Slug, page+1)))
 	}
 	if len(nav) > 0 {
 		rows = append(rows, nav)
 	}
 	rows = append(rows, markup.Row(
-		markup.Data("Меню проекта", backBtn.Unique, project.Slug),
-		markup.Data("К проектам", homeBtn.Unique)))
+		markup.Data(buttonProjectMenu, backBtn.Unique, project.Slug),
+		markup.Data(buttonToProjects, homeBtn.Unique)))
 	markup.Inline(rows...)
 	return b.screen(c, text.String(), markup)
 }
@@ -1984,7 +1898,7 @@ func (b *Bot) onCard(c tele.Context) error {
 		b.log.Warn("bad_card_data", "user_id", senderID(c), "data", c.Data())
 		return b.staleButton(c)
 	}
-	b.toast(c, "Открываю тикет")
+	b.toast(c, toastOpeningTicket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
@@ -2001,11 +1915,11 @@ func (b *Bot) onCard(c tele.Context) error {
 	ticket, err := b.tickets.Load(ctx, project, number)
 	switch {
 	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, fmt.Sprintf("Тикета #%d больше нет в GitHub.", number), backToList(project.Slug, page))
+		return b.screen(c, msgTicketGoneOnCard(number), backToList(project.Slug, page))
 	case err != nil:
 		return err
 	case ticket == nil:
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
+		return b.screen(c, msgTicketNotFound, backToList(project.Slug, page))
 	}
 	b.log.Info("ticket_opened", "user_id", senderID(c), "case_id", ticket.CaseID, "issue", number)
 
@@ -2020,12 +1934,12 @@ func (b *Bot) onCard(c tele.Context) error {
 	markup := &tele.ReplyMarkup{}
 	var rows []tele.Row
 	if cancelOffered(ticket, senderID(c)) {
-		rows = append(rows, markup.Row(markup.Data("Отменить тикет", killBtn.Unique,
+		rows = append(rows, markup.Row(markup.Data(buttonCancelTicket, killBtn.Unique,
 			cardData(project.Slug, number))))
 	}
 	rows = append(rows, markup.Row(
-		markup.Data("К списку", ticketsBtn.Unique, listData(project.Slug, page)),
-		markup.Data("Меню проекта", backBtn.Unique, project.Slug)))
+		markup.Data(buttonBackToList, ticketsBtn.Unique, listData(project.Slug, page)),
+		markup.Data(buttonProjectMenu, backBtn.Unique, project.Slug)))
 	markup.Inline(rows...)
 
 	return b.screen(c, cardText(ticket), markup)
@@ -2036,7 +1950,7 @@ func (b *Bot) onCard(c tele.Context) error {
 // бы как потеря места.
 func backToList(slug string, page int) *tele.ReplyMarkup {
 	markup := &tele.ReplyMarkup{}
-	markup.Inline(markup.Row(markup.Data("К списку", ticketsBtn.Unique, listData(slug, page))))
+	markup.Inline(markup.Row(markup.Data(buttonBackToList, ticketsBtn.Unique, listData(slug, page))))
 	return markup
 }
 
@@ -2050,7 +1964,7 @@ func (b *Bot) onKill(c tele.Context) error {
 		b.log.Warn("bad_card_data", "user_id", senderID(c), "data", c.Data())
 		return b.staleButton(c)
 	}
-	b.toast(c, "Отменяю тикет")
+	b.toast(c, toastCancellingTicket)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -2075,15 +1989,15 @@ func (b *Bot) onKill(c tele.Context) error {
 	switch {
 	case errors.Is(err, ErrNotAuthor):
 		b.log.Warn("cancel_denied", "user_id", senderID(c), "project", project.Slug, "issue", number)
-		return b.screen(c, "Отменить тикет может только его автор.", backToList(project.Slug, page))
+		return b.screen(c, msgCancelNotAuthor, backToList(project.Slug, page))
 	case errors.Is(err, ErrIssueGone):
-		return b.screen(c, "Тикет не найден.", backToList(project.Slug, page))
+		return b.screen(c, msgTicketNotFound, backToList(project.Slug, page))
 	case err != nil:
 		return err
 	}
 	// Кнопка отмены снимается сразу: работа уже в очереди, второе нажатие
 	// поставило бы её заново.
-	return b.screen(c, fmt.Sprintf("Отменяю тикет #%d, сообщу, когда закроется.", number),
+	return b.screen(c, msgCancellingTicket(number),
 		backToList(project.Slug, page))
 }
 
@@ -2105,7 +2019,7 @@ func (b *Bot) cardTarget(ctx context.Context, c tele.Context, slug string) (Proj
 		return Project{}, false, err
 	}
 	if !ok {
-		return Project{}, false, b.screen(c, "Проект недоступен: его выключили.", backHome())
+		return Project{}, false, b.screen(c, msgProjectDisabled, backHome())
 	}
 	return project, true, nil
 }
@@ -2148,31 +2062,6 @@ func listTarget(data string) (string, int) {
 	return slug, page
 }
 
-func ticketLine(t Ticket) string {
-	if t.News {
-		return fmt.Sprintf("#%d (новое) - %s - %s", t.Number, statusTitle(t.Status), t.Title)
-	}
-	return fmt.Sprintf("#%d - %s - %s", t.Number, statusTitle(t.Status), t.Title)
-}
-
-// ticketButton - подпись кнопки списка. Отметка новости повторяется на кнопке:
-// в длинном списке нажимают по кнопкам, не сверяясь с текстом выше.
-func ticketButton(t Ticket) string {
-	if t.News {
-		return fmt.Sprintf("#%d новое - %s", t.Number, statusTitle(t.Status))
-	}
-	return fmt.Sprintf("#%d %s", t.Number, statusTitle(t.Status))
-}
-
-// statusTitle - что показать вместо статуса, когда GitHub не ответил. Пустая
-// строка выглядела бы как «статус неизвестен сервису», а он просто недоступен.
-func statusTitle(s Status) string {
-	if s.Title == "" {
-		return "статус недоступен"
-	}
-	return s.Title
-}
-
 // cancelOffered - показывать ли кнопку отмены. Отменяет только автор и только
 // пока статус прочитан: при молчащем GitHub «не доигран» - это незнание, а не
 // факт, и кнопка звала бы отменять давно закрытый тикет.
@@ -2184,44 +2073,6 @@ func cancelOffered(t *Ticket, userID int64) bool {
 // бывает в тысячи символов: без предела карточка не влезала в одно сообщение и
 // уезжала автору двумя, вторым - обрывок комментария.
 const cardComment = 600
-
-// cutForCard готовит длинный текст к показу в карточке: снимает markdown и режет
-// хвост с пометкой. Без пометки автор примет обрывок за весь текст, а
-// полный текст живёт в issue - ссылка стоит в той же карточке.
-func cutForCard(text string, limit int) string {
-	text = plainText(strings.TrimSpace(text))
-	if utf8.RuneCountInString(text) <= limit {
-		return text
-	}
-	return cutRunes(text, limit) + "...\n\nПолностью - в тикете по ссылке ниже."
-}
-
-func cardText(t *Ticket) string {
-	var text strings.Builder
-	fmt.Fprintf(&text, "Тикет #%d - %s\n%s\n\nАвтор: %s\n", t.Number, statusTitle(t.Status), t.Title, t.Author)
-	// Краткое содержание, а у тикетов до его появления - начало тела: целиком тело
-	// вытесняло с экрана статус и комментарий, за которыми автор и заходит.
-	switch {
-	case t.Brief != "":
-		text.WriteString("\n" + cutForCard(t.Brief, briefLimit) + "\n")
-	case t.Body != "":
-		text.WriteString("\n" + cutForCard(firstSection(t.Body), briefLimit) + "\n")
-	}
-	if t.Comment != "" {
-		text.WriteString("\nПоследний комментарий:\n" + cutForCard(t.Comment, cardComment) + "\n")
-	}
-	if t.URL != "" {
-		text.WriteString("\n" + t.URL)
-	}
-	return text.String()
-}
-
-// projectHelp - подсказка. Один пример важнее описания синтаксиса: ссылку
-// копируют со страницы репозитория и присылают как есть.
-const projectHelp = "Пришлите ссылку на репозиторий проекта:\n" +
-	"https://github.com/owner/repo\n\n" +
-	"Название и описание я соберу сам по README. Можно задать их явно:\n" +
-	"owner/repo Название | Чем занят сервис"
 
 // onProjectAdd - команда /project: быстрый путь для того, кто ссылку уже
 // скопировал. Заводить может любой из белого списка: ролей в сервисе нет, а
@@ -2243,7 +2094,7 @@ func (b *Bot) onProjectAdd(c tele.Context) error {
 // onAddProject - кнопка «Добавить проект»: следующее сообщение автора - ссылка.
 // При активном обращении кнопка не работает: ссылка ушла бы в него сырьём.
 func (b *Bot) onAddProject(c tele.Context) error {
-	b.toast(c, "Жду ссылку")
+	b.toast(c, toastAwaitingLink)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -2256,8 +2107,7 @@ func (b *Bot) onAddProject(c tele.Context) error {
 		return b.sendState(c, cs)
 	}
 	b.awaitLink[senderID(c)] = time.Now()
-	return b.screen(c, "Пришлите ссылку на репозиторий следующим сообщением, "+
-		"например https://github.com/owner/repo", nil)
+	return b.screen(c, msgSendRepoLink, nil)
 }
 
 // onProjectLink - сообщение, обещанное после «Добавить проект». Зовёт allow:
@@ -2296,39 +2146,8 @@ func (b *Bot) addProject(c tele.Context, args string) error {
 // разбирают сами, до этого ответа он не доходит.
 func (b *Bot) refuseProject(c tele.Context, err error) error {
 	if errors.Is(err, ErrSlugTaken) {
-		return c.Send("Проект с таким именем уже заведён на другой репозиторий. " +
-			"Напишите владельцу сервиса - выключить проект из бота пока можно только через базу.")
+		return c.Send(msgSlugTaken)
 	}
 	b.log.Warn("project_add_failed", "user_id", senderID(c), "error", err)
 	return c.Send(projectFailText(err))
-}
-
-// projectCard показывает и то, откуда взялось описание: контекст уходит в
-// инструкцию интервью и определяет вопросы по всем будущим обращениям проекта,
-// поэтому придуманное моделью автор должен отличать от своего.
-func projectCard(p ProjectConfig, source string) string {
-	return fmt.Sprintf("Проект «%s» заведён и появился в меню.\nРепозиторий: %s/%s\n\n%s\n\n%s\n"+
-		"Переписать: /project %s/%s Название | Описание",
-		p.Title, p.Owner, p.Repo, p.Context, projectSourceNote(source), p.Owner, p.Repo)
-}
-
-func projectSourceNote(source string) string {
-	switch source {
-	case "модель":
-		return "Название и описание я собрал по README - проверьте, так ли это."
-	case "репозиторий":
-		return "Описание модель собрать не смогла, взял из полей репозитория."
-	default:
-		return "Название и описание ваши, я их не трогал."
-	}
-}
-
-// projectFailText объясняет отказ словами автора, а не статусом API: для
-// fine-grained токена «нет репозитория» и «нет доступа» неразличимы.
-func projectFailText(err error) string {
-	if isDenied(err) {
-		return "Репозиторий недоступен: токен сервиса его не видит либо не может писать в Issues. " +
-			"Проверьте адрес и права токена, потом повторите."
-	}
-	return "Не получилось завести проект. Попробуйте ещё раз, а если повторится - напишите владельцу сервиса."
 }

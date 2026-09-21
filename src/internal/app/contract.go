@@ -129,20 +129,6 @@ func (c Contract) Prompt() string {
 	return strings.TrimSpace(b.String())
 }
 
-// Unclear - строка о незакрытом ядре для саммари и тела тикета: «Не уточнено:
-// конкретный случай, что нужно.». Ядро закрыто - пусто. Счёт по Missing, а не
-// по gaps модели: строку, от которой зависит метка неполноты, считает Go.
-func (c Contract) Unclear(kind string, filled map[string]string) string {
-	var titles []string
-	for _, key := range c.Missing(kind, filled) {
-		titles = append(titles, lowerFirst(c.Title(kind, key)))
-	}
-	if len(titles) == 0 {
-		return ""
-	}
-	return "Не уточнено: " + strings.Join(titles, ", ") + "."
-}
-
 // lowerFirst - название пункта внутри фразы: «Конкретный случай» в правилах,
 // «..., конкретный случай» в строке.
 func lowerFirst(text string) string {

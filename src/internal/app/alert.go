@@ -35,20 +35,3 @@ func newAlertBot(cfg Config, main *tele.Bot) (*tele.Bot, error) {
 	}
 	return tb, nil
 }
-
-func alertPublished(p Project, cs *Case, author User, number int, url string) string {
-	text := alertMessage("Новый тикет", p, cs, author, number, url)
-	if cs.Incomplete {
-		text += "\nКонтракт недобран: тикет помечен incomplete."
-	}
-	return text
-}
-
-func alertCancelled(p Project, cs *Case, author User, number int, url string) string {
-	return alertMessage("Тикет отменён автором", p, cs, author, number, url)
-}
-
-func alertMessage(head string, p Project, cs *Case, author User, number int, url string) string {
-	return fmt.Sprintf("%s: %s\n%s\nАвтор: %s\n#%d %s",
-		head, p.Slug, cs.Title, authorName(author), number, url)
-}

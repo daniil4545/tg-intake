@@ -67,17 +67,6 @@ func NewGitHub(token, api string, statuses Statuses, log *slog.Logger) *GitHub {
 	}
 }
 
-// Метки проекта. Статус тикета живёт меткой и остаётся единственным источником
-// истины: сервис их только заводит и читает.
-// Статусов здесь нет: они приходят из rules/statuses.json. Иначе добавленный в
-// правила статус бот умел бы читать, но никогда не завёл бы в репозитории.
-var baseLabels = []struct{ Name, Color, Desc string }{
-	{"type:bug", "d73a4a", "Сервис ведёт себя не так, как ожидали"},
-	{"type:feature", "a2eeef", "Нужно то, чего в сервисе нет"},
-	{"type:question", "d876e3", "Нужен ответ, а не изменение в коде"},
-	{"incomplete", "fbca04", "Контракт готовности недобран, пробелы в теле"},
-}
-
 const authorLabelColor = "ededed"
 
 // PrepareProject заводит метки проекта и этим же проверяет право писать:
@@ -90,7 +79,7 @@ func (g *GitHub) PrepareProject(ctx context.Context, p Project) error {
 		}
 	}
 	for _, s := range g.statuses {
-		if err := g.createLabel(ctx, p, s.Label, s.Color, "Статус: "+s.Title); err != nil {
+		if err := g.createLabel(ctx, p, s.Label, s.Color, modelStatusLabelPrefix+s.Title); err != nil {
 			return err
 		}
 	}
@@ -488,7 +477,7 @@ func (g *GitHub) send(ctx context.Context, client *http.Client, method, path str
 		// accessible» не отличает «прав нет» от «токен не выдан на этот
 		// репозиторий», и разбор упирается в догадки.
 		if need := resp.Header.Get("X-Accepted-GitHub-Permissions"); need != "" {
-			message += " (нужно: " + need + ")"
+			message += modelGithubPermissionNeeded + need + ")"
 		}
 		return nil, retry, &githubError{status: resp.StatusCode, message: message}
 	}
@@ -563,7 +552,7 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	}
 	// Метка автора живёт вне базового набора: она появляется вместе с первым
 	// обращением человека.
-	if err := p.gh.createLabel(ctx, project, "author:"+author.Slug, authorLabelColor, "Автор обращения"); err != nil {
+	if err := p.gh.createLabel(ctx, project, "author:"+author.Slug, authorLabelColor, modelAuthorLabelDesc); err != nil {
 		return err
 	}
 
@@ -645,50 +634,6 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	return nil
 }
 
-// body собирает тело тикета: авторство, разделы саммари, незакрытое ядро и маркер.
-//
-// Авторство фиксируется телом, а не полем API: GitHub не даёт создать issue от
-// чужого имени, автором станет владелец токена.
-func (p *Publisher) body(cs *Case, author User, links []string, marker string) string {
-	var b strings.Builder
-	b.WriteString("Автор: " + authorName(author) + "\n\n")
-	// Кратко идёт первым разделом: тот, кто возьмёт тикет, читает суть до
-	// разделов контракта. Пусто оно только у тикетов, заведённых до появления
-	// поля.
-	if cs.Brief != "" {
-		b.WriteString("## Кратко\n\n" + cs.Brief + "\n\n")
-	}
-	b.WriteString(cs.Summary)
-
-	// Адреса из сырья идут отдельным разделом и целиком: тот, кто возьмёт тикет,
-	// открывает карточку сам, а пересказ модели ведёт в никуда.
-	if len(links) > 0 {
-		b.WriteString("\n\n## Ссылки\n\n")
-		for _, link := range links {
-			b.WriteString("- " + link + "\n")
-		}
-		b.WriteString("\nПрислано автором вместе с материалом обращения.")
-	}
-
-	// Пересечения идут после ссылок и до пробелов: это не часть обращения, а
-	// найденный сервисом контекст, и берущему тикет он нужен раньше, чем список
-	// того, чего автор не уточнил.
-	if cs.Overlap != "" {
-		b.WriteString("\n\n## Пересечения\n\n" + cs.Overlap + "\n")
-		b.WriteString("\nНашёл бот при сборке тикета и показал автору: он видел этот " +
-			"список и всё равно завёл тикет.")
-	}
-
-	// Незакрытое ядро - одной строкой в конце: пробел назван явно, правдоподобная
-	// выдумка была бы принята за факт. Считается так же, как метка incomplete.
-	if unclear := p.rules.Unclear(cs.Kind, cs.Filled); unclear != "" {
-		b.WriteString("\n\n---\n" + unclear)
-	}
-
-	b.WriteString("\n\n" + marker)
-	return b.String()
-}
-
 // typeLabels - метки типа тикета. Смесь - один тикет с метками обоих типов:
 // делить обращение на два - решение разработчика, а не бота (Р-2 ticket-form).
 func typeLabels(kind string) []string {
@@ -722,36 +667,6 @@ func isDenied(err error) bool {
 // publishFailedText отделяет отказ в правах от временного сбоя. Советовать
 // «нажмите ещё раз» там, где токену не хватает прав, значит гонять автора по
 // кругу: повтор не поможет, пока владелец не выдаст право заводить тикеты.
-func publishFailedText(cause error) string {
-	if isDenied(cause) {
-		return "Тикет не создан: у сервиса нет прав заводить задачи в этом проекте. " +
-			"Материал сохранён. Напишите владельцу сервиса - когда право появится, " +
-			"нажмите «Публикую» ещё раз."
-	}
-	return "Не удалось создать тикет в GitHub. Нажмите «Публикую» ещё раз - материал на месте."
-}
-
-// lookupFailedText - то же разделение для похода в документацию: право читать
-// содержимое репозитория выдаётся отдельно от права заводить тикеты, и без него
-// «спросите ещё раз своими словами» отправляет автора по кругу навсегда.
-func lookupFailedText(cause error) string {
-	if isDenied(cause) {
-		return "У сервиса нет доступа к документации этого проекта, и повтор тут не " +
-			"поможет - напишите владельцу сервиса. Тикет создать можно: нажмите " +
-			"«Создать тикет»."
-	}
-	return "Не смог посмотреть документацию. Спросите ещё раз своими словами - " +
-		"или нажмите «Создать тикет»."
-}
-
-func publishedMessage(number int, url string, incomplete bool) string {
-	text := fmt.Sprintf("Готово. Тикет #%d: %s", number, url)
-	if incomplete {
-		text += "\n\nЧасть вопросов осталась без ответа - тикет помечен как неполный, " +
-			"пробелы перечислены в теле."
-	}
-	return text
-}
 
 // Repo - репозиторий в том виде, в каком его читает заведение проекта.
 type Repo struct {

@@ -103,7 +103,7 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 		// Файла нет или он не читается: повтор этого не исправит.
 		n.log.Warn("item_rejected", "case_id", p.CaseID, "item_id", item.ID,
 			"reason", "unreadable_file", "error", err)
-		return n.failAndMoveOn(ctx, p.CaseID, item.ID, "файл не прочитан")
+		return n.failAndMoveOn(ctx, p.CaseID, item.ID, modelErrFileUnread)
 	}
 
 	raw, err := n.llm.Complete(ctx, Request{
@@ -134,7 +134,7 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 		// О нераспознанной речи надо сказать прямо: пустота, ушедшая дальше,
 		// читается моделью как «человек ничего не сказал».
 		n.log.Info("item_rejected", "case_id", p.CaseID, "item_id", item.ID, "reason", "no_speech")
-		return n.failAndMoveOn(ctx, p.CaseID, item.ID, "речь не распознана")
+		return n.failAndMoveOn(ctx, p.CaseID, item.ID, modelErrSpeechUnrecognized)
 	}
 
 	if err := n.cases.SaveNormalized(ctx, item.ID, text); err != nil {
@@ -215,7 +215,7 @@ func (n *Normalizer) readScreenshot(ctx context.Context, protocol string, item I
 	data, err := readFile(item.FilePath)
 	if err != nil {
 		n.log.Warn("item_rejected", "item_id", item.ID, "reason", "unreadable_file", "error", err)
-		return failItem(ctx, n.cases.pool, item.ID, "файл не прочитан")
+		return failItem(ctx, n.cases.pool, item.ID, modelErrFileUnreadScreenshot)
 	}
 
 	mime := item.Mime
@@ -230,7 +230,7 @@ func (n *Normalizer) readScreenshot(ctx context.Context, protocol string, item I
 		Step: stepScreenshot,
 		Messages: []Message{
 			{Role: "system", Parts: []Part{TextPart(screenshotPrompt)}},
-			{Role: "user", Parts: []Part{TextPart("Протокол сырья:\n\n" + protocol)}},
+			{Role: "user", Parts: []Part{TextPart(modelRawProtocolPrefix + protocol)}},
 			{Role: "user", Parts: []Part{ImagePart(data, mime)}},
 		},
 		SchemaName: "screenshot_extract",
@@ -251,7 +251,7 @@ func (n *Normalizer) readScreenshot(ctx context.Context, protocol string, item I
 		n.log.Warn("llm_invalid", "step", stepScreenshot, "item_id", item.ID,
 			"attempt", attempt+1, "error", err)
 	}
-	return failItem(ctx, n.cases.pool, item.ID, "разбор скриншота не по схеме")
+	return failItem(ctx, n.cases.pool, item.ID, modelErrScreenshotSchema)
 }
 
 // screenshotFact - пара «поле экрана и его значение».
@@ -282,23 +282,6 @@ func parseExtract(raw json.RawMessage) (screenshotExtract, error) {
 		return e, errors.New("facts and unreadable are both empty")
 	}
 	return e, nil
-}
-
-// formatExtract превращает разбор в строку протокола: дальше с ним работает
-// текстовая модель, и структура ей нужна как текст, а не как JSON.
-func formatExtract(e screenshotExtract) string {
-	var b strings.Builder
-	b.WriteString(strings.TrimSpace(e.Screen))
-	for _, f := range e.Facts {
-		fmt.Fprintf(&b, "\n   %s: %s", strings.TrimSpace(f.Label), strings.TrimSpace(f.Value))
-	}
-	if relevant := strings.TrimSpace(e.Relevant); relevant != "" {
-		b.WriteString("\n   связь с обращением: " + relevant)
-	}
-	if len(*e.Unreadable) > 0 {
-		b.WriteString("\n   не прочитано: " + strings.Join(*e.Unreadable, "; "))
-	}
-	return strings.TrimSpace(b.String())
 }
 
 // finish закрывает нормализацию: протокол, статус, событие и уведомление автору
@@ -388,8 +371,7 @@ func (n *Normalizer) reopen(ctx context.Context, cs *Case, jobID int64) error {
 		if err := addEvent(ctx, tx, cs.ID, "case_reopened", map[string]any{"reason": "nothing parsed"}); err != nil {
 			return err
 		}
-		return putNotify(ctx, tx, cs.ID, jobID,
-			"Ничего не удалось разобрать. Пришлите материал иначе и нажмите «Готово» ещё раз.")
+		return putNotify(ctx, tx, cs.ID, jobID, msgNothingParsed)
 	})
 	if err != nil {
 		return err
@@ -401,11 +383,6 @@ func (n *Normalizer) reopen(ctx context.Context, cs *Case, jobID int64) error {
 	cs.Status = statusCollecting
 	n.log.Warn("case_reopened", "case_id", cs.ID, "reason", "nothing parsed")
 	return nil
-}
-
-func protocolMessage(protocol string) string {
-	return "Разобрал материал. Вот что получилось:\n\n" + plainText(protocol) +
-		"\n\nСейчас уточню недостающее."
 }
 
 // hasContent - осталось ли в сырье хоть что-то разобранное. Пустого протокола

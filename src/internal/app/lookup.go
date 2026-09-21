@@ -225,7 +225,7 @@ func (l *Lookup) load(ctx context.Context, cs *Case, project Project, ref string
 func (l *Lookup) askAnswer(ctx context.Context, cs *Case, project Project, loaded []docText, history []Message) (lookupAnswer, error) {
 	var out lookupAnswer
 	messages := lookupMessages(answerPrefix, project.Context,
-		docsMessage(loaded, "Содержимое отобранных файлов:"), history)
+		docsMessage(loaded, modelSelectedFilesHeading), history)
 	if err := complete(ctx, l.llm, l.model, stepAnswer, answerSchema, messages, &out); err != nil {
 		return lookupAnswer{}, err
 	}
@@ -324,23 +324,11 @@ func (l *Lookup) alertText(ctx context.Context, cs *Case, project Project, out l
 		return "", err
 	}
 
-	found := "ответа в документации нет"
+	found := alertLookupNoAnswer
 	if out.Found {
-		found = "ответ найден: " + strings.Join(out.Sources, ", ")
+		found = alertLookupAnswerFoundPrefix + strings.Join(out.Sources, ", ")
 	}
-	return fmt.Sprintf("Вопрос по документации: %s\nАвтор: %s\n%s",
-		project.Slug, authorName(author), found), nil
-}
-
-// lookupMessages собирает сообщения запроса. Порядок обязателен: стабильный
-// префикс первым сообщением, волатильное вторым, история разговора последней.
-// Любая изменяющаяся строка перед промтом молча гасит кэш провайдера.
-func lookupMessages(prefix, projectContext, volatile string, history []Message) []Message {
-	messages := []Message{
-		{Role: "system", Parts: []Part{TextPart(prefix + "\n\n## Проект\n\n" + projectContext)}},
-		{Role: "user", Parts: []Part{TextPart(volatile)}},
-	}
-	return append(messages, history...)
+	return alertLookupQuestion(project.Slug, authorName(author), found), nil
 }
 
 // keepInTree оставляет только пути, которые есть в дереве репозитория. Второе
@@ -415,55 +403,11 @@ func sourceLinks(project Project, ref string, sources []string) []string {
 // история разговора не должна учить её обратному.
 func answerBody(out lookupAnswer) string {
 	if !out.Found {
-		return "В документации проекта ответа на это нет. Если нужна правка или " +
-			"что-то не работает - нажмите «Создать тикет»."
+		return msgLookupNoAnswer
 	}
 	// Разметку снимаем здесь же, где текст модели превращается в реплику бота:
 	// Telegram markdown не рендерит, а parse_mode на чужом тексте роняет отправку.
 	return plainText(out.Answer)
-}
-
-func withLinks(body string, links []string) string {
-	if len(links) == 0 {
-		return body
-	}
-	label := "Источник: "
-	if len(links) > 1 {
-		label = "Источники:\n"
-	}
-	return body + "\n\n" + label + strings.Join(links, "\n")
-}
-
-// treeMessage - волатильная часть хода отбора: что за файлы есть в репозитории.
-func treeMessage(docs []DocFile) string {
-	var b strings.Builder
-	b.WriteString("Файлы документации в репозитории (путь и размер в байтах):\n")
-	for n, d := range docs {
-		if n == maxTreePaths {
-			// Без пометки модель считает список полным, и «не нашёл» становится
-			// неверным: файл с ответом мог остаться за обрезом.
-			b.WriteString("[список обрезан]\n")
-			break
-		}
-		fmt.Fprintf(&b, "%s (%d)\n", d.Path, d.Size)
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// docsMessage - волатильная часть: содержимое прочитанных файлов. Заголовок
-// параметром: у отбора это «отобранные файлы», у сверки - выдержки из четырёх
-// известных документов, которые никто не выбирал.
-func docsMessage(loaded []docText, header string) string {
-	if len(loaded) == 0 {
-		return "Прочитать не удалось ни одного файла документации."
-	}
-
-	var b strings.Builder
-	b.WriteString(header + "\n")
-	for _, d := range loaded {
-		fmt.Fprintf(&b, "\n### %s\n\n%s\n", d.Path, d.Text)
-	}
-	return b.String()
 }
 
 // cutDoc режет документ по остатку бюджета и помечает обрез: без пометки модель
@@ -472,7 +416,7 @@ func cutDoc(text string, limit int) string {
 	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
-	return cutRunes(text, limit) + "\n\n[файл обрезан]"
+	return cutRunes(text, limit) + modelDocCutMark
 }
 
 // askHistory восстанавливает разговор режима вопроса из журнала: реплики автора

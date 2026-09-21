@@ -414,7 +414,7 @@ func (c *Cases) download(ctx context.Context, bot *tele.Bot, cs *Case, itemID in
 	path, err := c.media.Download(bot, cs.ID, strconv.FormatInt(itemID, 10), file)
 	if err != nil {
 		c.log.Warn("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "download_failed", "error", err)
-		if failErr := failItem(ctx, c.pool, itemID, "файл не скачался"); failErr != nil {
+		if failErr := failItem(ctx, c.pool, itemID, modelErrDownloadFailed); failErr != nil {
 			c.log.Error("item_fail_failed", "case_id", cs.ID, "item_id", itemID, "error", failErr)
 		}
 		return fmt.Errorf("download item %d: %w", itemID, err)
@@ -832,7 +832,7 @@ func switchToTicket(ctx context.Context, db txRunner, caseID string) error {
 	// кнопке, и по реплике, распознанной ходом lookup: в разборе «Готово» с этой
 	// панели ушло бы ответом автора, а не командой.
 	if err := putNotifyKey(ctx, db, caseID, "to-ticket",
-		"Что бы вы хотели изменить?", keysHome); err != nil {
+		msgWhatToChange, keysHome); err != nil {
 		return err
 	}
 	if next == statusNormalizing {
@@ -860,50 +860,6 @@ func BuildProtocol(items []Item) string {
 		fmt.Fprintf(&b, "%d. %s\n", n, line)
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-var itemLabel = map[string]string{
-	"text":  "текст",
-	"link":  "ссылка",
-	"voice": "голосовое",
-	"photo": "скриншот",
-}
-
-func itemLine(it Item) string {
-	label := itemLabel[it.Kind]
-	if label == "" {
-		label = it.Kind
-	}
-	if it.Forwarded {
-		label += ", переслано (не слова автора)"
-	}
-
-	if it.Status == "failed" {
-		reason := strings.TrimSpace(it.Error)
-		if reason == "" {
-			reason = "причина неизвестна"
-		}
-		// Провал виден строкой, а не пропуском: модель должна видеть пробел, а
-		// не достраивать его сама.
-		return label + ": не удалось разобрать: " + oneLine(reason)
-	}
-
-	body := strings.TrimSpace(it.Normalized)
-	caption := strings.TrimSpace(it.SourceText)
-	if body == "" {
-		body = caption
-		caption = ""
-	}
-	if body == "" {
-		return ""
-	}
-	// Подпись под пересланным медиа автор набирает сам, поэтому она идёт
-	// отдельной строкой и как его слова: пометка «не слова автора» относится к
-	// содержимому элемента, а не к тому, что автор написал под ним.
-	if caption != "" {
-		return label + ": " + body + "\n   слова автора: " + caption
-	}
-	return label + ": " + body
 }
 
 // linkRe - адрес в тексте сообщения. Скобки и угловые исключены нарочно: ссылка
@@ -1086,15 +1042,6 @@ func (c *Cases) RemindDrafts(ctx context.Context) error {
 	return nil
 }
 
-func remindText(status string) string {
-	if status == statusCollecting {
-		return "Обращение ждёт вас сутки. Пришлите остальное и нажмите «Готово» " +
-			"либо нажмите «Сброс». Вложения уже удалены, текст на месте."
-	}
-	return "Обращение ждёт вашего ответа сутки. Ответьте, и я доведу его до тикета, " +
-		"либо нажмите «Сброс». Вложения уже удалены, разбор на месте."
-}
-
 type casePayload struct {
 	CaseID string `json:"case_id"`
 }
@@ -1171,8 +1118,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			}
 			// Автору говорим только здесь: провал одного голосового виден ему
 			// строкой протокола, а вот вставшую цепочку заметить нечем.
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог обработать обращение. Пришлите материал иначе и нажмите «Готово» ещё раз."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, msgProcessFailed); err != nil {
 				return err
 			}
 		case JobLookup:
@@ -1194,8 +1140,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 		case JobInterview, JobSummarize:
 			// Обращение остаётся живым: следующий ответ автора поставит новую
 			// работу, и разговор продолжится с того же места.
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог разобрать обращение. Напишите ещё раз своими словами - или нажмите «Сброс»."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, msgParseFailed); err != nil {
 				return err
 			}
 		case JobPublish:
@@ -1233,7 +1178,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			// тем же ключом, что и успех: он правит экран отмены, а не копится
 			// в памяти бота непрочитанным.
 			if err := putNotifyKey(ctx, tx, p.CaseID, strconv.FormatInt(job.ID, 10),
-				"Отменить тикет не получилось. Откройте его в списке и попробуйте ещё раз.",
+				msgCancelFailed,
 				keysCancel); err != nil {
 				return err
 			}
@@ -1257,12 +1202,6 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 		c.log.Error("notify_lost", "case_id", p.CaseID, "job_id", job.ID,
 			"error", oneLine(cause.Error()))
 	}
-}
-
-// lostNotifyText - шапка алерта о недоставленном сообщении. Текст потери идёт
-// целиком: владелец должен видеть, что именно не дошло до автора.
-func lostNotifyText(caseID, text string) string {
-	return "Сообщение автору не доставлено, обращение " + caseID + ":\n\n" + text
 }
 
 // reopenCase возвращает обращение в сбор. Два пути возврата - «разобрать не

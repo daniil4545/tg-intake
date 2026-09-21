@@ -319,7 +319,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 			// issue читалось бы как зависший бот.
 			return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 				return putNotifyKey(ctx, tx, cs.ID, "cancel-gone",
-					fmt.Sprintf("Тикета #%d уже нет в GitHub, отменять нечего.", cs.IssueNumber), keysCancel)
+					msgCancelIssueGone(cs.IssueNumber), keysCancel)
 			})
 		}
 		return err
@@ -333,8 +333,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 	if status, ok := t.statuses.Pick(withoutLabel(names, labelCancelled)); ok && status.Final {
 		return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 			return putNotifyKey(ctx, tx, cs.ID, "cancel-late",
-				fmt.Sprintf("Тикет #%d уже закрыт со статусом «%s», отменять нечего.",
-					cs.IssueNumber, status.Title), keysCancel)
+				msgCancelAlreadyClosed(cs.IssueNumber, status.Title), keysCancel)
 		})
 	}
 
@@ -373,7 +372,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		}
 		recorded = true
 		if err := putNotifyKey(ctx, tx, cs.ID, "cancelled",
-			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), keysCancel); err != nil {
+			msgCancelled(cs.IssueNumber), keysCancel); err != nil {
 			return err
 		}
 		if t.alertChat == 0 {
