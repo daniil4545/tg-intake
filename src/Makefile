@@ -9,7 +9,7 @@ endif
 GOOSE := go run -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.27.3
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: run build test test-fast vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
+.PHONY: run build test test-fast eval vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
 
 run:
 	go run ./cmd/intake
@@ -27,8 +27,14 @@ test:
 test-fast:
 	go test -short ./... $(if $(RUN),-run $(RUN) -count=1,)
 
+# Прогон набора eval/cases.jsonl через текущие промты: реальный OpenRouter и
+# TRUNCATE базы TEST_DATABASE_URL. EVAL_OUT - имя файла в eval/results/.
+eval:
+	go test -tags eval -count=1 -timeout 3h -v -run '^TestEvalRun$$' ./internal/app
+
+# Тег eval: иначе vet и линтер не видят прогон, и он ломается молча.
 vet:
-	go vet ./...
+	go vet -tags eval ./...
 
 fmt-check:
 	@out=$$(gofmt -l ./cmd ./internal); \

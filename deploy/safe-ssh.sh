@@ -23,6 +23,7 @@ Read-only actions:
   cases [N]        последние обращения: id, статус, проект, автор, тикет
   case <id>        обращение целиком с текстами: протокол, сырьё, события, работы
   job-errors [N]   упавшие и повторяющиеся работы очереди с ошибками
+  eval-export      набор для make eval: JSON-строка на обращение, только в файл
   deploy-config    имена переменных сервиса в Coolify и версия его compose
   deploy-state     образ кандидата на хосте и незавершённые деплои Coolify
 
@@ -98,6 +99,12 @@ case "$action" in
     job-errors)
         lines="$(tail_lines "$arg")"
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running'; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select id||' '||kind||' status='||status||' attempts='||attempts||' case='||coalesce(left(payload->>'case_id',8),'-')||' updated='||to_char(updated_at,'MM-DD HH24:MI')||coalesce(chr(10)||'  error: '||nullif(last_error,''),'') from jobs where status = 'failed' or attempts > 1 order by updated_at desc limit $lines\""
+        ;;
+    eval-export)
+        # Набор прогона eval (спека ticket-form, Р-10): тексты обращений идут
+        # сразу в файл вне git, а не в терминал. Автор не выгружается: прогону
+        # он не нужен, а набор лежит на машине разработчика.
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running' >&2; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select json_build_object('id', c.id, 'project', p.slug, 'context', p.context, 'protocol', c.protocol, 'kind', c.kind, 'events', coalesce((select json_agg(json_build_object('kind', e.kind, 'payload', e.payload) order by e.id) from case_events e where e.case_id = c.id and e.kind in ('round_asked', 'answer_given', 'interview_done', 'summary_ready', 'switched_to_ticket')), '[]'::json)) from cases c join projects p on p.id = c.project_id where c.mode = 'ticket' and c.protocol <> '' order by c.created_at\""
         ;;
     case-trace)
         # Ход разговора без единого слова автора: вид события, время, статус и

@@ -17,6 +17,9 @@ vendor/
 *.out
 coverage.*
 
+# Eval set and results: real conversations, never enters git
+/eval/
+
 # Media downloaded from Telegram: never enters git
 /src/media/
 *.ogg
