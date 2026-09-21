@@ -40,27 +40,20 @@ services:
 
   app:
     image: ${APP_IMAGE:?APP_IMAGE must be set}
-    # С этого VPS дефолтный IP api.telegram.org (149.154.166.110) недоступен:
-    # getMe уходит в i/o timeout, приложение уходит в перезапуск. Пин на DC
-    # 149.154.167.220, как у соседнего Bot API сервиса. Проверено 2026-08-08.
-    extra_hosts:
-      - "api.telegram.org:149.154.167.220"
     environment:
       DATABASE_URL: postgres://intake:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/intake?sslmode=disable
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN must be set}
       TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS:?TELEGRAM_ALLOWED_IDS must be set}
-      # Пусто - идём напрямую через закреплённый DC. Заполняется адресом
-      # SOCKS-туннеля хоста, как у соседних сервисов.
+      # Пусто - идём напрямую: с узла A api.telegram.org отвечает без прокси.
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
       # Чат уведомлений владельца и токен бота, которым туда пишут. Пустой чат
       # выключает уведомления, пустой токен отдаёт отправку боту сервиса.
       ALERT_CHAT_ID: ${ALERT_CHAT_ID:-}
       ALERT_BOT_TOKEN: ${ALERT_BOT_TOKEN:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set}
-      # Прямой путь к OpenRouter с этого хоста закрыт: запрос возвращает 403 от
-      # фильтра по дороге, а не ответ API. Адрес прокси - секрет контура, в
-      # репозиторий не попадает. Telegram и GitHub идут напрямую, их не трогаем.
-      OPENROUTER_PROXY: ${OPENROUTER_PROXY:?OPENROUTER_PROXY must be set}
+      # Пусто - идём напрямую: с узла A OpenRouter отвечает без прокси. Адрес
+      # прокси, если понадобится, - секрет контура, в репозиторий не попадает.
+      OPENROUTER_PROXY: ${OPENROUTER_PROXY:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
       # Дефолты модели и лимитов лежат в config.go: пустая переменная означает
       # дефолт, а не пустое значение. Копия значений здесь молча разъехалась бы
