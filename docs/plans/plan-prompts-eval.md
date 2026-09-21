@@ -36,7 +36,9 @@ Architecture review: pass with fixes, находки закрыты тексто
   перезаписал бы базу); модель, reasoning, раунды или набор ID не как в базе; база сломана
   (`runsValid`: прогонов базы не `evalBaseRuns` или failed выше предела) - не тратить ключ на
   сравнение с шумной базой.
-- Failed замера больше 10% - `t.Fatal` по `checkFailed`, как в срезе 1, до вердикта.
+- Failed замера больше `evalFailLimit` (20%, решение диспетчера по факту базы среза 1: 13% -
+  честное качество старого кода, не поломка) - `t.Fatal` по `checkFailed`, как в срезе 1, до
+  вердикта.
 
 ## 3a. Рубежи молчания
 
@@ -97,13 +99,16 @@ func compareRuns(base, after evalResult) (table string, reasons []string)
 func sameSetup(base evalResult, model, reasoning string, rounds int, ids []string) error
 ```
 
-`compareRuns`:
-- База годна, если прогонов `evalBaseRuns` и в каждом `Failed <= evalFailLimit*(Cases+Failed)`;
-  иначе причина `base broken`.
+`compareRuns` получает уже годную базу: `runsValid` (прогонов `evalBaseRuns` и в каждом
+`Failed <= evalFailLimit*(Cases+Failed)`) проверяется в `eval_test.go` до хода модели, причина
+`base broken` - там же.
 - Порог на `Mean.Metrics` (допуск 1e-9): M1 >= база + 0.10; M2 <= база + 0.10; M3 >= база -
-  0.05; M4 < база; у замера `evalBaseRuns` прогонов, иначе причина `runs N of 3`. `Bugs = 0`
+  0.05; M4 < база; доля `failed` (`Failed/(Cases+Failed)`) не больше доли базы + 0.05, иначе
+  причина `failed: X vs base Y` - обе стороны в `evalFailLimit` порознь ещё не значит близко
+  друг к другу; у замера `evalBaseRuns` прогонов, иначе причина `runs N of 3`. `Bugs = 0`
   в базе или замере - причина `M3: no bug cases`.
-- Таблица: строка на метрику - база (среднее и min-max), замер, разница, правило, `ok`/`miss`.
+- Таблица: строка на метрику и на долю `failed` - база (среднее и min-max), замер, разница,
+  правило, `ok`/`miss`.
   Ниже справка без влияния на вердикт: по типам M1-M4 со знаменателями (тип без базы - `-`),
   M3 на пересечении, среднее `Attempts` на обращение, ID, где база спрашивала, а замер молчит,
   ID, упавшие только в одной стороне.

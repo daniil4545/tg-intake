@@ -50,8 +50,10 @@ const evalBaseRuns = 3
 
 // evalFailLimit - доля failed, выше которой прогон не мерит промты, а
 // упирается в поломку. Общая для проверки одного прогона (checkFailed, тег
-// eval) и для оценки готовности базы (runsValid, здесь).
-const evalFailLimit = 0.1
+// eval) и для оценки готовности базы (runsValid, здесь). База среза 1 дала
+// 13% (7 из 54, отказы модели и сети после maxAttempts) - честное качество
+// старого кода, а не поломка; 10% резало бы годную базу.
+const evalFailLimit = 0.2
 
 // evalEps - допуск сравнения средних метрик с порогом: защита от шума float,
 // не от реальной разницы (Р-9, сценарий на границе).
@@ -141,6 +143,14 @@ func metricsLine(m evalMetrics) string {
 		m.M1, m.M2, m.M3, m.Bugs, m.M4, m.Asked, m.Cases, m.Failed)
 }
 
+// failedShare - доля failed от всех обращений прогона. Обе стороны могут
+// уложиться в evalFailLimit порознь и всё равно разъехаться: замер не должен
+// разваливаться относительно базы больше чем на 5 п.п. (решение диспетчера
+// после базового прогона, plan-prompts-eval.md §3).
+func failedShare(m evalMetrics) float64 {
+	return share(m.Failed, m.Cases+m.Failed)
+}
+
 // runsValid - прогонов evalBaseRuns и в каждом failed не больше
 // evalFailLimit: сравнение с шумной или недособранной базой хуже отказа от
 // сравнения.
@@ -222,6 +232,7 @@ func compareRuns(base, after evalResult) (string, []string) {
 		{"M2", am.M2 <= bm.M2+0.10+evalEps, "<= base+0.10", func(m evalMetrics) float64 { return m.M2 }},
 		{"M3", m3ok, m3rule, func(m evalMetrics) float64 { return m.M3 }},
 		{"M4", am.M4 < bm.M4-evalEps, "< base", func(m evalMetrics) float64 { return m.M4 }},
+		{"failed", failedShare(am) <= failedShare(bm)+0.05+evalEps, "<= base+0.05", failedShare},
 	}
 	for _, row := range rows {
 		switch {
@@ -573,10 +584,12 @@ func TestEvalThreshold(t *testing.T) {
 		base := evalResultFixture("m", "low", 2)
 		// Литералы, не арифметика правила: 0.1+0.2 != 0.3 в float64, и ровно на
 		// этих парах база+порог и буквальная граница расходятся на пару ULP.
-		// Удаление evalEps превращает все три ok в miss - тест это ловит.
-		base.Mean.Metrics = evalMetrics{M1: 0.2, M2: 0.7, M3: 0.34, M4: 0.3, Bugs: 10}
+		// Удаление evalEps превращает все четыре ok в miss - тест это ловит.
+		// Failed/Cases 12/88 и 17/83 дают ту же ULP-границу для доли failed
+		// (12/100=0.12, 17/100=0.17=база+0.05 с плавающей неточностью).
+		base.Mean.Metrics = evalMetrics{M1: 0.2, M2: 0.7, M3: 0.34, M4: 0.3, Bugs: 10, Cases: 88, Failed: 12}
 		after := base
-		after.Mean.Metrics = evalMetrics{M1: 0.3, M2: 0.8, M3: 0.29, M4: 0.299, Bugs: 10}
+		after.Mean.Metrics = evalMetrics{M1: 0.3, M2: 0.8, M3: 0.29, M4: 0.299, Bugs: 10, Cases: 83, Failed: 17}
 		_, reasons := compareRuns(base, after)
 		if len(reasons) != 0 {
 			t.Fatalf("want pass, got reasons: %v", reasons)
@@ -590,6 +603,9 @@ func TestEvalThreshold(t *testing.T) {
 		passing := evalMetrics{
 			M1: base.Mean.Metrics.M1 + 0.20, M2: base.Mean.Metrics.M2, M3: base.Mean.Metrics.M3,
 			M4: base.Mean.Metrics.M4 - 0.20, Bugs: base.Mean.Metrics.Bugs,
+			// База без failed (фикстура их не сеет): 2 из 100 - доля 0.02,
+			// с запасом под порог база+0.05.
+			Cases: 98, Failed: 2,
 		}
 		m4 := passing
 		m4.M4 = base.Mean.Metrics.M4
@@ -599,12 +615,14 @@ func TestEvalThreshold(t *testing.T) {
 		m2.M2 = base.Mean.Metrics.M2 + 0.11
 		m3 := passing
 		m3.M3 = base.Mean.Metrics.M3 - 0.06
+		failed := passing
+		failed.Cases, failed.Failed = 90, 10 // доля 0.10 > база(0)+0.05
 
 		cases := []struct {
 			name  string
 			after evalMetrics
 		}{
-			{"M4", m4}, {"M1", m1}, {"M2", m2}, {"M3", m3},
+			{"M4", m4}, {"M1", m1}, {"M2", m2}, {"M3", m3}, {"failed", failed},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
@@ -643,7 +661,7 @@ func TestEvalThreshold(t *testing.T) {
 				t.Fatal("want invalid for a single-run base")
 			}
 		})
-		t.Run("failed over 10 percent", func(t *testing.T) {
+		t.Run("failed over the limit", func(t *testing.T) {
 			base := evalResultFixture("m", "low", 2)
 			base.Runs[0].Metrics.Failed = 10
 			base.Runs[0].Metrics.Cases = 0
