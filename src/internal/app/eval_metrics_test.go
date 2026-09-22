@@ -146,7 +146,7 @@ func metricsLine(m evalMetrics) string {
 // failedShare - доля failed от всех обращений прогона. Обе стороны могут
 // уложиться в evalFailLimit порознь и всё равно разъехаться: замер не должен
 // разваливаться относительно базы больше чем на 5 п.п. (решение диспетчера
-// после базового прогона, plan-prompts-eval.md §3).
+// после базового прогона, docs/specs/ticket-form.md).
 func failedShare(m evalMetrics) float64 {
 	return share(m.Failed, m.Cases+m.Failed)
 }
@@ -205,8 +205,7 @@ func caseIDs(runs []evalRun) []string {
 
 // compareRuns - таблица база/замер и вердикт по порогу Р-9. Вызывающий уже
 // отсеял сломанную базу (runsValid, до хода модели): здесь она годна. reasons
-// пуст - pass; иначе каждая причина - непройденная проверка (§5
-// plan-prompts-eval).
+// пуст - pass; иначе каждая причина - непройденная проверка (docs/specs/ticket-form.md).
 func compareRuns(base, after evalResult) (string, []string) {
 	var b strings.Builder
 	var reasons []string
@@ -341,7 +340,7 @@ func majorityKind(runs []evalRun) map[string]string {
 // m3Intersection - M3 на пересечении: ID с типом bug в базе и bug/mixed в
 // замере, доля закрытого ядра по всем прогонам замера этих ID. Ломается
 // знаменатель M3 у обычного расчёта, когда часть bug/feature уходит в mixed -
-// это подмножество остаётся сравнимым (plan-prompts-eval.md §4).
+// это подмножество остаётся сравнимым (docs/specs/ticket-form.md).
 func m3Intersection(base, after evalResult) (float64, int) {
 	baseKind := majorityKind(base.Runs)
 	afterKind := majorityKind(after.Runs)
@@ -578,7 +577,7 @@ func hasReason(reasons []string, substr string) bool {
 	return slices.ContainsFunc(reasons, func(r string) bool { return strings.Contains(r, substr) })
 }
 
-// TestEvalThreshold - сценарии проверки eval-compare, plan-prompts-eval-3b.md.
+// TestEvalThreshold - сценарии проверки eval-compare, docs/specs/ticket-form.md.
 func TestEvalThreshold(t *testing.T) {
 	t.Run("boundaries pass exactly at the threshold (сценарий 1)", func(t *testing.T) {
 		base := evalResultFixture("m", "low", 2)

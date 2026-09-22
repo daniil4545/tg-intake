@@ -20,7 +20,7 @@ import (
 	tele "gopkg.in/telebot.v4"
 )
 
-// live_test.go - срез 8 ticket-form (docs/plans/plan-live-run.md): сквозной
+// live_test.go - срез 8 ticket-form (docs/specs/ticket-form.md §7, §10): сквозной
 // прогон диалогов через настоящие хендлеры бота и воркер. Telegram - фейковый
 // (fakeTelegram/screenBot из screen_harness_test.go), OpenRouter и GitHub -
 // настоящие, песочница daniil4545/intake-sandbox. Маршруты NewBot тестом не
@@ -30,14 +30,14 @@ import (
 //
 // Модель недетерминирована и её выбор (был ли раунд, какие ключи спросила,
 // закрыла ли пункт ядра) в тесте не проверяется - только логируется: выбор
-// модели уже измерен статистически в eval (docs/plans/plan-prompts-eval.md).
+// модели уже измерен статистически в eval (docs/specs/ticket-form.md).
 // Живой прогон проверяет ПРОДУКТ - инварианты §2.1/Р-15/R4 архитектуры,
 // которые обязаны держаться при любом выборе модели (assertScreenStripped,
 // pressButton, assertGapConsistency, assertTypeLabels, assertIdeasKept,
 // assertHeadings). Провайдер, не ответивший вовремя, - не повод валить
 // сценарий: waitForCase различает зависший продукт (FAIL) и таймауты модели
 // (Skip) по журналу llm_retry/job_failed (см. решение диспетчера по итогам
-// второго живого прогона, docs/plans/plan-live-run.md §4).
+// второго живого прогона, docs/acceptance/ticket-form.md).
 
 const (
 	// Единственная база, с которой работает live: TRUNCATE в начале не должен

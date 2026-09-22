@@ -177,7 +177,7 @@ func TestEvalRun(t *testing.T) {
 		t.Log("verdict: pass")
 		return
 	}
-	// Порог не взят - код выхода не 0 (§3 plan-prompts-eval.md), последняя
+	// Порог не взят - код выхода не 0 (docs/specs/ticket-form.md), последняя
 	// строка называет причины: t.Fatalf логирует их сам, второй раз не пишем.
 	t.Fatalf("verdict: fail: %s", strings.Join(reasons, "; "))
 }

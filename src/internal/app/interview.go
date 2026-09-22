@@ -1004,9 +1004,8 @@ func (c *Cases) roundAnswered(ctx context.Context, caseID string) (bool, error) 
 	return kind != "" && kind != "round_asked", nil
 }
 
-// lastRoundEvent - последнее событие раунда среди троицы §4 плана
-// plan-skip-questions.md: вопрос, ответ, пропуск. Пустая строка - раунда с
-// таким событием ещё не было.
+// lastRoundEvent - последнее событие раунда среди троицы (docs/specs/ticket-form.md):
+// вопрос, ответ, пропуск. Пустая строка - раунда с таким событием ещё не было.
 func lastRoundEvent(ctx context.Context, db txRunner, caseID string) (string, error) {
 	var kind string
 	err := db.QueryRow(ctx, `
