@@ -413,7 +413,7 @@ func TestScrubContacts(t *testing.T) {
 // метке типа.
 func TestSummaryTitle(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
-	cs := &Case{Kind: "bug"}
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "заявка 4821"}}
 
 	const brief = "Заявка не сохраняется после нажатия «Готово», данные теряются."
 	if err := i.checkSummary(cs, summaryOut{Title: "Заявка не сохраняется", Brief: brief}); err != nil {
@@ -435,7 +435,7 @@ func TestSummaryTitle(t *testing.T) {
 // останавливает тикет, краткое достраивается из первого раздела саммари.
 func TestSummaryBrief(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
-	cs := &Case{Kind: "bug"}
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "заявка 4821"}}
 	title := "Заявка не сохраняется"
 
 	if err := i.checkSummary(cs, summaryOut{Title: title, Brief: "  "}); err != nil {
@@ -532,7 +532,7 @@ func TestSummaryWithoutSections(t *testing.T) {
 // ломали бы тело тикета молча (Р-6).
 func TestCheckSummary(t *testing.T) {
 	i := newTestInterview(t, nil, 2)
-	cs := &Case{Kind: "bug"}
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "сделка 59767187"}}
 
 	section := func(heading string) Section { return Section{Heading: heading, Text: "текст"} }
 	many := func(n int) []Section {
@@ -562,6 +562,7 @@ func TestCheckSummary(t *testing.T) {
 		{"занято Пересечения", []Section{section("Пересечения")}, false},
 		{"пустой текст", []Section{{Heading: "Шаги", Text: " "}}, false},
 		{"заголовок внутри текста", []Section{{Heading: "Шаги", Text: "раз\n## Ссылки\nдва"}}, false},
+		{"номер тикета в начале строки", []Section{{Heading: "Шаги", Text: "раз\n#57 уже закрыт"}}, true},
 		{"ключ другого типа становится свободным разделом", []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр"}}, true},
 	}
 	for _, tt := range tests {
@@ -574,6 +575,15 @@ func TestCheckSummary(t *testing.T) {
 				t.Errorf("саммари с разделами %q принято", tt.sections)
 			}
 		})
+	}
+}
+
+// TestCheckSummaryNeedsBody: без разделов и без ядра тело собрать не из чего,
+// а сырой протокол в него не идёт - он не обезличен моделью.
+func TestCheckSummaryNeedsBody(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	if err := i.checkSummary(&Case{Kind: "bug"}, summaryOut{Title: "Сделка закрыта дублем"}); err == nil {
+		t.Fatal("саммари без разделов и ядра принято")
 	}
 }
 
@@ -1382,7 +1392,7 @@ func TestSummarizeUnclear(t *testing.T) {
 			false, "", "заказ 4821"},
 		{"ядро открыто", "bug", `{"case": "заказ 4821"}`, `["wrong"]`,
 			true, "Не уточнено: что пошло не так.", "заказ 4821"},
-		{"вопрос без ядра и разделов", "question", `{}`, `["question"]`,
+		{"вопрос без ядра", "question", `{}`, `["question"]`,
 			true, "Не уточнено: вопрос.", "форма не сохраняется"},
 	}
 	for n, tt := range tests {
@@ -1394,7 +1404,7 @@ func TestSummarizeUnclear(t *testing.T) {
 				t.Fatalf("set contract: %v", err)
 			}
 			i := newTestInterview(t, cases, 2)
-			i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","brief":"","sections":[]}`)
+			i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","brief":"","sections":[{"key":"","heading":"Суть","text":"форма не сохраняется"}]}`)
 
 			job := Job{ID: int64(100 + n), Kind: JobSummarize, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
 			if err := i.Summarize(ctx, job); err != nil {

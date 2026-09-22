@@ -136,9 +136,8 @@ var titleStopWords = []string{"проблема", "баг", "ошибка", "п�
 // renderSections собирает тело саммари в markdown - тот же текст уходит и в
 // issue, и автору. Разделы идут в порядке модели под её заголовками: форма
 // тикета следует материалу. Закрытый пункт ядра, который модель не покрыла
-// разделом, дописывается из собранного интервью, а нет ни разделов, ни ядра -
-// тело собирается из протокола сырья: ни одна идея не выбрасывается, и держит
-// это Go, а не промт. Раздел по незакрытому пункту остаётся: это слова автора,
+// разделом, дописывается из собранного интервью. Ответ без разделов и без ядра
+// отклоняет checkSummary: сырой протокол не обезличен и в тело не идёт. Раздел по незакрытому пункту остаётся: это слова автора,
 // а строка «Не уточнено» всё равно называет пункт пробелом.
 func (i *Interview) renderSections(cs *Case, sections []Section) string {
 	var b strings.Builder
@@ -154,9 +153,6 @@ func (i *Interview) renderSections(cs *Case, sections []Section) string {
 			continue
 		}
 		fmt.Fprintf(&b, "## %s\n\n%s\n\n", item.Title, scrubContacts(text))
-	}
-	if b.Len() == 0 && strings.TrimSpace(cs.Protocol) != "" {
-		fmt.Fprintf(&b, "## Материал обращения\n\n%s", scrubContacts(strings.TrimSpace(cs.Protocol)))
 	}
 	return strings.TrimSpace(b.String())
 }

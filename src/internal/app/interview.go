@@ -258,12 +258,19 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		}
 	}
 
+	// После пропуска (Р-15) раунд не откроется, и ход без вопросов при открытом
+	// ядре законен: правка саммари иначе упала бы в отказ формата.
+	skipped, err := i.cases.skipped(ctx, i.cases.pool, cs.ID)
+	if err != nil {
+		return err
+	}
+
 	messages, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		return err
 	}
 
-	turn, err := i.askTurn(ctx, cs, messages, fix, asked)
+	turn, err := i.askTurn(ctx, cs, messages, fix, skipped, asked)
 	if err != nil {
 		return err
 	}
@@ -428,7 +435,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 // askTurn спрашивает модель и проверяет её ответ. Невалидный ответ - один
 // повтор: модель промахивается разово, второй такой же промах означает, что
 // дело не в случайности, и работа уходит в повтор очередью.
-func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, fix bool, asked map[string]int) (interviewTurn, error) {
+func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, fix, skipped bool, asked map[string]int) (interviewTurn, error) {
 	req := Request{
 		Step:       stepInterview,
 		CaseID:     cs.ID,
@@ -455,7 +462,7 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, f
 		var turn interviewTurn
 		if err := json.Unmarshal(raw, &turn); err != nil {
 			lastErr = fmt.Errorf("decode turn: %w", err)
-		} else if err := i.checkTurn(cs.Filled, turn, !fix && (cs.Round >= i.rounds || allExhausted(turn.Gaps, asked))); err != nil {
+		} else if err := i.checkTurn(cs.Filled, turn, skipped || !fix && (cs.Round >= i.rounds || allExhausted(turn.Gaps, asked))); err != nil {
 			lastErr = err
 		} else if attempt == 0 && len(turn.Questions) > 0 && !hasSuggestion(turn.Questions) {
 			i.log.Warn("turn_without_suggestion", "step", stepInterview, "case_id", cs.ID,
@@ -813,14 +820,21 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 		return fmt.Errorf("summary brief is %d runes long", utf8.RuneCountInString(brief))
 	}
 
-	// Пустой список разделов не ошибка: тело соберёт renderSections из ядра.
+	// Пустой список разделов не ошибка, пока тело есть из чего собрать: из
+	// закрытого ядра. Без ядра модель обязана дать разделы - протокол сырья в
+	// тело не идёт, он не обезличен.
 	if len(out.Sections) > maxSections {
 		return fmt.Errorf("summary has %d sections", len(out.Sections))
+	}
+	if len(out.Sections) == 0 && !slices.ContainsFunc(i.rules.Items(cs.Kind), func(item ContractItem) bool {
+		return strings.TrimSpace(cs.Filled[item.Key]) != ""
+	}) {
+		return errors.New("summary has no sections and no filled core")
 	}
 	for idx := range out.Sections {
 		s := &out.Sections[idx]
 		if err := checkHeading(s.Heading); err != nil {
-			return err
+			return fmt.Errorf("section %d: %w", idx+1, err)
 		}
 		if s.Key != "" && i.rules.Title(cs.Kind, s.Key) == "" {
 			// Тип менялся по ходу интервью (case_kind_changed): ключ из
@@ -829,13 +843,15 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 			i.log.Warn("section_key_dropped", "case_id", cs.ID, "key", s.Key)
 			s.Key = ""
 		}
+		// В ошибке номер раздела, а не заголовок: она уходит в лог и события, а
+		// заголовок собран из материала и может нести имя клиента.
 		if strings.TrimSpace(s.Text) == "" {
-			return fmt.Errorf("section %q is empty", s.Heading)
+			return fmt.Errorf("section %d is empty", idx+1)
 		}
 		// Строка «## Ссылки» внутри текста стала бы в теле тикета вторым
 		// заголовком и спорила бы с разделом, который пишет Go.
 		if headingLineRe.MatchString(s.Text) {
-			return fmt.Errorf("section %q text has a heading line", s.Heading)
+			return fmt.Errorf("section %d text has a heading line", idx+1)
 		}
 	}
 	return nil
@@ -852,7 +868,7 @@ func checkHeading(heading string) error {
 	case utf8.RuneCountInString(heading) > maxHeading:
 		return fmt.Errorf("section heading is %d runes long", utf8.RuneCountInString(heading))
 	case strings.ContainsAny(heading, "\n\r#<"):
-		return fmt.Errorf("section heading %q has markup", heading)
+		return errors.New("section heading has markup")
 	case slices.ContainsFunc(reservedHeadings, func(r string) bool { return strings.EqualFold(r, heading) }):
 		return fmt.Errorf("section heading %q is reserved", heading)
 	}
@@ -1357,7 +1373,7 @@ func tableRow(line string) string {
 var (
 	headingRe = regexp.MustCompile(`^#{1,6}\s+`)
 	// headingLineRe - строка текста, которую markdown прочтёт заголовком.
-	headingLineRe = regexp.MustCompile(`(?m)^\s*#`)
+	headingLineRe = regexp.MustCompile(`(?m)^\s*#{1,6}(\s|$)`)
 	tableRuleRe   = regexp.MustCompile(`^[\s|:-]+$`)
 	mdLinkRe      = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 )

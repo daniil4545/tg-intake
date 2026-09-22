@@ -308,3 +308,50 @@ func TestPublishMixedLabels(t *testing.T) {
 		t.Errorf("строки пробела нет в теле:\n%s", issue.Body)
 	}
 }
+
+// TestPublishFindsIssueOnFirstAttempt: «Публикую» после исчерпанных повторов
+// ставит новую работу с первой попыткой, а issue прошлой уже мог создаться -
+// маркер ищется и тогда, второго тикета нет.
+func TestPublishFindsIssueOnFirstAttempt(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 7202, First: "Тест"}, "tg-intake", modeTicket)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		UPDATE cases SET status = 'publishing', kind = 'bug', title = 'Статус не сменился',
+		                 summary = '## Сделка', contract = '{"case": "заказ 4821", "wrong": "статус"}'
+		WHERE id = $1`, cs.ID)
+	if err != nil {
+		t.Fatalf("mark publishing: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/daniil4545/tg-intake/issues" {
+			t.Error("создан второй issue")
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/daniil4545/tg-intake/issues" {
+			found := []Issue{{Number: 77, HTMLURL: "https://github.com/daniil4545/tg-intake/issues/77",
+				Body: "тело\n" + caseMarker(cs.ID)}}
+			if err := json.NewEncoder(w).Encode(found); err != nil {
+				t.Errorf("encode issues: %v", err)
+			}
+			return
+		}
+		fmt.Fprint(w, "[]")
+	}))
+	t.Cleanup(server.Close)
+
+	publisher := NewPublisher(cases, NewGitHub("token", server.URL, nil, testLog(t)), testRules(t), testLog(t), 0)
+	job := Job{ID: 1, Kind: JobPublish, Attempts: 1, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := publisher.Run(ctx, job); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got := reload(t, cases, cs.ID); got.IssueNumber != 77 {
+		t.Errorf("обращение не привязано к найденному issue 77: %v", got.IssueNumber)
+	}
+}

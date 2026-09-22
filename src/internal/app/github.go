@@ -561,13 +561,10 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 	// Метка неполноты и строка «Не уточнено» в теле считаются одной функцией по
 	// ядру: расходиться им не с чего.
 	incomplete := p.rules.Unclear(cs.Kind, cs.Filled) != ""
-	// На первой попытке дубля быть не может: создание issue повторов не делает,
-	// и до второй попытки очереди тикета в GitHub нет. Лишний запрос стоил бы
-	// секунды на каждом тикете.
-	if job.Attempts > 1 {
-		if number, url, err = p.gh.FindIssue(ctx, project, marker); err != nil {
-			return err
-		}
+	// Ищем всегда, а не со второй попытки: «Публикую» после исчерпанных повторов
+	// ставит новую работу с нулевым счётом, а issue прошлой уже мог создаться.
+	if number, url, err = p.gh.FindIssue(ctx, project, marker); err != nil {
+		return err
 	}
 	if number == 0 {
 		labels := append(typeLabels(cs.Kind), labelNew, "author:"+author.Slug)

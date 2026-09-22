@@ -488,7 +488,7 @@ func TestFixAfterSkip(t *testing.T) {
 	pool := testPool(t)
 	cases := newTestCases(t, pool, t.TempDir())
 
-	runFix := func(t *testing.T, cs *Case) {
+	runFix := func(t *testing.T, cs *Case, turn string) {
 		i := newTestInterview(t, cases, 3)
 		i.llm = fakeLLM(t, `{"title":"Т","brief":"","sections":[]}`)
 		sumJob := Job{ID: 1, Kind: JobSummarize, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
@@ -502,7 +502,7 @@ func TestFixAfterSkip(t *testing.T) {
 		if err := cases.AddAnswer(ctx, reload(t, cases, cs.ID), "правка"); err != nil {
 			t.Fatalf("add answer: %v", err)
 		}
-		i.llm = fakeLLM(t, skippedTurn)
+		i.llm = fakeLLM(t, turn)
 		job := Job{ID: 2, Kind: JobInterview, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
 		if err := i.Run(ctx, job); err != nil {
 			t.Fatalf("run interview: %v", err)
@@ -514,7 +514,7 @@ func TestFixAfterSkip(t *testing.T) {
 		if err := cases.SkipQuestions(ctx, cs, 1); err != nil {
 			t.Fatalf("skip questions: %v", err)
 		}
-		runFix(t, cs)
+		runFix(t, cs, skippedTurn)
 
 		if n := countEventKind(t, cases, cs.ID, "round_asked"); n != 1 {
 			t.Errorf("событий round_asked: %d, ожидалось 1 (правка не открыла раунд)", n)
@@ -530,9 +530,23 @@ func TestFixAfterSkip(t *testing.T) {
 		}
 	})
 
+	// После пропуска спрашивать уже бессмысленно, и ход без вопросов при
+	// открытом ядре законен: правка автора обязана дойти до саммари.
+	t.Run("правка после пропуска без вопросов", func(t *testing.T) {
+		cs := skipFixture(t, cases, 9013)
+		if err := cases.SkipQuestions(ctx, cs, 1); err != nil {
+			t.Fatalf("skip questions: %v", err)
+		}
+		runFix(t, cs, `{"kind":"bug","filled":[],"gaps":["case"],"ready":false,"questions":[]}`)
+
+		if n := countJobs(t, pool, JobSummarize, cs.ID); n != 1 {
+			t.Errorf("работ саммари после правки: %d, ожидалась 1", n)
+		}
+	})
+
 	t.Run("второе обращение без пропуска", func(t *testing.T) {
 		cs := skipFixture(t, cases, 9012)
-		runFix(t, cs)
+		runFix(t, cs, skippedTurn)
 
 		if n := countEventKind(t, cases, cs.ID, "round_asked"); n != 2 {
 			t.Errorf("событий round_asked без пропуска: %d, ожидалось 2 (раунд 2 задан)", n)
