@@ -3,8 +3,10 @@
 # Все действия только читают: ни одно из них не меняет состояние контура.
 set -euo pipefail
 
-host="${INTAKE_SSH_HOST:-root@203.0.113.10}"
-resource="${INTAKE_RESOURCE:-intake-dev}"
+# Адреса узлов в публичный репозиторий не попадают: хост задаётся окружением,
+# значение - карточка intake-prod базы знаний.
+host="${INTAKE_SSH_HOST:?INTAKE_SSH_HOST не задан: адрес узла - карточка intake-prod базы знаний}"
+resource="${INTAKE_RESOURCE:-intake}"
 action="${1:-}"
 arg="${2:-}"
 
@@ -24,11 +26,12 @@ Read-only actions:
   case <id>        обращение целиком с текстами: протокол, сырьё, события, работы
   job-errors [N]   упавшие и повторяющиеся работы очереди с ошибками
   eval-export      набор для make eval: JSON-строка на обращение, только в файл
+  db-dump          pg_dump -Fc базы в stdout, только в файл: переезд узла
   deploy-config    имена переменных сервиса в Coolify и версия его compose
   deploy-state     образ кандидата на хосте и незавершённые деплои Coolify
 
-INTAKE_SSH_HOST переопределяет root@203.0.113.10.
-INTAKE_RESOURCE переопределяет контур intake-dev.
+INTAKE_SSH_HOST - обязательный адрес узла, user@host.
+INTAKE_RESOURCE переопределяет ресурс Coolify intake.
 USAGE
 }
 
@@ -105,6 +108,11 @@ case "$action" in
         # сразу в файл вне git, а не в терминал. Автор не выгружается: прогону
         # он не нужен, а набор лежит на машине разработчика.
         remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running' >&2; exit 1; }; docker exec \"\$c\" psql -U intake -d intake -tAc \"select json_build_object('id', c.id, 'project', p.slug, 'context', p.context, 'protocol', c.protocol, 'kind', c.kind, 'events', coalesce((select json_agg(json_build_object('kind', e.kind, 'payload', e.payload) order by e.id) from case_events e where e.case_id = c.id and e.kind in ('round_asked', 'answer_given', 'interview_done', 'summary_ready', 'switched_to_ticket')), '[]'::json)) from cases c join projects p on p.id = c.project_id where c.mode = 'ticket' and c.protocol <> '' order by c.created_at\""
+        ;;
+    db-dump)
+        # Окно переезда: база уходит потоком на машину оператора, на сервере
+        # ничего не пишется. Вывод двоичный и с текстами обращений - только в файл.
+        remote="c=\$(docker ps -q $filter --filter 'label=com.docker.compose.service=postgres' | head -1); test -n \"\$c\" || { echo 'postgres=not_running' >&2; exit 1; }; docker exec \"\$c\" pg_dump -U intake -Fc intake"
         ;;
     case-trace)
         # Ход разговора без единого слова автора: вид события, время, статус и
