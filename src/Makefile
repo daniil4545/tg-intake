@@ -9,7 +9,7 @@ endif
 GOOSE := go run -tags='no_sqlite3' github.com/pressly/goose/v3/cmd/goose@v3.27.3
 MIGRATIONS_DIR := ./migrations
 
-.PHONY: run build test test-fast eval eval-compare vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset
+.PHONY: run build test test-fast eval eval-compare vet fmt-check lint commit-check ci-check check-db migrate-up migrate-down migrate-reset live check-live-db
 
 run:
 	go run ./cmd/intake
@@ -40,7 +40,37 @@ eval-compare: eval
 
 # Тег eval: иначе vet и линтер не видят прогон, и он ломается молча.
 vet:
-	go vet -tags eval ./...
+	go vet -tags eval,live ./...
+
+# Срез 8: сквозной прогон через настоящие хендлеры бота, реальный OpenRouter и
+# GitHub-песочницу daniil4545/intake-sandbox. Telegram - фейковый, база -
+# LIVE_DATABASE_URL (только intake_live на localhost:5434, тест сам это
+# проверяет и делает TRUNCATE). GITHUB_TOKEN - обязательно make-переменной
+# командной строки, не через `VAR=... make`: .env этого дерева тоже может
+# держать GITHUB_TOKEN (для контура, не для песочницы), а make отдаёт
+# приоритет файлу (-include .env) над окружением процесса - переменная той же
+# командной строки перекрыла бы правильный токен молча. Верно:
+#   make live GITHUB_TOKEN=$$(gh auth token) LIVE_DATABASE_URL=...
+# Неверно (может тихо взять токен из .env):
+#   GITHUB_TOKEN=$$(gh auth token) make live LIVE_DATABASE_URL=...
+live: check-live-db
+	@$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(LIVE_DATABASE_URL)" up
+	go test -tags live -count=1 -timeout 2h -v -run '^TestLiveRun$$' ./internal/app
+
+check-live-db:
+	@test -n "$(LIVE_DATABASE_URL)" || { echo "LIVE_DATABASE_URL is not set"; exit 1; }
+	@host=$$(printf '%s' "$(LIVE_DATABASE_URL)" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|^.*@||'); \
+	case "$(LIVE_DATABASE_URL)" in \
+	postgres://*@localhost:5434/intake_live*|postgres://*@127.0.0.1:5434/intake_live*) ;; \
+	*) echo "LIVE_DATABASE_URL must point to intake_live on localhost:5434, got host/db: $${host}"; exit 1 ;; \
+	esac
+	@test -n "$(GITHUB_TOKEN)" || { echo "GITHUB_TOKEN is not set"; exit 1; }
+	@if [ "$(origin GITHUB_TOKEN)" = "file" ]; then \
+		echo "GITHUB_TOKEN came from .env (origin=file), not from your command - .env wins over"; \
+		echo "a plain env-prefix, so it may have silently replaced the real token. Pass it as a"; \
+		echo "make variable instead: make live GITHUB_TOKEN=\$$(gh auth token) LIVE_DATABASE_URL=..."; \
+		exit 1; \
+	fi
 
 fmt-check:
 	@out=$$(gofmt -l ./cmd ./internal); \
