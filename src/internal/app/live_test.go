@@ -3,6 +3,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,10 +28,16 @@ import (
 // а не через tb.ProcessUpdate - таблица кнопка->хендлер лежит в голове теста,
 // а не в коде.
 //
-// Модель недетерминирована: сценарии проверяют факты исхода (issue, метки,
-// contract, gaps, события), а не дословные тексты - кроме toast'ов «Принято» и
-// «Этот экран устарел», зафиксированных §11 глобальной спеки и не тронутых
-// срезом 7 (texts.go).
+// Модель недетерминирована и её выбор (был ли раунд, какие ключи спросила,
+// закрыла ли пункт ядра) в тесте не проверяется - только логируется: выбор
+// модели уже измерен статистически в eval (docs/plans/plan-prompts-eval.md).
+// Живой прогон проверяет ПРОДУКТ - инварианты §2.1/Р-15/R4 архитектуры,
+// которые обязаны держаться при любом выборе модели (assertScreenStripped,
+// pressButton, assertGapConsistency, assertTypeLabels, assertIdeasKept,
+// assertHeadings). Провайдер, не ответивший вовремя, - не повод валить
+// сценарий: waitForCase различает зависший продукт (FAIL) и таймауты модели
+// (Skip) по журналу llm_retry/job_failed (см. решение диспетчера по итогам
+// второго живого прогона, docs/plans/plan-live-run.md §4).
 
 const (
 	// Единственная база, с которой работает live: TRUNCATE в начале не должен
@@ -47,10 +55,8 @@ const (
 	liveRounds       = 2
 	liveMaxItems     = 30
 	// Дедлайн одного шага (§3 плана): ход модели, публикация в GitHub. Не
-	// меньше двух подряд попыток работы воркера (jobTimeout каждая, см.
-	// worker.go) с паузой между ними - первая живая попытка на S4 упёрлась в
-	// более короткий предел и упала до второй попытки, хотя продукт был ни
-	// при чём.
+	// меньше двух подряд попыток работы воркера (jobTimeout каждая, worker.go)
+	// с паузой между ними - одной попытки живому прогону не хватает.
 	liveStepDeadline = 2*jobTimeout + 30*time.Second
 	livePoll         = 2 * time.Second
 	// Запас перед дедлайном самого теста (t.Deadline, из -timeout): без него
@@ -77,6 +83,73 @@ type liveEnv struct {
 	cases   *Cases
 	gh      *GitHub
 	project Project
+	// rules - то же ядро контракта, что видит продукт (Publisher, Interview):
+	// gap-инварианты сверяются с ним же, а не с самоотчётом модели (cs.Gaps).
+	rules Contract
+	// logBuf - копия лога прогона для providerTimeouts: различить зависший
+	// продукт и молчащего провайдера можно только по журналу вызовов модели.
+	logBuf *liveLogBuf
+}
+
+// liveLogBuf копит лог прогона (сверх обычной печати в stderr) для
+// providerTimeouts: слог не персистит llm_retry/job_failed в БД, только в
+// журнал, а тесту после таймаута шага нужно посчитать их по конкретному
+// case_id. slog.Handler сам сериализует вызовы Handle одного хендлера, но
+// строку сюда пишет один хендлер, а читает - другая горутина (тест), поэтому
+// свой мьютекс всё равно нужен.
+type liveLogBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *liveLogBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, _ = os.Stderr.Write(p)
+	return l.buf.Write(p)
+}
+
+// countTimeouts - строки лога этого обращения, где не ответил провайдер:
+// llm_retry (сам факт повтора - таймаут или 5xx) и job_failed с явным
+// «deadline exceeded» в причине - остальные job_failed (невалидный ответ
+// модели, дубль ключа) провайдер ни при чём, это выбор модели или наш же
+// checkTurn, и в счёт не идут.
+func (l *liveLogBuf) countTimeouts(caseID string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	marker := "case_id=" + caseID
+	n := 0
+	for _, line := range strings.Split(l.buf.String(), "\n") {
+		if !strings.Contains(line, marker) {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "msg=llm_retry"):
+			n++
+		case strings.Contains(line, "msg=job_failed") && strings.Contains(line, "deadline exceeded"):
+			n++
+		}
+	}
+	return n
+}
+
+// scenarioResult - исход одного сценария для итоговой строки TestLiveRun.
+type scenarioResult struct {
+	name    string
+	skipped bool
+	passed  bool
+}
+
+// runScenario - t.Run с учётом отличия «пропущен провайдером» от «прошёл» и
+// «упал»: обычный t.Run.ok не различает pass и skip.
+func runScenario(t *testing.T, results *[]scenarioResult, name string, fn func(t *testing.T)) {
+	var skipped bool
+	ok := t.Run(name, func(t *testing.T) {
+		defer func() { skipped = t.Skipped() }()
+		fn(t)
+	})
+	*results = append(*results, scenarioResult{name: name, skipped: skipped, passed: ok && !skipped})
 }
 
 func TestLiveRun(t *testing.T) {
@@ -97,8 +170,9 @@ func TestLiveRun(t *testing.T) {
 	}
 
 	// Info, не Warn: разбор живого прогона нужен interview_round (gap_keys) и
-	// llm_call - оба уровня Info.
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// llm_call, оба уровня Info; providerTimeouts читает тот же журнал.
+	logBuf := &liveLogBuf{}
+	log := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if err := SyncProjects(ctx, pool, []ProjectConfig{{
 		Slug: liveProjectSlug, Title: liveProjectTitle,
@@ -169,21 +243,52 @@ func TestLiveRun(t *testing.T) {
 	t.Cleanup(cancelWorker)
 	go RunWorker(workerCtx, pool, log, handlers, cases.HandleFailedJob)
 
-	env := &liveEnv{ft: ft, tb: tb, b: b, cases: cases, gh: gh, project: project}
+	env := &liveEnv{ft: ft, tb: tb, b: b, cases: cases, gh: gh, project: project, rules: rules, logBuf: logBuf}
 
 	// Один автор (id 1, единственный в белом списке) ведёт сценарии по очереди:
 	// активное обращение у него одно, и следующий сценарий начинается только
-	// когда предыдущее опубликовано (или отменено уборкой упавшего - см.
-	// startCase/cancelIfActive).
-	t.Run("S1_bug_R2", func(t *testing.T) { runBugScenario(t, env) })
-	t.Run("S2_feature_R2", func(t *testing.T) { runFeatureScenario(t, env) })
-	t.Run("S3_mixed_R1", func(t *testing.T) {
-		runMixedScenario(t, env, "S3", []string{mixedR1Text}, mixedR1Answers, false)
+	// когда предыдущее опубликовано (или отменено уборкой упавшего/пропущенного
+	// - см. startCase/cancelIfActive).
+	var results []scenarioResult
+	runScenario(t, &results, "S1_bug_R2", func(t *testing.T) { runBugScenario(t, env) })
+	runScenario(t, &results, "S2_feature_R2", func(t *testing.T) { runFeatureScenario(t, env) })
+	runScenario(t, &results, "S3_mixed_R1", func(t *testing.T) {
+		runMixedScenario(t, env, mixedScenario{
+			name:          "S3",
+			material:      []string{mixedR1Text},
+			facts:         mixedR1Facts,
+			materialIdeas: []string{"склонением имени"},
+			factIdeas:     []string{"Анны", "забывают"},
+		})
 	})
-	t.Run("S4_mixed_gate_b", func(t *testing.T) {
-		runMixedScenario(t, env, "S4", mixedSecondMaterial, mixedR1Answers, false)
+	runScenario(t, &results, "S4_mixed_gate_b", func(t *testing.T) {
+		runMixedScenario(t, env, mixedScenario{
+			name:          "S4",
+			material:      mixedSecondMaterial,
+			facts:         mixedR1Facts,
+			materialIdeas: []string{"склонением имени", "комментарием в сделку"},
+			factIdeas:     []string{"Анны", "забывают"},
+		})
 	})
-	t.Run("S5_skip_R5", func(t *testing.T) { runSkipScenario(t, env) })
+	runScenario(t, &results, "S5_skip_R5", func(t *testing.T) { runSkipScenario(t, env) })
+
+	passed, skipped, failed := 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.skipped:
+			skipped++
+		case r.passed:
+			passed++
+		default:
+			failed++
+		}
+	}
+	t.Logf("итог: пройдено %d/%d, пропущено провайдером %d, упало %d",
+		passed, len(results), skipped, failed)
+	if passed == 0 {
+		t.Fatalf("ни один сценарий не дошёл до конца: пройдено 0 из %d (провайдер пропустил %d, упало %d)",
+			len(results), skipped, failed)
+	}
 }
 
 // requireLiveDatabase - защита §2 плана: только intake_live на localhost:5434,
@@ -250,15 +355,15 @@ func startCase(t *testing.T, env *liveEnv) string {
 	if cs == nil {
 		t.Fatal("нет активного обращения после «Создать тикет»")
 	}
-	// Упавший сценарий не должен держать активное обращение автора: следующий
-	// startCase получил бы его вместо нового и упал бы на чужом состоянии.
+	// Упавший или пропущенный по провайдеру сценарий не должен держать
+	// активное обращение автора: следующий startCase получил бы его вместо
+	// нового и упал бы на чужом состоянии.
 	t.Cleanup(func() { cancelIfActive(t, env, cs.ID) })
 	return cs.ID
 }
 
-// cancelIfActive - уборка провалившегося сценария: CancelCase - no-op на уже
-// опубликованном или отменённом обращении, так что вызов безопасен и после
-// успеха сценария тоже.
+// cancelIfActive - уборка: CancelCase - no-op на уже опубликованном или
+// отменённом обращении, так что вызов безопасен и после успеха сценария тоже.
 func cancelIfActive(t *testing.T, env *liveEnv, caseID string) {
 	t.Helper()
 	cs, err := env.cases.Load(context.Background(), caseID)
@@ -307,9 +412,11 @@ func stepDeadline(t *testing.T) time.Time {
 // статус - до неё автору нечего было бы нажимать. Как только новый экран
 // найден, прошлый (prevScreen) обязан быть уже снят - assertScreenStripped:
 // это и есть проверяемая часть инварианта §3 «не больше одного живого
-// inline-экрана» (устройство кода гарантирует, что кнопки несёт только
-// текущий cases.screen_msg, остальные экраны - навигация, правящаяся на месте,
-// без накопления новых сообщений с клавиатурой).
+// inline-экрана».
+//
+// Не дождались за liveStepDeadline: если в логе этого обращения есть следы
+// того, что провайдер не отвечал (llm_retry, job_failed с deadline exceeded) -
+// это не продукт виноват, Skip; иначе - зависание продукта, Fatal.
 func waitForCase(t *testing.T, env *liveEnv, caseID string, prevScreen int, match func(*Case) bool) *Case {
 	t.Helper()
 
@@ -323,6 +430,9 @@ func waitForCase(t *testing.T, env *liveEnv, caseID string, prevScreen int, matc
 			return cs
 		}
 		if time.Now().After(deadline) {
+			if n := env.logBuf.countTimeouts(caseID); n > 0 {
+				t.Skipf("провайдер не ответил: %d таймаутов (case %s)", n, caseID)
+			}
 			t.Fatalf("не дождались шага обращения %s за %s: status=%s round=%d screen=%d",
 				caseID, liveStepDeadline, cs.Status, cs.Round, cs.Screen)
 		}
@@ -374,35 +484,65 @@ func publish(t *testing.T, env *liveEnv, caseID string, screenID int, closeAfter
 	return cs
 }
 
-// buildAnswer собирает ответ автора одним текстом (§3 плана): заготовка на
-// известный ключ вопроса, «Не знаю» на незнакомый.
-func buildAnswer(questions []Question, answers map[string]string) string {
-	if len(questions) == 0 {
-		return "Не знаю"
-	}
-	lines := make([]string, 0, len(questions))
-	for _, q := range questions {
-		if a, ok := answers[q.Key]; ok && a != "" {
-			lines = append(lines, a)
-		} else {
-			lines = append(lines, "Не знаю")
+// factKeyOrder - порядок ядра плюс уточнение, для стабильного порядка строк
+// собранного ответа.
+var factKeyOrder = []string{"case", "wrong", "need", "why", "detail"}
+
+// answerWithFacts - раунд отвечается всеми подготовленными фактами разом, а
+// не только тем, что совпадает с ключом конкретного вопроса модели: модель
+// может спросить не под тем ключом, под которым заготовлен факт (в живом
+// прогоне спрашивала под case то, что было заготовлено под wrong), или
+// повторно попросить то, что уже есть в материале. Какой именно раунд и
+// какие ключи задала модель - решение модели, оно идёт в t.Logf вызывающим,
+// не сюда. Ответ - одним текстом (§3 плана).
+func answerWithFacts(facts map[string]string) string {
+	lines := make([]string, 0, len(facts))
+	for _, key := range factKeyOrder {
+		if v := facts[key]; v != "" {
+			lines = append(lines, v)
 		}
+	}
+	if len(lines) == 0 {
+		return "Не знаю"
 	}
 	return strings.Join(lines, "\n")
 }
 
-// pressButton нажимает инлайн-кнопку через хендлер бота и проверяет §3: на
-// нажатие приходится ровно один answerCallbackQuery - ноль (не ответили) и
-// два (двойной ответ - его отдельно ловит cleanup фейка, assertSingleAnswers)
-// одинаково провал, поэтому считается прирост числа вызовов по конкретному
-// нажатию, а не последний тост всего прогона. wantToast пустой - текст не
-// сверяется (стиль тостов вне §11 меняет срез 7), иначе - дословно.
+// driveToSummary ведёt обращение до саммари, отвечая на любые раунды
+// подготовленными фактами и логируя, что именно спросила модель (§4 плана,
+// решение диспетчера по итогам второго прогона: выбор модели не проверяется,
+// только логируется). firstRoundScreen/firstRound - экран и номер первого
+// раунда, 0 - раунда не было вовсе.
+func driveToSummary(t *testing.T, env *liveEnv, name, caseID string, prevScreen int, facts map[string]string,
+) (cs *Case, firstRoundScreen, firstRound int) {
+	t.Helper()
+
+	priorRound := 0
+	for {
+		var roundOccurred bool
+		cs, roundOccurred = waitForRoundOrSummary(t, env, caseID, priorRound, prevScreen)
+		if !roundOccurred {
+			return cs, firstRoundScreen, firstRound
+		}
+		questions := mustQuestions(t, env.cases, caseID)
+		t.Logf("%s: раунд %d, вопросы модели %v", name, cs.Round, questionKeys(questions))
+		if firstRoundScreen == 0 {
+			firstRoundScreen, firstRound = cs.Screen, cs.Round
+		}
+		must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, answerWithFacts(facts))), "onItem answer")
+		prevScreen, priorRound = cs.Screen, cs.Round
+	}
+}
+
 func pressButton(t *testing.T, env *liveEnv, handler func(tele.Context) error, screenID int, data, wantToast string) {
 	t.Helper()
 
 	before := len(env.ft.methodCalls("answerCallbackQuery"))
 	must(t, handler(callbackCtx(env.tb, liveAuthorID, screenID, data)), "press")
 
+	// §2.1: ровно один answerCallbackQuery на нажатие - ноль (не ответили) и
+	// два (двойной ответ - его ещё отдельно ловит cleanup фейка,
+	// assertSingleAnswers) одинаково провал.
 	calls := env.ft.methodCalls("answerCallbackQuery")
 	if len(calls) != before+1 {
 		t.Fatalf("answerCallbackQuery на нажатие: было %d, стало %d, ожидался прирост ровно на 1", before, len(calls))
@@ -434,26 +574,72 @@ func fetchIssue(t *testing.T, env *liveEnv, cs *Case) Issue {
 	return issue
 }
 
-// assertGapConsistency - R4/Р-13: метка incomplete, строка «Не уточнено:» в
-// теле и непустой gaps идут втроём или не идут вовсе; старая строка «Не
-// разобрано» не должна встречаться нигде (R4).
-func assertGapConsistency(t *testing.T, cs *Case, issue Issue) {
+// assertGapConsistency - R4: метка incomplete и строка «Не уточнено:» в теле
+// есть тогда и только тогда, когда ядро открыто по rules.Unclear - тому же
+// расчёту, которым Publisher решает это на публикации, а не по самоотчёту
+// модели (cs.Gaps может с ним разойтись, и это не повод отказа - см.
+// logCoreGaps). Старая строка «Не разобрано» (R4) не должна встречаться.
+func assertGapConsistency(t *testing.T, rules Contract, cs *Case, issue Issue) {
 	t.Helper()
 
-	hasGaps := len(cs.Gaps) > 0
-	if hasGaps != cs.Incomplete {
-		t.Errorf("incomplete=%t не совпадает с gaps=%v", cs.Incomplete, cs.Gaps)
+	wantIncomplete := rules.Unclear(cs.Kind, cs.Filled) != ""
+	if cs.Incomplete != wantIncomplete {
+		t.Errorf("cs.incomplete=%t, по открытому ядру (Unclear) ожидалось %t", cs.Incomplete, wantIncomplete)
 	}
 	hasLabel := slices.Contains(issue.LabelNames(), "incomplete")
-	if hasLabel != hasGaps {
-		t.Errorf("метка incomplete=%t, ожидалась %t (gaps=%v)", hasLabel, hasGaps, cs.Gaps)
+	if hasLabel != wantIncomplete {
+		t.Errorf("метка incomplete=%t, ожидалась %t", hasLabel, wantIncomplete)
 	}
 	hasLine := strings.Contains(issue.Body, "Не уточнено:")
-	if hasLine != hasGaps {
-		t.Errorf("строка «Не уточнено:» в теле=%t, ожидалась %t", hasLine, hasGaps)
+	if hasLine != wantIncomplete {
+		t.Errorf("строка «Не уточнено:» в теле=%t, ожидалась %t", hasLine, wantIncomplete)
 	}
 	if strings.Contains(issue.Body, "Не разобрано") {
 		t.Errorf("тело несёт старую строку «Не разобрано» (R4): %s", issue.Body)
+	}
+}
+
+// assertTypeLabels - метки типа отражают cs.Kind, каким бы он ни оказался
+// (выбор модели логируется отдельно, не здесь): mixed несёт обе метки, любой
+// другой kind - ровно свою и не чужую.
+func assertTypeLabels(t *testing.T, cs *Case, issue Issue) {
+	t.Helper()
+
+	labels := issue.LabelNames()
+	want := typeLabels(cs.Kind)
+	for _, w := range want {
+		if !slices.Contains(labels, w) {
+			t.Errorf("метки issue: %v, ожидалась %q по kind=%q", labels, w, cs.Kind)
+		}
+	}
+	for _, other := range []string{"type:bug", "type:feature", "type:question"} {
+		if !slices.Contains(want, other) && slices.Contains(labels, other) {
+			t.Errorf("метки issue: %v несёт лишнюю %q при kind=%q", labels, other, cs.Kind)
+		}
+	}
+}
+
+// assertIdeasKept - «Ни одна идея не выбрасывается» (architecture.md):
+// ключевая фраза каждой мысли, которую тест отправил как автор, обязана
+// остаться в теле итогового issue - не дословно всей репликой (саммари
+// пересказывает своими словами), а этим коротким литеральным фрагментом
+// (номер сделки, точная цитата статуса, конкретная деталь), который
+// формулировка модели меняет с наименьшей вероятностью.
+func assertIdeasKept(t *testing.T, name string, phrases []string, issue Issue) {
+	t.Helper()
+	for _, phrase := range phrases {
+		if !strings.Contains(issue.Body, phrase) {
+			t.Errorf("%s: идея автора потеряна - %q нет в теле issue", name, phrase)
+		}
+	}
+}
+
+// logCoreGaps - какие пункты ядра модель не закрыла. Это выбор модели, не
+// инвариант продукта (см. заголовок файла) - строка в лог, не Errorf.
+func logCoreGaps(t *testing.T, name string, rules Contract, cs *Case) {
+	t.Helper()
+	if missing := rules.Missing(cs.Kind, cs.Filled); len(missing) > 0 {
+		t.Logf("%s: отклонение модели от R1/R2 - ядро не закрыто по %v (gaps модели=%v)", name, missing, cs.Gaps)
 	}
 }
 
@@ -526,9 +712,12 @@ func eventCounts(t *testing.T, cases *Cases, caseID string) string {
 	return strings.Join(parts, ",")
 }
 
-// runBugScenario - S1, R2 баг: материал закрывает case и wrong с первого
-// хода, раунда не должно быть (round_asked=0).
+// runBugScenario - S1, R2 баг: материал уже закрывает case и wrong. Раунда
+// может и не быть (round_asked=0 - happy path R2), а может, ниже не
+// проверяется (см. заголовок файла) - если раунд случился, отвечаем теми же
+// фактами и идём дальше.
 func runBugScenario(t *testing.T, env *liveEnv) {
+	const name = "S1"
 	caseID := startCase(t, env)
 	cs := sendMaterial(t, env, caseID, []string{
 		"https://crm.example.com/deal/59767187",
@@ -538,41 +727,32 @@ func runBugScenario(t *testing.T, env *liveEnv) {
 	prevScreen := cs.Screen
 	finishCollect(t, env)
 
-	cs, roundOccurred := waitForRoundOrSummary(t, env, caseID, 0, prevScreen)
-	if roundOccurred {
-		// Дальше вести нечего: сценарий проверяет именно прогон без раунда,
-		// а с раундом это уже не S1.
-		t.Fatalf("ожидался прогон без раунда (round_asked=0), но раунд %d случился: %+v",
-			cs.Round, mustQuestions(t, env.cases, caseID))
+	facts := map[string]string{
+		"case":  "Сделка 59767187, вчера",
+		"wrong": "Закрылась статусом «Дублем», хотя должна была перейти в «Встреча назначена»",
 	}
-	if cs.Kind != "bug" {
-		t.Errorf("kind=%q, ожидался bug", cs.Kind)
-	}
-	if cs.Filled["case"] == "" || cs.Filled["wrong"] == "" {
-		t.Errorf("ядро не закрыто: filled=%v", cs.Filled)
-	}
-	if len(cs.Gaps) != 0 {
-		t.Errorf("gaps=%v, ожидался пустой список", cs.Gaps)
-	}
+	cs, _, _ = driveToSummary(t, env, name, caseID, prevScreen, facts)
+	logCoreGaps(t, name, env.rules, cs)
 	assertHeadings(t, env.cases, caseID)
 
 	cs = publish(t, env, caseID, cs.Screen, true)
 
 	issue := fetchIssue(t, env, cs)
-	labels := issue.LabelNames()
-	if !slices.Contains(labels, "type:bug") || slices.Contains(labels, "type:feature") {
-		t.Errorf("метки issue: %v, ожидался только type:bug", labels)
-	}
-	assertGapConsistency(t, cs, issue)
+	assertTypeLabels(t, cs, issue)
+	assertGapConsistency(t, env.rules, cs, issue)
+	assertIdeasKept(t, name, []string{"59767187", "Дублем"}, issue)
 
-	t.Logf("S1: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
-		cs.IssueNumber, cs.Kind, cs.Gaps, labels, eventCounts(t, env.cases, caseID), t.Failed())
+	t.Logf("%s: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
+		name, cs.IssueNumber, cs.Kind, cs.Gaps, issue.LabelNames(), eventCounts(t, env.cases, caseID), t.Failed())
 }
 
-// runFeatureScenario - S2, R2 пожелание: не больше одного раунда с вопросом
-// detail; повторное «Отправить как есть» после ответа - toast «Этот экран
-// устарел», без нового события пропуска.
+// runFeatureScenario - S2, R2 пожелание. Раундов не бывает больше 2
+// (INTERVIEW_ROUNDS, config.go) - продукт сам форсирует саммари; сколько их
+// было и какие ключи спросила модель - в t.Logf. Устаревшая кнопка «Отправить
+// как есть» на уже отвеченном раунде - продуктовый инвариант, проверяется
+// независимо от того, что именно спросила модель.
 func runFeatureScenario(t *testing.T, env *liveEnv) {
+	const name = "S2"
 	caseID := startCase(t, env)
 	cs := sendMaterial(t, env, caseID, []string{
 		"Руками отказываю лидам не под портрет, например финансовый аутсорсинг. " +
@@ -581,88 +761,51 @@ func runFeatureScenario(t *testing.T, env *liveEnv) {
 	prevScreen := cs.Screen
 	finishCollect(t, env)
 
-	cs, roundOccurred := waitForRoundOrSummary(t, env, caseID, 0, prevScreen)
-	if roundOccurred {
-		// R2 обязателен только на числе раундов - какой именно ключ спросит
-		// модель, недетерминировано; ключи - в лог, а не в жёсткую проверку.
-		if cs.Round > 1 {
-			t.Errorf("раундов %d, ожидался не больше 1", cs.Round)
-		}
-		questions := mustQuestions(t, env.cases, caseID)
-		t.Logf("S2: раунд %d, вопросы %v", cs.Round, questionKeys(questions))
-		roundScreen := cs.Screen
-		answer := buildAnswer(questions, map[string]string{
-			"detail": "Признак - деятельность вне маркетинговых агентств и студий разработки",
-		})
-		must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, answer)), "onItem answer")
+	facts := map[string]string{
+		"need":   "Бот сам отказывает лидам вне портрета по скрипту и ставит сделке статус «нерелевантен лид»",
+		"why":    "Сейчас отказывают руками",
+		"detail": "Признак - деятельность вне маркетинговых агентств и студий разработки",
+	}
+	cs, roundScreen, round := driveToSummary(t, env, name, caseID, prevScreen, facts)
 
+	ideas := []string{"нерелевантен лид"}
+	if roundScreen != 0 {
+		ideas = append(ideas, "маркетинговых агентств")
+		// Р-15/правило 3 §2.1: кнопка «Отправить как есть» на уже отвеченном
+		// раунде - устаревшая, без нового события пропуска.
 		before := countEventKind(t, env.cases, caseID, "questions_skipped")
-		pressSkip(t, env, roundScreen, cs.Round, "Этот экран устарел")
+		pressSkip(t, env, roundScreen, round, "Этот экран устарел")
 		if after := countEventKind(t, env.cases, caseID, "questions_skipped"); after != before {
-			t.Errorf("skip после ответа завёл событие пропуска: было %d, стало %d", before, after)
+			t.Errorf("%s: skip на отвеченном раунде завёл событие пропуска: было %d, стало %d", name, before, after)
 		}
-
-		cs, _ = waitForRoundOrSummary(t, env, caseID, cs.Round, roundScreen)
+	} else {
+		t.Logf("%s: раунда не было - модель закрыла ядро сразу материалом", name)
 	}
-	if cs.Status != statusSummary {
-		t.Fatalf("статус перед публикацией: %s, ожидался %s", cs.Status, statusSummary)
-	}
-	if cs.Kind != "feature" {
-		t.Errorf("kind=%q, ожидался feature", cs.Kind)
-	}
-	if cs.Filled["need"] == "" || cs.Filled["why"] == "" {
-		t.Errorf("ядро не закрыто: filled=%v", cs.Filled)
-	}
+	logCoreGaps(t, name, env.rules, cs)
 	assertHeadings(t, env.cases, caseID)
 
 	cs = publish(t, env, caseID, cs.Screen, true)
 
 	issue := fetchIssue(t, env, cs)
-	labels := issue.LabelNames()
-	if !slices.Contains(labels, "type:feature") || slices.Contains(labels, "type:bug") {
-		t.Errorf("метки issue: %v, ожидался только type:feature", labels)
-	}
-	assertGapConsistency(t, cs, issue)
+	assertTypeLabels(t, cs, issue)
+	assertGapConsistency(t, env.rules, cs, issue)
+	assertIdeasKept(t, name, ideas, issue)
 
-	t.Logf("S2: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
-		cs.IssueNumber, cs.Kind, cs.Gaps, labels, eventCounts(t, env.cases, caseID), t.Failed())
+	t.Logf("%s: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
+		name, cs.IssueNumber, cs.Kind, cs.Gaps, issue.LabelNames(), eventCounts(t, env.cases, caseID), t.Failed())
 }
 
 // mixedR1Text - дословный пример R1 из §10 глобальной спеки.
 const mixedR1Text = "Напоминание пришло с неверным склонением имени, и заодно " +
 	"пусть напоминание уходит за час, а не за день."
 
-// mixedR1Answers - заготовки на case, wrong и why, которых материалу не
-// хватает: see S3/S4 таблицы §4 плана среза. need закрывается материалом
-// («пусть напоминание уходит за час») без отдельного вопроса.
-var mixedR1Answers = map[string]string{
+// mixedR1Facts - заготовки на case, wrong и why, которых материалу не
+// хватает (§4 плана): need закрывается материалом («пусть напоминание уходит
+// за час») без отдельного вопроса.
+var mixedR1Facts = map[string]string{
 	"case":  "Вчера, напоминание о встрече",
 	"wrong": `Имя пришло как "Анны" вместо "Анна"`,
 	"why":   "Чтобы клиент не забыл: за день забывают",
-}
-
-// mixedCoreOrder - порядок ядра смеси, как в rules/contract.json.
-var mixedCoreOrder = []string{"case", "wrong", "need", "why"}
-
-// mixedAnswer - раунд смеси отвечается всеми заготовками ядра разом, если
-// хоть один вопрос назвал ключ ядра: модель раунда спрашивает под одним
-// ключом (например case) то, что на деле относится к другому (wrong), и
-// ответ строго по ключу конкретного вопроса терял бы эту идею. Одним текстом
-// (§3 плана), как и обычный buildAnswer.
-func mixedAnswer(questions []Question, coreAnswers map[string]string) string {
-	for _, q := range questions {
-		if _, ok := coreAnswers[q.Key]; !ok {
-			continue
-		}
-		lines := make([]string, 0, len(mixedCoreOrder))
-		for _, key := range mixedCoreOrder {
-			if a := coreAnswers[key]; a != "" {
-				lines = append(lines, a)
-			}
-		}
-		return strings.Join(lines, "\n")
-	}
-	return buildAnswer(questions, coreAnswers)
 }
 
 // mixedSecondMaterial - S4, вторая смесь для гейта B: тот же случай, что и
@@ -676,102 +819,110 @@ var mixedSecondMaterial = []string{
 	"И заодно пусть бот при закрытии сделки пишет причину комментарием в сделку.",
 }
 
+// mixedScenario - вход S3/S4: материал, факты на случай раунда, ключевые
+// фразы материала (проверяются всегда) и фактов (только если раунд
+// действительно случился и факты ушли автору), и остаётся ли issue открытым
+// для гейта B.
+type mixedScenario struct {
+	name          string
+	material      []string
+	facts         map[string]string
+	materialIdeas []string
+	factIdeas     []string
+	closeAfter    bool
+}
+
 // runMixedScenario - S3 и S4: смесь бага и пожелания, issue с двумя метками
 // типа. Issue остаётся открытым - его читает владелец на гейте B (§7 плана,
 // не автоматизируется).
-func runMixedScenario(t *testing.T, env *liveEnv, name string, material []string,
-	answers map[string]string, closeAfter bool) {
+func runMixedScenario(t *testing.T, env *liveEnv, sc mixedScenario) {
 	caseID := startCase(t, env)
-	cs := sendMaterial(t, env, caseID, material)
-	prevScreen, priorRound := cs.Screen, 0
+	cs := sendMaterial(t, env, caseID, sc.material)
+	prevScreen := cs.Screen
 	finishCollect(t, env)
 
-	for {
-		var roundOccurred bool
-		cs, roundOccurred = waitForRoundOrSummary(t, env, caseID, priorRound, prevScreen)
-		if !roundOccurred {
-			break
-		}
-		questions := mustQuestions(t, env.cases, caseID)
-		t.Logf("%s: раунд %d, вопросы %v", name, cs.Round, questionKeys(questions))
-		answer := mixedAnswer(questions, answers)
-		must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, answer)), "onItem answer")
-		prevScreen, priorRound = cs.Screen, cs.Round
+	cs, roundScreen, _ := driveToSummary(t, env, sc.name, caseID, prevScreen, sc.facts)
+	ideas := slices.Clone(sc.materialIdeas)
+	if roundScreen != 0 {
+		ideas = append(ideas, sc.factIdeas...)
+	} else {
+		t.Logf("%s: раунда не было - материал закрыл ядро сразу", sc.name)
 	}
-
-	if cs.Kind != "mixed" {
-		t.Errorf("%s: kind=%q, ожидался mixed", name, cs.Kind)
-	}
-	for _, key := range []string{"case", "wrong", "need", "why"} {
-		if cs.Filled[key] == "" {
-			t.Errorf("%s: пункт ядра %q не закрыт: filled=%v", name, key, cs.Filled)
-		}
-	}
+	logCoreGaps(t, sc.name, env.rules, cs)
 	assertHeadings(t, env.cases, caseID)
 
-	cs = publish(t, env, caseID, cs.Screen, closeAfter)
+	cs = publish(t, env, caseID, cs.Screen, sc.closeAfter)
 
 	issue := fetchIssue(t, env, cs)
-	labels := issue.LabelNames()
-	if !slices.Contains(labels, "type:bug") || !slices.Contains(labels, "type:feature") {
-		t.Errorf("%s: метки issue: %v, ожидались обе type:bug и type:feature", name, labels)
-	}
-	assertGapConsistency(t, cs, issue)
+	assertTypeLabels(t, cs, issue)
+	assertGapConsistency(t, env.rules, cs, issue)
+	assertIdeasKept(t, sc.name, ideas, issue)
 
-	t.Logf("%s: ГЕЙТ B - issue=#%d %s kind=%s gaps=%v labels=%v events(%s) failed=%t",
-		name, cs.IssueNumber, issue.HTMLURL, cs.Kind, cs.Gaps, labels, eventCounts(t, env.cases, caseID), t.Failed())
+	tag := ""
+	if !sc.closeAfter {
+		tag = "ГЕЙТ B - "
+	}
+	t.Logf("%s: %sissue=#%d %s kind=%s gaps=%v labels=%v events(%s) failed=%t",
+		sc.name, tag, cs.IssueNumber, issue.HTMLURL, cs.Kind, cs.Gaps, issue.LabelNames(),
+		eventCounts(t, env.cases, caseID), t.Failed())
 }
 
-// runSkipScenario - S5, R5 пропуск: раунд 1 обязателен, «Отправить как есть»
-// закрывает его без ответа, повтор той же кнопки на устаревшем экране даёт
-// «Этот экран устарел», а правка текстом после саммари пересобирает саммари
-// без нового раунда (Р-15).
+// runSkipScenario - S5, R5 пропуск. Раунд нужен, чтобы вообще было что
+// пропускать кнопкой «Отправить как есть»: если модель ушла в саммари без
+// раунда, пропуск проверить не на чем - это логируется, а не отказ, и
+// сценарий идёт к публикации сразу. Если раунд был, инварианты продукта:
+// повтор той же кнопки на уже неживом экране - «Этот экран устарел», а
+// правка текстом после пропуска пересобирает саммари без нового раунда
+// (Р-15) - раунда не добавляет.
 func runSkipScenario(t *testing.T, env *liveEnv) {
+	const name = "S5"
 	caseID := startCase(t, env)
 	cs := sendMaterial(t, env, caseID, []string{"Напоминания опять приходят неправильно"})
 	prevScreen := cs.Screen
 	finishCollect(t, env)
 
 	cs, roundOccurred := waitForRoundOrSummary(t, env, caseID, 0, prevScreen)
-	if !roundOccurred {
-		t.Fatal("ожидался раунд 1, саммари пришло без вопросов")
-	}
-	roundScreen, round := cs.Screen, cs.Round
+	ideas := []string{"приходят неправильно"}
 
-	pressSkip(t, env, roundScreen, round, "Принято")
+	if roundOccurred {
+		questions := mustQuestions(t, env.cases, caseID)
+		t.Logf("%s: раунд %d, вопросы модели %v", name, cs.Round, questionKeys(questions))
+		roundScreen, round := cs.Screen, cs.Round
 
-	cs = waitForCase(t, env, caseID, roundScreen, func(cs *Case) bool { return cs.Status == statusSummary })
-	if n := countEventKind(t, env.cases, caseID, "questions_skipped"); n != 1 {
-		t.Errorf("событий пропуска: %d, ожидалась 1", n)
-	}
-	summaryScreen := cs.Screen
+		pressSkip(t, env, roundScreen, round, "Принято")
+		cs = waitForCase(t, env, caseID, roundScreen, func(cs *Case) bool { return cs.Status == statusSummary })
+		if n := countEventKind(t, env.cases, caseID, "questions_skipped"); n != 1 {
+			t.Errorf("%s: событий пропуска: %d, ожидалась 1", name, n)
+		}
+		summaryScreen := cs.Screen
 
-	// Повтор той же кнопки на уже неживом (раундовом) экране - устарел.
-	pressSkip(t, env, roundScreen, round, "Этот экран устарел")
-	if n := countEventKind(t, env.cases, caseID, "questions_skipped"); n != 1 {
-		t.Errorf("повторный пропуск завёл второе событие: событий %d, ожидалась 1", n)
-	}
+		// Повтор той же кнопки на уже неживом (раундовом) экране - устарел.
+		pressSkip(t, env, roundScreen, round, "Этот экран устарел")
+		if n := countEventKind(t, env.cases, caseID, "questions_skipped"); n != 1 {
+			t.Errorf("%s: повторный пропуск завёл второе событие: событий %d, ожидалась 1", name, n)
+		}
 
-	must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, "Речь про напоминание о встрече за день")), "onItem fix")
-	cs = waitForCase(t, env, caseID, summaryScreen, func(cs *Case) bool { return cs.Status == statusSummary })
-	if n := countEventKind(t, env.cases, caseID, "round_asked"); n != 1 {
-		t.Errorf("после правки после пропуска открылся новый раунд: событий round_asked %d, ожидалась 1", n)
+		must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, "Речь про напоминание о встрече за день")), "onItem fix")
+		cs = waitForCase(t, env, caseID, summaryScreen, func(cs *Case) bool { return cs.Status == statusSummary })
+		if n := countEventKind(t, env.cases, caseID, "round_asked"); n != 1 {
+			t.Errorf("%s: правка после пропуска открыла новый раунд: событий round_asked %d, ожидалась 1", name, n)
+		}
+		ideas = append(ideas, "встрече за день")
+	} else {
+		t.Logf("%s: раунда не было - пропуск проверить не на чем, модель ушла сразу в саммари", name)
 	}
-	if !cs.Incomplete || len(cs.Gaps) == 0 {
-		t.Errorf("исход: incomplete=%t gaps=%v, ожидались непустые (ядро так и не закрыто)", cs.Incomplete, cs.Gaps)
-	}
+	logCoreGaps(t, name, env.rules, cs)
 	assertHeadings(t, env.cases, caseID)
 
 	cs = publish(t, env, caseID, cs.Screen, true)
 
 	issue := fetchIssue(t, env, cs)
-	assertGapConsistency(t, cs, issue)
-	if !slices.Contains(issue.LabelNames(), "incomplete") {
-		t.Errorf("метки issue: %v, ожидалась incomplete", issue.LabelNames())
-	}
+	assertTypeLabels(t, cs, issue)
+	assertGapConsistency(t, env.rules, cs, issue)
+	assertIdeasKept(t, name, ideas, issue)
 
-	t.Logf("S5: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
-		cs.IssueNumber, cs.Kind, cs.Gaps, issue.LabelNames(), eventCounts(t, env.cases, caseID), t.Failed())
+	t.Logf("%s: issue=#%d kind=%s gaps=%v labels=%v events(%s) failed=%t",
+		name, cs.IssueNumber, cs.Kind, cs.Gaps, issue.LabelNames(), eventCounts(t, env.cases, caseID), t.Failed())
 }
 
 func mustQuestions(t *testing.T, cases *Cases, caseID string) []Question {
