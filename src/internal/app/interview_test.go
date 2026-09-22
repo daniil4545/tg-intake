@@ -500,7 +500,7 @@ func TestCheckSummary(t *testing.T) {
 		{"занято Пересечения", []Section{section("Пересечения")}, false},
 		{"пустой текст", []Section{{Heading: "Шаги", Text: " "}}, false},
 		{"заголовок внутри текста", []Section{{Heading: "Шаги", Text: "раз\n## Ссылки\nдва"}}, false},
-		{"ключ другого типа", []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр"}}, false},
+		{"ключ другого типа становится свободным разделом", []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр"}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -512,6 +512,28 @@ func TestCheckSummary(t *testing.T) {
 				t.Errorf("саммари с разделами %q принято", tt.sections)
 			}
 		})
+	}
+}
+
+// TestCheckSummary_ForeignKeyDropped: тип менялся по ходу интервью
+// (case_kind_changed), и раздел под ключ прежнего типа не должен ронять
+// саммари на пустом месте - ключ снимается, а текст остаётся в теле тикета.
+func TestCheckSummary_ForeignKeyDropped(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	cs := &Case{Kind: "bug"}
+	out := summaryOut{
+		Title:    "Сделка закрыта дублем",
+		Sections: []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр по статусу"}},
+	}
+
+	if err := i.checkSummary(cs, out); err != nil {
+		t.Fatalf("саммари с чужим ключом отклонено: %v", err)
+	}
+	if out.Sections[0].Key != "" {
+		t.Fatalf("ключ %q не снят", out.Sections[0].Key)
+	}
+	if body := i.renderSections(cs, out.Sections); !strings.Contains(body, "фильтр по статусу") {
+		t.Fatalf("текст раздела потерян в теле:\n%s", body)
 	}
 }
 

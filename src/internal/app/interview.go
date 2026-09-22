@@ -781,12 +781,17 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 	if len(out.Sections) > maxSections {
 		return fmt.Errorf("summary has %d sections", len(out.Sections))
 	}
-	for _, s := range out.Sections {
+	for idx := range out.Sections {
+		s := &out.Sections[idx]
 		if err := checkHeading(s.Heading); err != nil {
 			return err
 		}
 		if s.Key != "" && i.rules.Title(cs.Kind, s.Key) == "" {
-			return fmt.Errorf("section key %q is not in contract", s.Key)
+			// Тип менялся по ходу интервью (case_kind_changed): ключ из
+			// контракта прежнего типа - не повод отклонять весь ответ и
+			// жечь попытки, текст остаётся обычным разделом.
+			i.log.Warn("section_key_dropped", "case_id", cs.ID, "key", s.Key)
+			s.Key = ""
 		}
 		if strings.TrimSpace(s.Text) == "" {
 			return fmt.Errorf("section %q is empty", s.Heading)
