@@ -72,7 +72,11 @@ func NewOpenRouter(key, model, proxy string, log *slog.Logger) *OpenRouter {
 // сообщениями: стабильный префикс обязан идти первым сообщением, и любая
 // изменяющаяся строка перед ним молча гасит кэш провайдера.
 type Request struct {
-	Step       string          // имя шага для лога; содержимое запроса не логируется
+	Step string // имя шага для лога; содержимое запроса не логируется
+	// CaseID - только для лога (llm_call, llm_retry, llm_invalid): по нему
+	// разбор инцидента с моделью собирает цепочку конкретного обращения.
+	// Пусто у шагов вне обращения (например заведение проекта).
+	CaseID     string
 	Model      string          // пусто - модель клиента по умолчанию
 	Messages   []Message       // префикс первым, волатильное последним
 	SchemaName string          // имя схемы в response_format, пусто - "response"
@@ -268,6 +272,7 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 		if err == nil {
 			c.log.Info("llm_call",
 				"step", req.Step,
+				"case_id", req.CaseID,
 				"model", model,
 				"ms", spent.Milliseconds(),
 				"attempt", attempt+1,
@@ -286,7 +291,7 @@ func (c *OpenRouter) Complete(ctx context.Context, req Request) (json.RawMessage
 			return nil, fmt.Errorf("openrouter %s: no budget for attempt %d: %w", req.Step, attempt+2, err)
 		}
 
-		c.log.Warn("llm_retry", "step", req.Step, "model", model, "attempt", attempt+1,
+		c.log.Warn("llm_retry", "step", req.Step, "case_id", req.CaseID, "model", model, "attempt", attempt+1,
 			"ms", spent.Milliseconds(), "error", err)
 		select {
 		case <-ctx.Done():

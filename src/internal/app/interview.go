@@ -431,6 +431,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, fix bool, asked map[string]int) (interviewTurn, error) {
 	req := Request{
 		Step:       stepInterview,
+		CaseID:     cs.ID,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
 		MaxTokens:  llmMaxTokens,
@@ -560,10 +561,18 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn, stuck
 		return fmt.Errorf("turn has %d questions", len(turn.Questions))
 	}
 
+	// Повтор ключа в Filled иначе прошёл бы молча: mergeFilled взял бы
+	// последнее значение и потерял первую идею, ту же проверку questions
+	// уже делает строкой ниже.
+	seenFilled := make(map[string]bool, len(turn.Filled))
 	for _, kv := range turn.Filled {
 		if i.rules.Title(turn.Kind, kv.Key) == "" {
 			return fmt.Errorf("filled key %q is not in contract", kv.Key)
 		}
+		if seenFilled[kv.Key] {
+			return fmt.Errorf("two values for filled key %q", kv.Key)
+		}
+		seenFilled[kv.Key] = true
 	}
 	for _, key := range turn.Gaps {
 		if i.rules.Title(turn.Kind, key) == "" {
@@ -750,6 +759,7 @@ func (i *Interview) checkOverlap(ctx context.Context, cs *Case, project Project,
 func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message) (summaryOut, error) {
 	req := Request{
 		Step:       stepSummary,
+		CaseID:     cs.ID,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
 		MaxTokens:  llmMaxTokens,

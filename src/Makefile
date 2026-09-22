@@ -53,9 +53,12 @@ vet:
 #   make live GITHUB_TOKEN=$$(gh auth token) LIVE_DATABASE_URL=...
 # Неверно (может тихо взять токен из .env):
 #   GITHUB_TOKEN=$$(gh auth token) make live LIVE_DATABASE_URL=...
+# 3h: liveStepDeadline даёт каждому шагу до двух попыток работы воркера
+# (2*jobTimeout+запас), а сценариев и шагов в них достаточно, чтобы худший
+# случай подряд превысил прежние 2h без единой настоящей поломки.
 live: check-live-db
 	@$(GOOSE) -dir $(MIGRATIONS_DIR) postgres "$(LIVE_DATABASE_URL)" up
-	go test -tags live -count=1 -timeout 2h -v -run '^TestLiveRun$$' ./internal/app
+	go test -tags live -count=1 -timeout 3h -v -run '^TestLiveRun$$' ./internal/app
 
 check-live-db:
 	@test -n "$(LIVE_DATABASE_URL)" || { echo "LIVE_DATABASE_URL is not set"; exit 1; }

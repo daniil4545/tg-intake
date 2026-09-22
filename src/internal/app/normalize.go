@@ -107,7 +107,8 @@ func (n *Normalizer) RunNormalizeVoice(ctx context.Context, job Job) error {
 	}
 
 	raw, err := n.llm.Complete(ctx, Request{
-		Step: stepTranscribe,
+		Step:   stepTranscribe,
+		CaseID: p.CaseID,
 		Messages: []Message{
 			{Role: "system", Parts: []Part{TextPart(transcribePrompt)}},
 			{Role: "user", Parts: []Part{AudioPart(audio, format)}},

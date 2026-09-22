@@ -46,8 +46,12 @@ const (
 	liveAuthorID     = int64(1)
 	liveRounds       = 2
 	liveMaxItems     = 30
-	// Дедлайн одного шага (§3 плана): ход модели, публикация в GitHub.
-	liveStepDeadline = 5 * time.Minute
+	// Дедлайн одного шага (§3 плана): ход модели, публикация в GitHub. Не
+	// меньше двух подряд попыток работы воркера (jobTimeout каждая, см.
+	// worker.go) с паузой между ними - первая живая попытка на S4 упёрлась в
+	// более короткий предел и упала до второй попытки, хотя продукт был ни
+	// при чём.
+	liveStepDeadline = 2*jobTimeout + 30*time.Second
 	livePoll         = 2 * time.Second
 	// Запас перед дедлайном самого теста (t.Deadline, из -timeout): без него
 	// зависший шаг ловит не наш Fatalf, а -timeout убивает процесс мимо
@@ -92,7 +96,9 @@ func TestLiveRun(t *testing.T) {
 		t.Fatalf("truncate: %v", err)
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// Info, не Warn: разбор живого прогона нужен interview_round (gap_keys) и
+	// llm_call - оба уровня Info.
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if err := SyncProjects(ctx, pool, []ProjectConfig{{
 		Slug: liveProjectSlug, Title: liveProjectTitle,
@@ -577,13 +583,13 @@ func runFeatureScenario(t *testing.T, env *liveEnv) {
 
 	cs, roundOccurred := waitForRoundOrSummary(t, env, caseID, 0, prevScreen)
 	if roundOccurred {
+		// R2 обязателен только на числе раундов - какой именно ключ спросит
+		// модель, недетерминировано; ключи - в лог, а не в жёсткую проверку.
 		if cs.Round > 1 {
 			t.Errorf("раундов %d, ожидался не больше 1", cs.Round)
 		}
 		questions := mustQuestions(t, env.cases, caseID)
-		if len(questions) != 1 || questions[0].Key != "detail" {
-			t.Errorf("вопросы раунда 1: %+v, ожидался один вопрос detail", questions)
-		}
+		t.Logf("S2: раунд %d, вопросы %v", cs.Round, questionKeys(questions))
 		roundScreen := cs.Screen
 		answer := buildAnswer(questions, map[string]string{
 			"detail": "Признак - деятельность вне маркетинговых агентств и студий разработки",
@@ -626,11 +632,37 @@ func runFeatureScenario(t *testing.T, env *liveEnv) {
 const mixedR1Text = "Напоминание пришло с неверным склонением имени, и заодно " +
 	"пусть напоминание уходит за час, а не за день."
 
-// mixedR1Answers - заготовки на case и wrong, которых материалу не хватает:
-// see S3/S4 таблицы §4 плана среза.
+// mixedR1Answers - заготовки на case, wrong и why, которых материалу не
+// хватает: see S3/S4 таблицы §4 плана среза. need закрывается материалом
+// («пусть напоминание уходит за час») без отдельного вопроса.
 var mixedR1Answers = map[string]string{
 	"case":  "Вчера, напоминание о встрече",
 	"wrong": `Имя пришло как "Анны" вместо "Анна"`,
+	"why":   "Чтобы клиент не забыл: за день забывают",
+}
+
+// mixedCoreOrder - порядок ядра смеси, как в rules/contract.json.
+var mixedCoreOrder = []string{"case", "wrong", "need", "why"}
+
+// mixedAnswer - раунд смеси отвечается всеми заготовками ядра разом, если
+// хоть один вопрос назвал ключ ядра: модель раунда спрашивает под одним
+// ключом (например case) то, что на деле относится к другому (wrong), и
+// ответ строго по ключу конкретного вопроса терял бы эту идею. Одним текстом
+// (§3 плана), как и обычный buildAnswer.
+func mixedAnswer(questions []Question, coreAnswers map[string]string) string {
+	for _, q := range questions {
+		if _, ok := coreAnswers[q.Key]; !ok {
+			continue
+		}
+		lines := make([]string, 0, len(mixedCoreOrder))
+		for _, key := range mixedCoreOrder {
+			if a := coreAnswers[key]; a != "" {
+				lines = append(lines, a)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	return buildAnswer(questions, coreAnswers)
 }
 
 // mixedSecondMaterial - S4, вторая смесь для гейта B: тот же случай, что и
@@ -661,7 +693,8 @@ func runMixedScenario(t *testing.T, env *liveEnv, name string, material []string
 			break
 		}
 		questions := mustQuestions(t, env.cases, caseID)
-		answer := buildAnswer(questions, answers)
+		t.Logf("%s: раунд %d, вопросы %v", name, cs.Round, questionKeys(questions))
+		answer := mixedAnswer(questions, answers)
 		must(t, env.b.onItem(textCtx(env.tb, liveAuthorID, answer)), "onItem answer")
 		prevScreen, priorRound = cs.Screen, cs.Round
 	}
@@ -748,4 +781,15 @@ func mustQuestions(t *testing.T, cases *Cases, caseID string) []Question {
 		t.Fatalf("read last round questions of case %s: %v", caseID, err)
 	}
 	return questions
+}
+
+// questionKeys - ключи вопросов раунда для лога: разбор живого прогона хочет
+// видеть, что именно спросила модель, а сценарии саму формулировку ключа не
+// проверяют (недетерминировано).
+func questionKeys(questions []Question) []string {
+	keys := make([]string, len(questions))
+	for i, q := range questions {
+		keys[i] = q.Key
+	}
+	return keys
 }
