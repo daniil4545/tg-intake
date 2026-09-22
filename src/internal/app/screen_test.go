@@ -460,6 +460,38 @@ func TestStaleRoundNotify(t *testing.T) {
 	})
 }
 
+// TestOldFormatRoundNotify: работа notify без поля round - как у той, что
+// легла в очередь до выката поля (Round==0 после omitempty), а не только у
+// настоящего раунда 0. Читать такую как устаревшую (payload.Round < cs.Round)
+// значило бы молча ронять кнопки шага на живом обращении, а «Отправить как
+// есть» к тому раунду уже не работает (ответ дан) - только «Сброс».
+func TestOldFormatRoundNotify(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	ft, tb := newFakeTelegram(t)
+	log, _ := screenLog()
+	b := screenBot(tb, pool, cases, log)
+
+	cs := startInterview(t, cases, 8852, 2)
+	if err := cases.SetScreen(ctx, cs.ID, 400, 2); err != nil {
+		t.Fatalf("set screen: %v", err)
+	}
+
+	if err := b.Notify(ctx, notifyJob(t, cs.ID, "Раунд вопросов", keysRound)); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+
+	sends := ft.methodCalls("sendMessage")
+	if len(sends) != 1 {
+		t.Fatalf("раунд старого формата не дошёл: сообщений %d", len(sends))
+	}
+	if _, ok := sends[0].body["reply_markup"]; !ok {
+		t.Errorf("раунд старого формата принят как устаревший, кнопки шага нет: %v", sends[0].body)
+	}
+}
+
 // Строки 10-11 §3b (R8): пометка раунда живёт в БД, а не в памяти процесса -
 // новый Bot без единого прежнего вызова размечает и текстовый ответ, и
 // «Всё так» на тот же экран.

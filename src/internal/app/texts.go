@@ -50,9 +50,9 @@ const newsTail = "Открыть - кнопкой ниже или в «Мои т
 // alertPublished и alertCancelled - уведомление владельцу: короткая шапка о
 // движении тикета в отдельный чат, куда пишут и алерты контура. Адресат - чат
 // из конфига, а не роль в сервисе: кто читает ленту, решается составом чата.
-func alertPublished(p Project, cs *Case, author User, number int, url string) string {
+func alertPublished(p Project, cs *Case, author User, number int, url string, incomplete bool) string {
 	text := alertMessage("Новый тикет", p, cs, author, number, url)
-	if cs.Incomplete {
+	if incomplete {
 		text += "\nКонтракт недобран: тикет помечен incomplete."
 	}
 	return text

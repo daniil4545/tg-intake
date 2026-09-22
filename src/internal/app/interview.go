@@ -498,6 +498,22 @@ func dropDetails(questions []Question, round int) ([]Question, int) {
 	return kept, len(questions) - len(kept)
 }
 
+// allExhausted - по каждому пробелу уже спрошено maxAsks раз: дальше спрашивать
+// нечем, и ход без единого вопроса - не тупик модели, а законный переход в
+// саммари с пометкой о неполноте. Пустой gaps сюда не попадает: это другая
+// ошибка (ядро не назвало пробел молчанием), а не исчерпанный лимит.
+func allExhausted(gaps []string, asked map[string]int) bool {
+	if len(gaps) == 0 {
+		return false
+	}
+	for _, key := range gaps {
+		if asked[key] < maxAsks {
+			return false
+		}
+	}
+	return true
+}
+
 // mergeFilled - состояние контракта после хода: накопленное прошлыми раундами
 // плюс свежее. Ключ в gaps переоткрывает пункт, смена типа обращения снимает
 // ключи чужого контракта.
@@ -535,7 +551,7 @@ func lostKeys(prior, filled map[string]string) []string {
 // при незакрытом ядре прошли бы схему насквозь. Ядро считается по слитому
 // состоянию: контракт копится, и пункт, закрытый прошлым раундом, модель
 // повторять не обязана.
-func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error {
+func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn, stuck bool) error {
 	items := i.rules.Items(turn.Kind)
 	if len(items) == 0 {
 		return fmt.Errorf("unknown case kind %q", turn.Kind)
@@ -586,13 +602,18 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	if turn.Ready && len(turn.Questions) > 0 {
 		return fmt.Errorf("turn is ready with %d questions", len(turn.Questions))
 	}
-	// Иначе разговор встаёт: не готово, а спросить нечего.
+	// Иначе разговор встаёт: не готово, а спросить нечего. Раунды или лимит
+	// повторов по оставшимся пробелам исчерпаны (stuck) - ход уходит в
+	// саммари с incomplete (toSummary это уже учитывает по пустым Questions),
+	// а не крутится в отказах, пока не кончатся попытки очереди.
 	if !turn.Ready && len(turn.Questions) == 0 {
-		return errors.New("turn is not ready and has no questions")
-	}
-	// Открытое ядро спрашивается раньше уточнения: раунд из одного detail при
-	// пробеле в ядре тратит вопрос автора мимо того, без чего тикет неполон.
-	if !turn.Ready && len(turn.Gaps) > 0 &&
+		if !stuck {
+			return errors.New("turn is not ready and has no questions")
+		}
+	} else if !turn.Ready && len(turn.Gaps) > 0 &&
+		// Открытое ядро спрашивается раньше уточнения: раунд из одного detail
+		// при пробеле в ядре тратит вопрос автора мимо того, без чего тикет
+		// неполон. Не относится к stuck: там вопросов нет вовсе.
 		!slices.ContainsFunc(turn.Questions, func(q Question) bool { return slices.Contains(turn.Gaps, q.Key) }) {
 		return errors.New("turn has core gaps but no question about them")
 	}

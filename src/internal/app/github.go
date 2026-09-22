@@ -613,7 +613,7 @@ func (p *Publisher) Run(ctx context.Context, job Job) error {
 			return nil
 		}
 		return putAlert(ctx, tx, cs.ID, "alert",
-			alertPublished(project, cs, author, number, url), p.alertChat)
+			alertPublished(project, cs, author, number, url, incomplete), p.alertChat)
 	})
 	if err != nil {
 		return err

@@ -103,6 +103,7 @@ func TestCheckTurn(t *testing.T) {
 		name  string
 		prior map[string]string
 		turn  interviewTurn
+		stuck bool
 		ok    bool
 	}{
 		{
@@ -216,6 +217,26 @@ func TestCheckTurn(t *testing.T) {
 			turn: interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"wrong"}},
 		},
 		{
+			// Автор отказался уточнять, лимит повторов и раундов исчерпан:
+			// ход без вопросов - не тупик, а переход в саммари с incomplete.
+			name:  "не готов и спросить нечего, но лимит исчерпан",
+			turn:  interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"wrong"}},
+			stuck: true,
+			ok:    true,
+		},
+		{
+			// stuck снимает только запрет на пустые Questions - раунд из
+			// одного detail мимо открытого ядра остаётся отказом.
+			name: "уточнение при открытом ядре без вопроса о нём, лимит исчерпан",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[:1],
+				Gaps:      []string{"wrong"},
+				Questions: []Question{{Key: detailKey, Text: "где смотрели?"}},
+			},
+			stuck: true,
+		},
+		{
 			name: "вопрос про закрытый пункт",
 			turn: interviewTurn{
 				Kind:      "bug",
@@ -248,12 +269,37 @@ func TestCheckTurn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := i.checkTurn(tt.prior, tt.turn)
+			err := i.checkTurn(tt.prior, tt.turn, tt.stuck)
 			if tt.ok && err != nil {
 				t.Errorf("ход отклонён: %v", err)
 			}
 			if !tt.ok && err == nil {
 				t.Error("ход принят, ожидался отказ")
+			}
+		})
+	}
+}
+
+// TestAllExhausted: askTurn считает stuck по этой функции, а TestCheckTurn
+// проверяет stuck напрямую булевым значением - без этого теста ошибка в
+// подсчёте лимита (askedKeys, maxAsks) прошла бы незамеченной.
+func TestAllExhausted(t *testing.T) {
+	tests := []struct {
+		name  string
+		gaps  []string
+		asked map[string]int
+		want  bool
+	}{
+		{"пустой gaps - другая ошибка, не исчерпание", nil, map[string]int{"wrong": maxAsks}, false},
+		{"один пробел ниже лимита", []string{"wrong"}, map[string]int{"wrong": maxAsks - 1}, false},
+		{"один пробел на лимите", []string{"wrong"}, map[string]int{"wrong": maxAsks}, true},
+		{"из двух один ниже лимита", []string{"wrong", "case"}, map[string]int{"wrong": maxAsks, "case": 0}, false},
+		{"оба на лимите или выше", []string{"wrong", "case"}, map[string]int{"wrong": maxAsks, "case": maxAsks + 1}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allExhausted(tt.gaps, tt.asked); got != tt.want {
+				t.Errorf("allExhausted(%v, %v) = %v, want %v", tt.gaps, tt.asked, got, tt.want)
 			}
 		})
 	}

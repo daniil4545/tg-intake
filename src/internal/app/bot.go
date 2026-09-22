@@ -454,10 +454,12 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 	// текст становится следующим. Запоздавшая доставка - раунд, который автор
 	// уже прошёл (payload.Round < cs.Round), или саммари, которое больше не
 	// текущее (status != summary) - шагом не становится: обычное сообщение без
-	// кнопок шага, живой экран не трогает.
+	// кнопок шага, живой экран не трогает. p.Round == 0 - и вправду первый
+	// раунд, и работа старого формата без поля round, вставшая в очередь до
+	// выката: обеих читаем как «текущий», а не как устаревшую.
 	switch p.Buttons {
 	case keysRound, keysAsk:
-		if cs.Status == statusInterview && p.Round >= cs.Round {
+		if cs.Status == statusInterview && (p.Round == 0 || p.Round >= cs.Round) {
 			return b.showStep(ctx, cs, cs.Round, p.Text, roundKeyboard(cs.Round, p.Buttons == keysRound))
 		}
 		_, err := b.sendLong(&tele.User{ID: cs.UserID}, p.Text)

@@ -14,13 +14,17 @@ const testAlertChat = -1001234567890
 
 // TestAlertMessages: шапка уведомления несёт проект, заголовок, автора и ссылку,
 // а строка про недобранный контракт появляется только у неполного тикета.
+// Метка incomplete приходит параметром (Unclear), а не из cs.Incomplete - поле
+// в этом тесте нарочно расходится с параметром, чтобы падать, если алерт
+// снова начнёт читать cs.Incomplete (github.go: метка issue и алерт обязаны
+// считать одной и той же функцией).
 func TestAlertMessages(t *testing.T) {
 	project := Project{Slug: "crm-bot"}
 	author := User{First: "Иван", Last: "Петров", Username: "ivan"}
-	cs := &Case{Title: "Не грузится карточка", Incomplete: true}
+	cs := &Case{Title: "Не грузится карточка", Incomplete: false}
 	url := "https://github.com/o/r/issues/42"
 
-	got := alertPublished(project, cs, author, 42, url)
+	got := alertPublished(project, cs, author, 42, url, true)
 	for _, want := range []string{"Новый тикет: crm-bot", "Не грузится карточка",
 		"Иван Петров (@ivan)", "#42 " + url, "incomplete"} {
 		if !strings.Contains(got, want) {
@@ -28,9 +32,9 @@ func TestAlertMessages(t *testing.T) {
 		}
 	}
 
-	cs.Incomplete = false
-	if strings.Contains(alertPublished(project, cs, author, 42, url), "incomplete") {
-		t.Error("полный тикет помечен недобранным контрактом")
+	cs.Incomplete = true
+	if strings.Contains(alertPublished(project, cs, author, 42, url, false), "incomplete") {
+		t.Error("полный тикет (по параметру) помечен недобранным контрактом")
 	}
 
 	cancelled := alertCancelled(project, cs, author, 42, url)
