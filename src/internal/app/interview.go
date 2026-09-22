@@ -27,6 +27,13 @@ const (
 	// третий автор читает как испорченную пластинку.
 	maxAsks  = 2
 	maxTitle = 80
+	// Разделов саммари не больше шести, заголовок - одна строка: длиннее уже
+	// не заголовок, а пересказ (Р-6 спеки ticket-form).
+	maxSections = 6
+	maxHeading  = 60
+	// detailKey - вопрос-уточнение вне ядра: адрес объекта, дословный образец.
+	// Одно на обращение и только в первом раунде, держит это Go (dropDetails).
+	detailKey = "detail"
 	// Предел краткого содержания. Два-три предложения о сути помещаются с
 	// запасом; всё, что длиннее, - уже пересказ разделов.
 	briefLimit = 400
@@ -100,17 +107,19 @@ type interviewTurn struct {
 	Ready     bool       `json:"ready"`
 }
 
-// section - раздел саммари: ключ пункта контракта и текст. Заголовок берётся из
-// правил, а не от модели: тикет одного типа должен выглядеть одинаково.
-type section struct {
-	Key  string `json:"key"`
-	Text string `json:"text"`
+// Section - раздел саммари под заголовком модели: форма тикета идёт от
+// материала, а не от анкеты. Key - пункт ядра, который раздел покрывает, или
+// пусто: по нему Go видит, какой закрытый пункт модель не упомянула.
+type Section struct {
+	Key     string `json:"key"`
+	Heading string `json:"heading"`
+	Text    string `json:"text"`
 }
 
 type summaryOut struct {
 	Title    string    `json:"title"`
 	Brief    string    `json:"brief"`
-	Sections []section `json:"sections"`
+	Sections []Section `json:"sections"`
 }
 
 // turnSchema строится из правил: список типов обращения задаётся ими же, и
@@ -163,8 +172,12 @@ var summarySchema = json.RawMessage(`{
 			"type": "array",
 			"items": {
 				"type": "object",
-				"properties": {"key": {"type": "string"}, "text": {"type": "string"}},
-				"required": ["key", "text"],
+				"properties": {
+					"key": {"type": "string"},
+					"heading": {"type": "string"},
+					"text": {"type": "string"}
+				},
+				"required": ["key", "heading", "text"],
 				"additionalProperties": false
 			}
 		}
@@ -235,13 +248,29 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
+	// Раньше askTurn: checkTurn сверяет по нему, спрашивать ли ещё можно
+	// (allExhausted), а не только фильтрует готовый ход после него.
+	var asked map[string]int
+	if !fix {
+		asked, err = i.cases.askedKeys(ctx, cs.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	// После пропуска (Р-15) раунд не откроется, и ход без вопросов при открытом
+	// ядре законен: правка саммари иначе упала бы в отказ формата.
+	skipped, err := i.cases.skipped(ctx, i.cases.pool, cs.ID)
+	if err != nil {
+		return err
+	}
 
 	messages, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		return err
 	}
 
-	turn, err := i.askTurn(ctx, cs, messages)
+	turn, err := i.askTurn(ctx, cs, messages, fix, skipped, asked)
 	if err != nil {
 		return err
 	}
@@ -251,16 +280,19 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	// предела не знает, как и предела раундов: автор пришёл уточнять именно
 	// этот пункт, и молчание в ответ обесценило бы правку.
 	if !fix {
-		asked, err := i.cases.askedKeys(ctx, cs.ID)
-		if err != nil {
-			return err
-		}
 		kept := slices.DeleteFunc(turn.Questions, func(q Question) bool { return asked[q.Key] >= maxAsks })
 		if len(kept) < len(turn.Questions) {
 			i.log.Info("questions_exhausted", "case_id", cs.ID, "dropped", len(turn.Questions)-len(kept))
 		}
 		turn.Questions = kept
 	}
+	// Правка саммари тоже может открыть раунд, и уточнение там подчиняется
+	// тому же пределу: номер раунда модели не сообщается.
+	kept, dropped := dropDetails(turn.Questions, cs.Round)
+	if dropped > 0 {
+		i.log.Info("detail_dropped", "case_id", cs.ID, "round", cs.Round+1, "dropped", dropped)
+	}
+	turn.Questions = kept
 
 	// Предел считается по уже заданным раундам: исчерпав их, ход не спрашивает
 	// ничего, а собирает саммари с тем, что есть. Правка саммари предел не
@@ -281,7 +313,7 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 			"lost_keys", strings.Join(lostKeys(cs.Filled, filled), ","))
 	}
 
-	saved, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
+	saved, actualRound, actualToSummary, err := i.saveTurn(ctx, cs, turn, filled, round, toSummary, version)
 	if err != nil {
 		return err
 	}
@@ -292,24 +324,33 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 		return nil
 	}
 
+	// Вопросов в правдивом логе нет, если ход всё же ушёл в саммари (в том
+	// числе из-за пропуска, обнаруженного уже внутри saveTurn) - раунда с ними
+	// не было.
+	questions := len(turn.Questions)
+	if actualToSummary {
+		questions = 0
+	}
 	// Ключи пробелов, а не только их число: решение «оставлять ли пункт
 	// обязательным» принимается по тому, какой из них не закрывается чаще
 	// прочих, и по счётчику этого не увидеть. Ключ - имя пункта контракта,
 	// содержимого обращения в нём нет.
-	i.log.Info("interview_round", "case_id", cs.ID, "round", round, "kind", turn.Kind,
-		"questions", len(turn.Questions), "gaps", len(turn.Gaps),
-		"gap_keys", strings.Join(turn.Gaps, ","), "to_summary", toSummary)
+	i.log.Info("interview_round", "case_id", cs.ID, "round", actualRound, "kind", turn.Kind,
+		"questions", questions, "gaps", len(turn.Gaps),
+		"gap_keys", strings.Join(turn.Gaps, ","), "to_summary", actualToSummary)
 	return nil
 }
 
 // saveTurn кладёт ход разговора: состояние контракта, событие раунда и то, что
 // уходит автору либо в следующую работу. Одной транзакцией - иначе вопрос
 // уходит автору, а раунд в базе не сохранён.
-// Второе значение - лёг ли результат в базу. Ложь означает, что ход устарел:
-// обращение отменили или автор дописал, пока модель думала.
-func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool, version int) (bool, error) {
-	saved := false
-	err := i.cases.inTx(ctx, func(tx pgx.Tx) error {
+// saved - лёг ли результат в базу. Ложь означает, что ход устарел: обращение
+// отменили или автор дописал, пока модель думала - actualRound/actualToSummary
+// тогда не определены. Иначе они называют то, что реально записано: пропуск,
+// случившийся, пока модель думала, эта же транзакция обязана увидеть раньше
+// записи round (Р-15) - round остаётся прежним, а не round+1 из аргумента.
+func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, filled map[string]string, round int, toSummary bool, version int) (saved bool, actualRound int, actualToSummary bool, err error) {
+	err = i.cases.inTx(ctx, func(tx pgx.Tx) error {
 		// Версия разговора сверяется внутри той же транзакции: между её чтением
 		// и записью автор мог прислать ещё один ответ, и тогда писать этот ход
 		// поверх свежего нельзя.
@@ -321,6 +362,35 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 			return nil
 		}
 
+		// Строка блокируется раньше решения "какой раунд писать": так пропуск,
+		// случившийся конкурентно, обязан лечь в эту же транзакцию до того, как
+		// мы выберем round и toSummary, а не после.
+		var status string
+		err = tx.QueryRow(ctx, `SELECT status FROM cases WHERE id = $1 FOR UPDATE`, cs.ID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock case %s for turn: %w", cs.ID, err)
+		}
+		// Обращение отменили, пока модель думала: ни вопроса, ни саммари.
+		if status != statusInterview {
+			return nil
+		}
+
+		actualRound, actualToSummary = round, toSummary
+		if !toSummary {
+			skipped, err := i.cases.skipped(ctx, tx, cs.ID)
+			if err != nil {
+				return err
+			}
+			if skipped {
+				actualToSummary = true
+				actualRound = cs.Round
+				i.log.Info("skip_dropped", "case_id", cs.ID, "dropped", len(turn.Questions))
+			}
+		}
+
 		contract, err := json.Marshal(filled)
 		if err != nil {
 			return fmt.Errorf("encode contract of case %s: %w", cs.ID, err)
@@ -330,21 +400,16 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 			return fmt.Errorf("encode gaps of case %s: %w", cs.ID, err)
 		}
 
-		tag, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE cases SET kind = $2, contract = $3, gaps = $4, round = $5, updated_at = now()
-			WHERE id = $1 AND status = 'interview'`, cs.ID, turn.Kind, contract, gaps, round)
-		if err != nil {
+			WHERE id = $1`, cs.ID, turn.Kind, contract, gaps, actualRound); err != nil {
 			return fmt.Errorf("save turn of case %s: %w", cs.ID, err)
-		}
-		// Обращение отменили, пока модель думала: ни вопроса, ни саммари.
-		if tag.RowsAffected() == 0 {
-			return nil
 		}
 		saved = true
 
-		if toSummary {
+		if actualToSummary {
 			if err := addEvent(ctx, tx, cs.ID, "interview_done", map[string]any{
-				"round": round, "gaps": turn.Gaps,
+				"round": actualRound, "gaps": turn.Gaps,
 			}); err != nil {
 				return err
 			}
@@ -352,7 +417,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		}
 
 		if err := addEvent(ctx, tx, cs.ID, "round_asked", map[string]any{
-			"round": round, "questions": turn.Questions,
+			"round": actualRound, "questions": turn.Questions,
 		}); err != nil {
 			return err
 		}
@@ -362,18 +427,18 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 		if hasSuggestion(turn.Questions) {
 			keys = keysRound
 		}
-		return putNotifyKey(ctx, tx, cs.ID, fmt.Sprintf("round-%d", round),
-			roundMessage(turn.Questions), keys)
+		return putNotifyRound(ctx, tx, cs.ID, actualRound, roundMessage(turn.Questions), keys)
 	})
-	return saved, err
+	return saved, actualRound, actualToSummary, err
 }
 
 // askTurn спрашивает модель и проверяет её ответ. Невалидный ответ - один
 // повтор: модель промахивается разово, второй такой же промах означает, что
 // дело не в случайности, и работа уходит в повтор очередью.
-func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (interviewTurn, error) {
+func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, fix, skipped bool, asked map[string]int) (interviewTurn, error) {
 	req := Request{
 		Step:       stepInterview,
+		CaseID:     cs.ID,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
 		MaxTokens:  llmMaxTokens,
@@ -397,7 +462,7 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 		var turn interviewTurn
 		if err := json.Unmarshal(raw, &turn); err != nil {
 			lastErr = fmt.Errorf("decode turn: %w", err)
-		} else if err := i.checkTurn(cs.Filled, turn); err != nil {
+		} else if err := i.checkTurn(cs.Filled, turn, skipped || !fix && (cs.Round >= i.rounds || allExhausted(turn.Gaps, asked))); err != nil {
 			lastErr = err
 		} else if attempt == 0 && len(turn.Questions) > 0 && !hasSuggestion(turn.Questions) {
 			i.log.Warn("turn_without_suggestion", "step", stepInterview, "case_id", cs.ID,
@@ -421,6 +486,40 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 // таких вопросов не должен ни обещать подтверждение, ни показывать кнопку.
 func hasSuggestion(questions []Question) bool {
 	return slices.ContainsFunc(questions, func(q Question) bool { return !isStub(q.Suggested) })
+}
+
+// dropDetails снимает лишние уточнения вне ядра: одно на обращение и только в
+// первом раунде (Р-3). round - номер последнего заданного раунда до этого хода,
+// так что первый раунд задаётся только при round == 0.
+func dropDetails(questions []Question, round int) ([]Question, int) {
+	allowed := round == 0
+	kept := make([]Question, 0, len(questions))
+	for _, q := range questions {
+		if q.Key == detailKey {
+			if !allowed {
+				continue
+			}
+			allowed = false
+		}
+		kept = append(kept, q)
+	}
+	return kept, len(questions) - len(kept)
+}
+
+// allExhausted - по каждому пробелу уже спрошено maxAsks раз: дальше спрашивать
+// нечем, и ход без единого вопроса - не тупик модели, а законный переход в
+// саммари с пометкой о неполноте. Пустой gaps сюда не попадает: это другая
+// ошибка (ядро не назвало пробел молчанием), а не исчерпанный лимит.
+func allExhausted(gaps []string, asked map[string]int) bool {
+	if len(gaps) == 0 {
+		return false
+	}
+	for _, key := range gaps {
+		if asked[key] < maxAsks {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeFilled - состояние контракта после хода: накопленное прошлыми раундами
@@ -456,11 +555,11 @@ func lostKeys(prior, filled map[string]string) []string {
 }
 
 // checkTurn - проверки недоверенного вывода модели. Схема гарантирует форму, а
-// смысл проверяет Go: ключи вне контракта, вопрос про закрытый пункт и
-// готовность при незакрытых обязательных пунктах прошли бы схему насквозь.
-// Обязательность считается по слитому состоянию: контракт копится, и пункт,
-// закрытый прошлым раундом, модель повторять не обязана.
-func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error {
+// смысл проверяет Go: ключи вне ядра, вопрос про закрытый пункт и готовность
+// при незакрытом ядре прошли бы схему насквозь. Ядро считается по слитому
+// состоянию: контракт копится, и пункт, закрытый прошлым раундом, модель
+// повторять не обязана.
+func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn, stuck bool) error {
 	items := i.rules.Items(turn.Kind)
 	if len(items) == 0 {
 		return fmt.Errorf("unknown case kind %q", turn.Kind)
@@ -469,10 +568,18 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		return fmt.Errorf("turn has %d questions", len(turn.Questions))
 	}
 
+	// Повтор ключа в Filled иначе прошёл бы молча: mergeFilled взял бы
+	// последнее значение и потерял первую идею, ту же проверку questions
+	// уже делает строкой ниже.
+	seenFilled := make(map[string]bool, len(turn.Filled))
 	for _, kv := range turn.Filled {
 		if i.rules.Title(turn.Kind, kv.Key) == "" {
 			return fmt.Errorf("filled key %q is not in contract", kv.Key)
 		}
+		if seenFilled[kv.Key] {
+			return fmt.Errorf("two values for filled key %q", kv.Key)
+		}
+		seenFilled[kv.Key] = true
 	}
 	for _, key := range turn.Gaps {
 		if i.rules.Title(turn.Kind, key) == "" {
@@ -481,15 +588,17 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 	}
 	// Два вопроса об одном пункте в одном раунде сожгли бы его предел за раз:
 	// счётчик заданных вопросов считает по журналу, а не по раундам.
+	// Уточнение вне ядра ключа в gaps не имеет, а лишние уточнения снимает
+	// dropDetails: ход из-за них не отклоняется.
 	seen := make(map[string]bool, len(turn.Questions))
 	for _, q := range turn.Questions {
-		if !slices.Contains(turn.Gaps, q.Key) {
+		if q.Key != detailKey && !slices.Contains(turn.Gaps, q.Key) {
 			return fmt.Errorf("question about closed key %q", q.Key)
 		}
 		if strings.TrimSpace(q.Text) == "" {
 			return fmt.Errorf("question about %q is empty", q.Key)
 		}
-		if seen[q.Key] {
+		if seen[q.Key] && q.Key != detailKey {
 			return fmt.Errorf("two questions about key %q", q.Key)
 		}
 		// Отписку вместо догадки промт запрещает прямо, а ловил её только
@@ -500,31 +609,35 @@ func (i *Interview) checkTurn(prior map[string]string, turn interviewTurn) error
 		}
 		seen[q.Key] = true
 	}
-	// Готовность держат только обязательные пункты. Необязательный остаётся в
-	// gaps и уходит в тикет строкой «не разобрано»: требовать пустой gaps
-	// значило бы либо не давать разговору закончиться, либо заставлять модель
-	// прятать непрочитанное - именно на этом противоречии контур выбрасывал
-	// готовые генерации (наблюдение 2026-08-12).
 	missing := i.rules.Missing(turn.Kind, i.mergeFilled(prior, turn))
 	if turn.Ready && len(missing) > 0 {
-		return fmt.Errorf("turn is ready with %d required gaps", len(missing))
+		return fmt.Errorf("turn is ready with %d core gaps", len(missing))
 	}
-	// Готовность обрывает разговор, и заданные тем же ходом вопросы автору уже
-	// не уйдут. Раньше это исключалось само собой (готовность требовала пустых
-	// gaps, а вопрос - ключа из них); теперь необязательный пункт остаётся в
-	// gaps, и модель может спросить про него, объявив разговор законченным.
+	// Готовность обрывает разговор, и заданное тем же ходом уточнение автору
+	// уже не уйдёт: уточнение допустимо и при закрытом ядре.
 	if turn.Ready && len(turn.Questions) > 0 {
 		return fmt.Errorf("turn is ready with %d questions", len(turn.Questions))
 	}
-	// Иначе разговор встаёт: не готово, а спросить нечего.
+	// Иначе разговор встаёт: не готово, а спросить нечего. Раунды или лимит
+	// повторов по оставшимся пробелам исчерпаны (stuck) - ход уходит в
+	// саммари с incomplete (toSummary это уже учитывает по пустым Questions),
+	// а не крутится в отказах, пока не кончатся попытки очереди.
 	if !turn.Ready && len(turn.Questions) == 0 {
-		return errors.New("turn is not ready and has no questions")
+		if !stuck {
+			return errors.New("turn is not ready and has no questions")
+		}
+	} else if !turn.Ready && len(turn.Gaps) > 0 &&
+		// Открытое ядро спрашивается раньше уточнения: раунд из одного detail
+		// при пробеле в ядре тратит вопрос автора мимо того, без чего тикет
+		// неполон. Не относится к stuck: там вопросов нет вовсе.
+		!slices.ContainsFunc(turn.Questions, func(q Question) bool { return slices.Contains(turn.Gaps, q.Key) }) {
+		return errors.New("turn has core gaps but no question about them")
 	}
-	// Обязательный пункт, не закрытый и не названный пробелом, ушёл бы в тикет
+	// Пункт ядра, не закрытый и не названный пробелом, ушёл бы в тикет
 	// молчанием. Признаваться в непрочитанном модель обязана.
 	for _, key := range missing {
 		if !slices.Contains(turn.Gaps, key) {
-			return fmt.Errorf("required key %q is neither filled nor in gaps", key)
+			return fmt.Errorf("core key %q is neither filled nor in gaps", key)
 		}
 	}
 	return nil
@@ -567,12 +680,11 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 	title := scrubContacts(strings.TrimSpace(out.Title))
 	body := i.renderSections(cs, out.Sections)
 	brief := briefOf(out.Brief, body)
-	// Недобран контракт или нет, решают обязательные пункты: необязательный
-	// пробел честно назван в теле тикета, но метки о неполноте не заслуживает -
-	// иначе её носил бы каждый тикет.
-	incomplete := len(i.rules.Missing(cs.Kind, cs.Filled)) > 0
-	// Ни одной строки ни от модели, ни из контракта: показывать автору нечего,
-	// и работа уходит в повторы, а исчерпав их - скажет ему об этом.
+	// Метку неполноты и строку «Не уточнено» считает Go по ядру, а не модель.
+	unclear := i.rules.Unclear(cs.Kind, cs.Filled)
+	incomplete := unclear != ""
+	// Пусто только при пустом протоколе: показывать автору нечего, и работа
+	// уходит в повторы, а исчерпав их - скажет ему об этом.
 	if body == "" {
 		return fmt.Errorf("summary of case %s has no content", cs.ID)
 	}
@@ -618,7 +730,7 @@ func (i *Interview) Summarize(ctx context.Context, job Job) error {
 		// переписанное саммари упёрлось бы в ключ прошлого - автор не увидел бы
 		// собственную правку.
 		return putNotifyKey(ctx, tx, cs.ID, strconv.FormatInt(job.ID, 10),
-			summaryMessage(title, brief, body, i.gapTitles(cs), incomplete, overlap), keysSummary)
+			summaryMessage(title, brief, body, unclear, overlap), keysSummary)
 	})
 	if err != nil {
 		return err
@@ -654,6 +766,7 @@ func (i *Interview) checkOverlap(ctx context.Context, cs *Case, project Project,
 func (i *Interview) askSummary(ctx context.Context, cs *Case, messages []Message) (summaryOut, error) {
 	req := Request{
 		Step:       stepSummary,
+		CaseID:     cs.ID,
 		Model:      i.model.Name,
 		Reasoning:  i.model.Reasoning,
 		MaxTokens:  llmMaxTokens,
@@ -707,59 +820,59 @@ func (i *Interview) checkSummary(cs *Case, out summaryOut) error {
 		return fmt.Errorf("summary brief is %d runes long", utf8.RuneCountInString(brief))
 	}
 
-	for _, s := range out.Sections {
-		if i.rules.Title(cs.Kind, s.Key) == "" {
-			return fmt.Errorf("section key %q is not in contract", s.Key)
+	// Пустой список разделов не ошибка, пока тело есть из чего собрать: из
+	// закрытого ядра. Без ядра модель обязана дать разделы - протокол сырья в
+	// тело не идёт, он не обезличен.
+	if len(out.Sections) > maxSections {
+		return fmt.Errorf("summary has %d sections", len(out.Sections))
+	}
+	if len(out.Sections) == 0 && !slices.ContainsFunc(i.rules.Items(cs.Kind), func(item ContractItem) bool {
+		return strings.TrimSpace(cs.Filled[item.Key]) != ""
+	}) {
+		return errors.New("summary has no sections and no filled core")
+	}
+	for idx := range out.Sections {
+		s := &out.Sections[idx]
+		if err := checkHeading(s.Heading); err != nil {
+			return fmt.Errorf("section %d: %w", idx+1, err)
 		}
+		if s.Key != "" && i.rules.Title(cs.Kind, s.Key) == "" {
+			// Тип менялся по ходу интервью (case_kind_changed): ключ из
+			// контракта прежнего типа - не повод отклонять весь ответ и
+			// жечь попытки, текст остаётся обычным разделом.
+			i.log.Warn("section_key_dropped", "case_id", cs.ID, "key", s.Key)
+			s.Key = ""
+		}
+		// В ошибке номер раздела, а не заголовок: она уходит в лог и события, а
+		// заголовок собран из материала и может нести имя клиента.
 		if strings.TrimSpace(s.Text) == "" {
-			return fmt.Errorf("section %q is empty", s.Key)
+			return fmt.Errorf("section %d is empty", idx+1)
+		}
+		// Строка «## Ссылки» внутри текста стала бы в теле тикета вторым
+		// заголовком и спорила бы с разделом, который пишет Go.
+		if headingLineRe.MatchString(s.Text) {
+			return fmt.Errorf("section %d text has a heading line", idx+1)
 		}
 	}
 	return nil
 }
 
-// renderSections собирает тело саммари в markdown - тот же текст уходит и в
-// issue, и автору. Порядок разделов задают правила, а не ответ модели: тикет
-// одного типа выглядит одинаково. Раздел, который модель не написала,
-// достраивается из контракта - почему так, раздел 7 architecture.md.
-func (i *Interview) renderSections(cs *Case, sections []section) string {
-	texts := make(map[string]string, len(sections))
-	for _, s := range sections {
-		// Пробел остаётся пробелом: раздел по незакрытому пункту - догадка,
-		// которой автор не давал, а сообщение о пробелах тут же ей противоречит.
-		if slices.Contains(cs.Gaps, s.Key) {
-			continue
-		}
-		texts[s.Key] = scrubContacts(strings.TrimSpace(s.Text))
+// checkHeading - заголовок раздела от модели становится строкой «## ...» в
+// теле issue: перевод строки, решётка или разметка в нём ломают тело, а
+// занятое имя спорит с разделом, который пишет Go.
+func checkHeading(heading string) error {
+	heading = strings.TrimSpace(heading)
+	switch {
+	case heading == "":
+		return errors.New("section has no heading")
+	case utf8.RuneCountInString(heading) > maxHeading:
+		return fmt.Errorf("section heading is %d runes long", utf8.RuneCountInString(heading))
+	case strings.ContainsAny(heading, "\n\r#<"):
+		return errors.New("section heading has markup")
+	case slices.ContainsFunc(reservedHeadings, func(r string) bool { return strings.EqualFold(r, heading) }):
+		return fmt.Errorf("section heading %q is reserved", heading)
 	}
-	for key, value := range cs.Filled {
-		if texts[key] != "" || slices.Contains(cs.Gaps, key) {
-			continue
-		}
-		texts[key] = scrubContacts(strings.TrimSpace(value))
-	}
-
-	var b strings.Builder
-	for _, item := range i.rules.Items(cs.Kind) {
-		text := texts[item.Key]
-		if text == "" {
-			continue
-		}
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", item.Title, text)
-	}
-	return strings.TrimSpace(b.String())
-}
-
-// gapTitles - незакрытые пункты человеческими названиями. Автор видит их до
-// публикации: недобранный контракт даёт тикет с пометкой, а не отказ.
-func (i *Interview) gapTitles(cs *Case) []string {
-	var titles []string
-	for _, key := range cs.Gaps {
-		if title := i.rules.Title(cs.Kind, key); title != "" {
-			titles = append(titles, title)
-		}
-	}
-	return titles
+	return nil
 }
 
 // dialog собирает сообщения запроса. Порядок обязателен: стабильный префикс
@@ -771,98 +884,13 @@ func (i *Interview) dialog(ctx context.Context, cs *Case, prefix string) ([]Mess
 		return nil, Project{}, err
 	}
 
-	messages := []Message{
-		{Role: "system", Parts: []Part{TextPart(prefix + "\n\n## Проект\n\n" + project.Context)}},
-		{Role: "user", Parts: []Part{TextPart("Протокол сырья:\n\n" + cs.Protocol)}},
-	}
+	messages := dialogMessages(prefix, project.Context, cs.Protocol)
 
 	history, err := i.cases.history(ctx, cs.ID)
 	if err != nil {
 		return nil, Project{}, err
 	}
 	return append(messages, history...), project, nil
-}
-
-// history восстанавливает разговор из журнала. Отдельной таблицы у него нет:
-// диалог по природе append-only, а case_events уже пишется в тех же
-// транзакциях, что и смена статуса. Показанное саммари - такая же реплика бота,
-// как вопрос раунда: автор правит именно его. Ответ по документации идёт сюда
-// же - разговор, пришедший из режима вопроса, уже установил факты, и
-// переспрашивать их интервью не должно. Вопроса автора здесь нет: его слова
-// целиком лежат в протоколе сырья, который подаётся отдельным сообщением.
-func (c *Cases) history(ctx context.Context, caseID string) ([]Message, error) {
-	rows, err := c.pool.Query(ctx, `
-		SELECT kind, payload FROM case_events
-		WHERE case_id = $1
-		  AND kind IN ('round_asked', 'answer_given', 'summary_ready', 'answer_ready')
-		ORDER BY id`, caseID)
-	if err != nil {
-		return nil, fmt.Errorf("query history of case %s: %w", caseID, err)
-	}
-	defer rows.Close()
-
-	var messages []Message
-	for rows.Next() {
-		var kind string
-		var payload []byte
-		if err := rows.Scan(&kind, &payload); err != nil {
-			return nil, fmt.Errorf("scan history event: %w", err)
-		}
-
-		switch kind {
-		case "round_asked":
-			var p struct {
-				Questions []Question `json:"questions"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode asked round: %w", err)
-			}
-			messages = append(messages, Message{
-				Role:  "assistant",
-				Parts: []Part{TextPart(questionList(p.Questions))},
-			})
-		case "answer_given", "answer_ready":
-			var p struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", kind, err)
-			}
-			if p.Text == "" {
-				continue
-			}
-			role := "user"
-			if kind == "answer_ready" {
-				role = "assistant"
-			}
-			messages = append(messages, Message{Role: role, Parts: []Part{TextPart(p.Text)}})
-		case "summary_ready":
-			var p struct {
-				Title   string `json:"title"`
-				Body    string `json:"body"`
-				Overlap string `json:"overlap"`
-			}
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return nil, fmt.Errorf("decode shown summary: %w", err)
-			}
-			// Обращение начато до выката: снимка в событии нет, и подставить
-			// вместо него нечего.
-			if p.Body == "" {
-				continue
-			}
-			shown := p.Title + "\n\n" + p.Body
-			// Пересечения показаны автору той же репликой, и следующий его ответ
-			// часто отвечает именно им: без них ход переспросит мимо.
-			if p.Overlap != "" {
-				shown += "\n\nПохоже, часть этого уже есть:\n\n" + p.Overlap
-			}
-			messages = append(messages, Message{
-				Role:  "assistant",
-				Parts: []Part{TextPart(shown)},
-			})
-		}
-	}
-	return messages, rows.Err()
 }
 
 // AddAnswer принимает ответ автора: текстом, расшифровкой голосового или
@@ -982,29 +1010,104 @@ func isStub(text string) bool {
 	return slices.ContainsFunc(stubPhrases, func(p string) bool { return strings.Contains(text, p) })
 }
 
-var (
-	stubTails = []string{"не указано", "не указан", "не указана", "не указаны", "неизвестно",
-		"не известно", "не разобрано", "неясно", "не ясно", "не сообщил", "не сообщила"}
-	stubPhrases = []string{"нет данных", "данных нет", "нет информации", "информации нет",
-		"информация отсутствует", "данные отсутствуют", "не удалось определить",
-		"уточнить не удалось", "не сообщается"}
-)
-
-// roundAnswered - последним событием разговора идёт ответ, а не вопрос. Значит
-// текущий раунд закрыт и подтверждать в нём нечего.
+// roundAnswered - последним событием разговора идёт ответ или пропуск, а не
+// вопрос. Значит текущий раунд закрыт и подтверждать в нём нечего.
 func (c *Cases) roundAnswered(ctx context.Context, caseID string) (bool, error) {
+	kind, err := lastRoundEvent(ctx, c.pool, caseID)
+	if err != nil {
+		return false, err
+	}
+	return kind != "" && kind != "round_asked", nil
+}
+
+// lastRoundEvent - последнее событие раунда среди троицы (docs/specs/ticket-form.md):
+// вопрос, ответ, пропуск. Пустая строка - раунда с таким событием ещё не было.
+func lastRoundEvent(ctx context.Context, db txRunner, caseID string) (string, error) {
 	var kind string
-	err := c.pool.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT kind FROM case_events
-		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given')
+		WHERE case_id = $1 AND kind IN ('round_asked', 'answer_given', 'questions_skipped')
 		ORDER BY id DESC LIMIT 1`, caseID).Scan(&kind)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return "", nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check last event of case %s: %w", caseID, err)
+		return "", fmt.Errorf("check last round event of case %s: %w", caseID, err)
 	}
-	return kind == "answer_given", nil
+	return kind, nil
+}
+
+// skipped - в обращении уже случился пропуск вопросов (Р-15): раунд не
+// открывается больше ни ходом, ни правкой саммари до самой публикации.
+// db - пул или транзакция: saveTurn обязан увидеть пропуск в своей же
+// транзакции, остальные вызовы читают вне неё.
+func (c *Cases) skipped(ctx context.Context, db txRunner, caseID string) (bool, error) {
+	var exists bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM case_events WHERE case_id = $1 AND kind = 'questions_skipped')`,
+		caseID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check skip of case %s: %w", caseID, err)
+	}
+	return exists, nil
+}
+
+// SkipQuestions - «Отправить как есть»: раунд закрывается без ответа, дальше
+// работу довершает саммари (Р-5 ticket-form: саммари - последняя точка перед
+// публикацией). Статус и cases.round не трогает - их меняет Summarize.
+func (c *Cases) SkipQuestions(ctx context.Context, cs *Case, round int) error {
+	if cs.Status != statusInterview {
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "not_interview")
+		return ErrNotInterview
+	}
+	if round != cs.Round {
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "stale_round")
+		return ErrStaleRound
+	}
+
+	err := c.inTx(ctx, func(tx pgx.Tx) error {
+		// Блокировка строки через updated_at, как у ответа: пропуск - тоже
+		// действие автора, таймер черновика сдвигается так же.
+		tag, err := tx.Exec(ctx, `
+			UPDATE cases SET updated_at = now()
+			WHERE id = $1 AND status = 'interview' AND round = $2`, cs.ID, round)
+		if err != nil {
+			return fmt.Errorf("lock case %s for skip: %w", cs.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrStaleRound
+		}
+
+		kind, err := lastRoundEvent(ctx, tx, cs.ID)
+		if err != nil {
+			return err
+		}
+		switch kind {
+		case "":
+			return ErrStaleRound
+		case "round_asked":
+		default:
+			return ErrRoundAnswered
+		}
+
+		if err := addEvent(ctx, tx, cs.ID, "questions_skipped", map[string]any{"round": round}); err != nil {
+			return err
+		}
+		return replaceJob(ctx, tx, JobSummarize, cs.ID, casePayload{CaseID: cs.ID})
+	})
+	switch {
+	case errors.Is(err, ErrStaleRound):
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "stale_round")
+		return err
+	case errors.Is(err, ErrRoundAnswered):
+		c.log.Info("skip_refused", "case_id", cs.ID, "round", round, "reason", "round_answered")
+		return err
+	case err != nil:
+		return err
+	}
+
+	c.log.Info("questions_skipped", "case_id", cs.ID, "round", round)
+	return nil
 }
 
 // askedKeys - сколько раз каждый пункт контракта уже становился вопросом.
@@ -1057,6 +1160,28 @@ func (c *Cases) lastQuestions(ctx context.Context, caseID string) ([]Question, e
 		return nil, fmt.Errorf("decode last round of case %s: %w", caseID, err)
 	}
 	return p.Questions, nil
+}
+
+// RoundView - вопросы последнего раунда вместе с числом ответов после него:
+// живая версия того, что markRound показывает на экране. Живёт в БД, а не в
+// памяти процесса - экран обязан пережить рестарт.
+func (c *Cases) RoundView(ctx context.Context, caseID string) ([]Question, int, error) {
+	questions, err := c.lastQuestions(ctx, caseID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var answers int
+	err = c.pool.QueryRow(ctx, `
+		SELECT count(*) FROM case_events
+		WHERE case_id = $1 AND kind = 'answer_given'
+		  AND id > COALESCE(
+		      (SELECT max(id) FROM case_events WHERE case_id = $1 AND kind = 'round_asked'), 0)`,
+		caseID).Scan(&answers)
+	if err != nil {
+		return nil, 0, fmt.Errorf("count round answers of case %s: %w", caseID, err)
+	}
+	return questions, answers, nil
 }
 
 // ConfirmSummary - кнопка «Публикую». Ключ работы без счётчика: issue у
@@ -1158,58 +1283,9 @@ func (c *Cases) AfterVoiceFail(ctx context.Context, caseID string, itemID int64)
 	}
 	if cs.Status == statusInterview || cs.Status == statusSummary {
 		return putNotifyKey(ctx, c.pool, caseID, fmt.Sprintf("voicefail-%d", itemID),
-			"Не разобрал голосовое. Повторите, пожалуйста, текстом или запишите ещё раз.", "")
+			msgVoiceUnrecognized, "")
 	}
 	return c.AdvanceNormalize(ctx, caseID)
-}
-
-func roundMessage(questions []Question) string {
-	tail := "\n\nОтветьте своими словами - текстом или голосовым."
-	if hasSuggestion(questions) {
-		tail += " Если предположения верны, нажмите «Всё так»."
-	}
-	return "Уточню, чтобы тикет не пришлось переспрашивать:\n\n" + questionList(questions) + tail
-}
-
-func questionList(questions []Question) string {
-	var b strings.Builder
-	for n, q := range questions {
-		fmt.Fprintf(&b, "%d. %s\n", n+1, q.Text)
-		if suggested := strings.TrimSpace(q.Suggested); suggested != "" {
-			fmt.Fprintf(&b, "   Предполагаю: %s\n", suggested)
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func summaryMessage(title, brief, body string, gaps []string, incomplete bool, overlap string) string {
-	var b strings.Builder
-	b.WriteString("Вот что уйдёт в тикет.\n\n")
-	b.WriteString(title + "\n\n")
-	// Краткое содержание показывается вместе с разделами: оно уедет в тикет, а
-	// подтверждает автор именно то, что уйдёт.
-	if brief != "" {
-		b.WriteString(brief + "\n\n")
-	}
-	b.WriteString(plainText(body))
-	if len(gaps) > 0 {
-		b.WriteString("\n\nОстались пробелы: " + strings.Join(gaps, "; ") + ".")
-		// Пометку о неполноте несёт только незакрытый обязательный пункт:
-		// обещать её на необязательном пробеле значит пугать автора тем, чего
-		// в тикете не будет.
-		if incomplete {
-			b.WriteString(" Тикет уйдёт с пометкой о неполноте.")
-		}
-	}
-	// Пересечения идут перед вопросом о правке: это то, чего автор не знал, и
-	// решать ему сразу после - публиковать или бросить обращение.
-	if overlap != "" {
-		b.WriteString("\n\nПохоже, часть этого уже есть:\n\n" + plainText(overlap))
-		b.WriteString("\n\nЕсли это оно - нажмите «Сброс», тикет не понадобится. " +
-			"Если нет - напишите, чего не хватает.")
-	}
-	b.WriteString("\n\nГде я ошибся? Напишите правку - или публикуем.")
-	return b.String()
 }
 
 // briefOf - краткое содержание: своё от модели или начало первого раздела
@@ -1295,9 +1371,11 @@ func tableRow(line string) string {
 }
 
 var (
-	headingRe   = regexp.MustCompile(`^#{1,6}\s+`)
-	tableRuleRe = regexp.MustCompile(`^[\s|:-]+$`)
-	mdLinkRe    = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	headingRe = regexp.MustCompile(`^#{1,6}\s+`)
+	// headingLineRe - строка текста, которую markdown прочтёт заголовком.
+	headingLineRe = regexp.MustCompile(`(?m)^\s*#{1,6}(\s|$)`)
+	tableRuleRe   = regexp.MustCompile(`^[\s|:-]+$`)
+	mdLinkRe      = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 )
 
 // Структурные персональные данные вырезаются детерминированно до записи в
@@ -1311,16 +1389,6 @@ var (
 	phoneRe = regexp.MustCompile(`(?:\+\d{1,3}[\s(-]?)?\d{3}[\s)-]\d{3}[\s-]\d{2}[\s-]\d{2}|\b[78]\d{10}\b`)
 	cardRe  = regexp.MustCompile(`\b\d{4}[\s-]\d{4}[\s-]\d{4}[\s-]\d{4}\b`)
 )
-
-func scrubContacts(text string) string {
-	text = emailRe.ReplaceAllString(text, "[почта]")
-	text = cardRe.ReplaceAllString(text, "[карта]")
-	return phoneRe.ReplaceAllString(text, "[телефон]")
-}
-
-// titleStopWords - служебные слова, с которых заголовок начинать нельзя: тип
-// тикета виден по метке, а в списке видно только заголовок.
-var titleStopWords = []string{"проблема", "баг", "ошибка", "просьба", "вопрос", "запрос"}
 
 func kindList(rules Contract) []string {
 	kinds := make([]string, 0, len(rules))

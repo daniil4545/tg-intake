@@ -187,7 +187,7 @@ func TestCancelDeniedForStranger(t *testing.T) {
 		t.Errorf("чужая отмена дошла до GitHub: %v", got)
 	}
 
-	if _, err := tickets.Cancel(context.Background(), testProject(t, pool), 40, 9999); err != ErrNotAuthor {
+	if _, err := tickets.Cancel(context.Background(), testProject(t, pool), 40, 9999, 0); err != ErrNotAuthor {
 		t.Errorf("постановка чужой отмены: %v", err)
 	}
 }
@@ -445,6 +445,13 @@ func addProject(t *testing.T, pool *pgxpool.Pool, slug string) ProjectConfig {
 		t.Fatalf("sync projects: %v", err)
 	}
 	t.Cleanup(func() {
+		// Тикеты теста ссылаются на проект внешним ключом: без снятия ссылки
+		// удаление проекта отказывает (cases_project_id_fkey), и следующий тест
+		// видит его в общем списке.
+		if _, err := pool.Exec(ctx,
+			`DELETE FROM cases WHERE project_id = (SELECT id FROM projects WHERE slug = $1)`, slug); err != nil {
+			t.Logf("cleanup cases of project %s: %v", slug, err)
+		}
 		if _, err := pool.Exec(ctx, `DELETE FROM projects WHERE slug = $1`, slug); err != nil {
 			t.Logf("cleanup project %s: %v", slug, err)
 		}

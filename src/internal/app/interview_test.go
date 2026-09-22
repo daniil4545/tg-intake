@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -34,98 +35,75 @@ func newTestInterview(t *testing.T, cases *Cases, rounds int) *Interview {
 	return NewInterview(cases, nil, log, testRules(t), DialogModel{Name: "test-model"}, rounds, nil)
 }
 
-// TestLoadContract: правила едут в бинарь и обязаны быть рабочими. Тип без
-// единого обязательного пункта означает, что готовым считается любое обращение,
-// и интервью не задаст ни одного вопроса - это должно ронять старт, а не
-// обнаруживаться на живом диалоге.
+// TestLoadContract: правила едут в бинарь и обязаны быть рабочими. Тип из
+// CHECK cases.kind без пунктов в правилах, как и повтор ключа, должен ронять
+// старт, а не обнаруживаться на живом диалоге.
 func TestLoadContract(t *testing.T) {
 	rules := testRules(t)
 
+	if !slices.Contains(caseKinds, "mixed") {
+		t.Errorf("тип mixed не в списке типов: %v", caseKinds)
+	}
 	for _, kind := range caseKinds {
 		if len(rules.Items(kind)) == 0 {
 			t.Errorf("тип %q остался без пунктов", kind)
 		}
 	}
-	if rules.Title("bug", "case") == "" {
-		t.Error("заголовок пункта bug.case пуст, он же заголовок раздела issue")
-	}
 
-	err := checkItems("bug", []ContractItem{{Key: "case", Title: "Случай"}})
-	if err == nil {
-		t.Error("тип без обязательных пунктов принят, ожидался отказ")
-	}
-	err = checkItems("bug", []ContractItem{
-		{Key: "case", Title: "Случай", Required: true},
-		{Key: "case", Title: "Второй раз", Required: true},
+	err := checkItems("bug", []ContractItem{
+		{Key: "case", Title: "Случай"},
+		{Key: "case", Title: "Второй раз"},
 	})
 	if err == nil {
 		t.Error("повтор ключа принят, ожидался отказ")
 	}
 }
 
-// TestContractHoldsReadiness: состав пунктов правится данными, и правка легко
-// отменяет смысл среза. Признак готовности обязан держать готовность пожелания,
-// иначе тикет снова описывает желание без границы сделанного; необязательный
-// пункт держать её не имеет права - иначе незнание автора станет неполнотой.
-func TestContractHoldsReadiness(t *testing.T) {
+// TestContractCore: правила - только ядро (Р-1). Правка данных легко вернула
+// бы анкету: каждый лишний пункт - лишний вопрос автору и метка неполноты.
+func TestContractCore(t *testing.T) {
 	rules := testRules(t)
 
-	wish := map[string]string{
-		"problem": "выгрузку собирают руками",
-		"today":   "копируют строки в таблицу",
-		"result":  "кнопка «выгрузить» в списке",
+	want := map[string][]string{
+		"bug":      {"case", "wrong"},
+		"feature":  {"need", "why"},
+		"question": {"question"},
+		"mixed":    {"case", "wrong", "need", "why"},
 	}
-	gaps := rules.Missing("feature", wish)
-	if !slices.Contains(gaps, "done") {
-		t.Errorf("пожелание без признака готовности считается готовым, пробелы: %v", gaps)
-	}
-	// Частота нужна для решения «стоит ли автоматизировать», но незнание её не
-	// делает обращение неполным: пункт необязателен и в пробелы не попадает.
-	if slices.Contains(gaps, "volume") {
-		t.Errorf("частота попала в пробелы: %v", gaps)
-	}
-
-	bug := map[string]string{
-		"case":     "заказ 4821",
-		"expected": "статус меняется",
-		"actual":   "статус прежний",
-	}
-	if gaps := rules.Missing("bug", bug); len(gaps) != 0 {
-		t.Errorf("необязательный пункт держит готовность бага, пробелы: %v", gaps)
-	}
-
-	// Путь до готовности стоит автору вопросов, и правка правил не имеет права
-	// удлинить его молча: раундов три, каждый новый обязательный пункт приближает
-	// метку неполноты. Держим состав, а не длину: счётчик пропустил бы подмену,
-	// снимающую обязательность с «как делают сейчас» ради нового пункта, - а
-	// именно эта пара с «каким должен быть результат» и делает тикет исполнимым.
-	var required []string
-	for _, it := range rules.Items("feature") {
-		if it.Required {
-			required = append(required, it.Key)
+	for kind, keys := range want {
+		var got []string
+		for _, it := range rules.Items(kind) {
+			got = append(got, it.Key)
+		}
+		if !slices.Equal(got, keys) {
+			t.Errorf("ядро %s: %v, ожидалось %v", kind, got, keys)
 		}
 	}
-	want := []string{"problem", "today", "result", "done"}
-	if !slices.Equal(required, want) {
-		t.Errorf("обязательные пункты пожелания: %v, ожидались %v", required, want)
+	filled := map[string]string{"case": "сделка 59767187", "wrong": "закрыта дублем"}
+	if gaps := rules.Missing("mixed", filled); !slices.Equal(gaps, []string{"need", "why"}) {
+		t.Errorf("пробелы смеси: %v", gaps)
 	}
 }
 
 // TestCheckTurn: схема гарантирует форму ответа, смысл проверяет Go. Каждое
 // нарушение здесь прошло бы схему насквозь и испортило бы тикет молча.
 func TestCheckTurn(t *testing.T) {
-	i := newTestInterview(t, nil, 3)
+	i := newTestInterview(t, nil, 2)
 
 	full := []keyValue{
-		{Key: "case", Value: "заказ 4821"},
-		{Key: "expected", Value: "статус меняется"},
-		{Key: "actual", Value: "статус прежний"},
+		{Key: "case", Value: "сделка 59767187"},
+		{Key: "wrong", Value: "закрыта «Дублем», ожидали «Встреча назначена»"},
+	}
+	wish := []keyValue{
+		{Key: "need", Value: "отказ нерелевантным лидам автоматически"},
+		{Key: "why", Value: "сейчас отказывают руками"},
 	}
 
 	tests := []struct {
 		name  string
 		prior map[string]string
 		turn  interviewTurn
+		stuck bool
 		ok    bool
 	}{
 		{
@@ -134,99 +112,172 @@ func TestCheckTurn(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name:  "обязательный пункт закрыт прошлым раундом",
-			prior: map[string]string{"case": "заказ 4821"},
-			turn: interviewTurn{
-				Kind:      "bug",
-				Filled:    full[1:],
-				Gaps:      []string{"where"},
-				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
-			},
-			ok: true,
+			name:  "пункт закрыт прошлым раундом",
+			prior: map[string]string{"case": "сделка 59767187"},
+			turn:  interviewTurn{Kind: "bug", Filled: full[1:], Ready: true},
+			ok:    true,
+		},
+		{
+			name: "смесь с ядром бага и пожелания",
+			turn: interviewTurn{Kind: "mixed", Filled: append(slices.Clone(full), wish...), Ready: true},
+			ok:   true,
 		},
 		{
 			name: "четыре вопроса",
 			turn: interviewTurn{
-				Kind: "bug",
-				Gaps: []string{"case", "expected", "actual", "where"},
+				Kind: "mixed",
+				Gaps: []string{"case", "wrong", "need", "why"},
 				Questions: []Question{
-					{Key: "case", Text: "а"}, {Key: "expected", Text: "б"},
-					{Key: "actual", Text: "в"}, {Key: "where", Text: "г"},
+					{Key: "case", Text: "а"}, {Key: "wrong", Text: "б"},
+					{Key: "need", Text: "в"}, {Key: "why", Text: "г"},
 				},
 			},
 		},
 		{
-			name: "ключ вне контракта",
+			// Иначе mergeFilled молча взял бы последнее значение и потерял
+			// первую идею - та же проверка, что и у повтора вопроса. Ядро
+			// иначе закрыто и готово (как "готовый ход"), чтобы отказ был
+			// именно от повтора ключа, а не от чего-то ещё.
+			name: "два значения одного ключа",
 			turn: interviewTurn{
-				Kind:      "bug",
-				Gaps:      []string{"deadline"},
-				Questions: []Question{{Key: "deadline", Text: "когда нужно?"}},
+				Kind: "bug",
+				Filled: []keyValue{
+					{Key: "case", Value: "сделка 59767187"},
+					{Key: "case", Value: "сделка 60000000"},
+					{Key: "wrong", Value: "закрыта «Дублем», ожидали «Встреча назначена»"},
+				},
+				Ready: true,
 			},
 		},
 		{
-			// Тот самый ход, который контур выбрасывал до 0.1.6: обязательные
-			// закрыты, необязательный честно назван пробелом.
-			name: "готов при незакрытом необязательном пункте",
-			turn: interviewTurn{Kind: "bug", Filled: full, Gaps: []string{"where"}, Ready: true},
-			ok:   true,
+			// Старый ключ из памяти модели: ядро его не знает.
+			name: "ключ вне ядра",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[:1],
+				Gaps:      []string{"wrong", "expected"},
+				Questions: []Question{{Key: "expected", Text: "что ожидали?"}},
+			},
 		},
 		{
-			name: "готов при незакрытом обязательном пункте",
-			turn: interviewTurn{Kind: "bug", Filled: full[:2], Gaps: []string{"actual"}, Ready: true},
+			name: "уточнение при закрытом ядре",
+			turn: interviewTurn{
+				Kind:   "feature",
+				Filled: wish,
+				Questions: []Question{{Key: detailKey, Text: "по какому признаку лид нерелевантен?",
+					Suggested: "нет бюджета"}},
+			},
+			ok: true,
+		},
+		{
+			// Лишние уточнения снимает Go после проверки, ход из-за них не
+			// отклоняется (R6).
+			name: "два уточнения",
+			turn: interviewTurn{
+				Kind:   "bug",
+				Filled: full,
+				Questions: []Question{
+					{Key: detailKey, Text: "а"}, {Key: detailKey, Text: "б"},
+				},
+			},
+			ok: true,
+		},
+		{
+			// Раунд из одного уточнения при открытом ядре тратит вопрос мимо
+			// того, без чего тикет неполон.
+			name: "уточнение при открытом ядре без вопроса о нём",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[:1],
+				Gaps:      []string{"wrong"},
+				Questions: []Question{{Key: detailKey, Text: "где смотрели?"}},
+			},
+		},
+		{
+			name: "уточнение рядом с вопросом о ядре",
+			turn: interviewTurn{
+				Kind:   "bug",
+				Filled: full[:1],
+				Gaps:   []string{"wrong"},
+				Questions: []Question{
+					{Key: "wrong", Text: "что пошло не так?"}, {Key: detailKey, Text: "где смотрели?"},
+				},
+			},
+			ok: true,
+		},
+		{
+			name: "готов при незакрытом пункте ядра",
+			turn: interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"wrong"}, Ready: true},
 		},
 		{
 			// Готовность обрывает разговор: заданный тем же ходом вопрос автору
 			// уже не уйдёт, и молча потерять его нельзя.
-			name: "готов и всё же спрашивает",
+			name: "готов и всё же уточняет",
 			turn: interviewTurn{
 				Kind:      "bug",
 				Filled:    full,
-				Gaps:      []string{"where"},
-				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
+				Questions: []Question{{Key: detailKey, Text: "где смотрели?"}},
 				Ready:     true,
 			},
 		},
 		{
-			name: "обязательный пункт не закрыт и не назван пробелом",
+			name: "пункт ядра не закрыт и не назван пробелом",
 			turn: interviewTurn{
 				Kind:      "bug",
 				Filled:    full[:1],
-				Gaps:      []string{"expected"},
-				Questions: []Question{{Key: "expected", Text: "что ожидалось?"}},
+				Questions: []Question{{Key: detailKey, Text: "где смотрели?"}},
 			},
 		},
 		{
 			name: "не готов и спросить нечего",
-			turn: interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"expected", "actual"}},
+			turn: interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"wrong"}},
+		},
+		{
+			// Автор отказался уточнять, лимит повторов и раундов исчерпан:
+			// ход без вопросов - не тупик, а переход в саммари с incomplete.
+			name:  "не готов и спросить нечего, но лимит исчерпан",
+			turn:  interviewTurn{Kind: "bug", Filled: full[:1], Gaps: []string{"wrong"}},
+			stuck: true,
+			ok:    true,
+		},
+		{
+			// stuck снимает только запрет на пустые Questions - раунд из
+			// одного detail мимо открытого ядра остаётся отказом.
+			name: "уточнение при открытом ядре без вопроса о нём, лимит исчерпан",
+			turn: interviewTurn{
+				Kind:      "bug",
+				Filled:    full[:1],
+				Gaps:      []string{"wrong"},
+				Questions: []Question{{Key: detailKey, Text: "где смотрели?"}},
+			},
+			stuck: true,
 		},
 		{
 			name: "вопрос про закрытый пункт",
 			turn: interviewTurn{
 				Kind:      "bug",
 				Filled:    full,
-				Gaps:      []string{"where"},
-				Questions: []Question{{Key: "case", Text: "а какой заказ?"}},
+				Questions: []Question{{Key: "case", Text: "а какая сделка?"}},
 			},
 		},
 		{
 			// Отписка вместо догадки обесценивает кнопку «Всё так»: автор
-			// читает «Предполагаю: не указано» и перестаёт ей верить. Ловить
-			// это на нажатии поздно - текст он уже увидел.
+			// читает «Предполагаю: не указано» и перестаёт ей верить.
 			name: "отписка вместо предположения",
 			turn: interviewTurn{
 				Kind:      "bug",
 				Filled:    full[:1],
-				Gaps:      []string{"expected", "actual"},
-				Questions: []Question{{Key: "expected", Text: "что ожидалось?", Suggested: "не указано"}},
+				Gaps:      []string{"wrong"},
+				Questions: []Question{{Key: "wrong", Text: "что пошло не так?", Suggested: "не указано"}},
 			},
 		},
 		{
-			name: "предположение без догадки допустимо пустым",
+			name: "предположение допустимо пустым",
 			turn: interviewTurn{
 				Kind:      "bug",
-				Filled:    full,
-				Gaps:      []string{"where"},
-				Questions: []Question{{Key: "where", Text: "где смотрели?"}},
+				Filled:    full[:1],
+				Gaps:      []string{"wrong"},
+				Questions: []Question{{Key: "wrong", Text: "что пошло не так?"}},
 			},
 			ok: true,
 		},
@@ -234,7 +285,7 @@ func TestCheckTurn(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := i.checkTurn(tt.prior, tt.turn)
+			err := i.checkTurn(tt.prior, tt.turn, tt.stuck)
 			if tt.ok && err != nil {
 				t.Errorf("ход отклонён: %v", err)
 			}
@@ -245,27 +296,96 @@ func TestCheckTurn(t *testing.T) {
 	}
 }
 
+// TestAllExhausted: askTurn считает stuck по этой функции, а TestCheckTurn
+// проверяет stuck напрямую булевым значением - без этого теста ошибка в
+// подсчёте лимита (askedKeys, maxAsks) прошла бы незамеченной.
+func TestAllExhausted(t *testing.T) {
+	tests := []struct {
+		name  string
+		gaps  []string
+		asked map[string]int
+		want  bool
+	}{
+		{"пустой gaps - другая ошибка, не исчерпание", nil, map[string]int{"wrong": maxAsks}, false},
+		{"один пробел ниже лимита", []string{"wrong"}, map[string]int{"wrong": maxAsks - 1}, false},
+		{"один пробел на лимите", []string{"wrong"}, map[string]int{"wrong": maxAsks}, true},
+		{"из двух один ниже лимита", []string{"wrong", "case"}, map[string]int{"wrong": maxAsks, "case": 0}, false},
+		{"оба на лимите или выше", []string{"wrong", "case"}, map[string]int{"wrong": maxAsks, "case": maxAsks + 1}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allExhausted(tt.gaps, tt.asked); got != tt.want {
+				t.Errorf("allExhausted(%v, %v) = %v, want %v", tt.gaps, tt.asked, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDropDetails: уточнение вне ядра - одно на обращение и только в первом
+// раунде (Р-3). Модель номера раунда не знает, предел держит Go.
+func TestDropDetails(t *testing.T) {
+	questions := []Question{
+		{Key: detailKey, Text: "первое"},
+		{Key: "wrong", Text: "что пошло не так?"},
+		{Key: detailKey, Text: "второе"},
+	}
+
+	tests := []struct {
+		name    string
+		round   int
+		want    []string
+		dropped int
+	}{
+		{"первый раунд", 0, []string{"первое", "что пошло не так?"}, 1},
+		{"второй раунд", 1, []string{"что пошло не так?"}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kept, dropped := dropDetails(slices.Clone(questions), tt.round)
+			var got []string
+			for _, q := range kept {
+				got = append(got, q.Text)
+			}
+			if !slices.Equal(got, tt.want) || dropped != tt.dropped {
+				t.Errorf("round=%d: оставлено %v, снято %d; ожидалось %v, %d",
+					tt.round, got, dropped, tt.want, tt.dropped)
+			}
+		})
+	}
+}
+
 // TestMergeFilled: контракт копится между раундами. Пункт, не повторённый
-// моделью, не пропадает; ключ в gaps переоткрывает пункт; ключ вне контракта
-// текущего типа снимается.
+// моделью, не пропадает; ключ в gaps переоткрывает пункт; ключ вне ядра
+// текущего типа снимается, а переход бага в смесь ядро бага сохраняет.
 func TestMergeFilled(t *testing.T) {
-	i := newTestInterview(t, nil, 3)
+	i := newTestInterview(t, nil, 2)
 
-	prior := map[string]string{
-		"case":     "заказ 4821",
-		"expected": "статус меняется",
-		"чужой":    "ключ другого типа",
+	tests := []struct {
+		name  string
+		prior map[string]string
+		turn  interviewTurn
+		want  map[string]string
+	}{
+		{
+			name:  "баг",
+			prior: map[string]string{"case": "сделка 1", "need": "ключ другого типа"},
+			turn: interviewTurn{Kind: "bug",
+				Filled: []keyValue{{Key: "wrong", Value: " закрыта дублем "}}, Gaps: []string{"case"}},
+			want: map[string]string{"wrong": "закрыта дублем"},
+		},
+		{
+			name:  "баг стал смесью",
+			prior: map[string]string{"case": "сделка 1", "wrong": "закрыта дублем"},
+			turn:  interviewTurn{Kind: "mixed", Filled: []keyValue{{Key: "need", Value: "напоминание за час"}}},
+			want:  map[string]string{"case": "сделка 1", "wrong": "закрыта дублем", "need": "напоминание за час"},
+		},
 	}
-	turn := interviewTurn{
-		Kind:   "bug",
-		Filled: []keyValue{{Key: "actual", Value: " статус прежний "}},
-		Gaps:   []string{"expected"},
-	}
-
-	got := i.mergeFilled(prior, turn)
-	want := map[string]string{"case": "заказ 4821", "actual": "статус прежний"}
-	if !maps.Equal(got, want) {
-		t.Errorf("слито %v, ожидалось %v", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := i.mergeFilled(tt.prior, tt.turn); !maps.Equal(got, tt.want) {
+				t.Errorf("слито %v, ожидалось %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -293,7 +413,7 @@ func TestScrubContacts(t *testing.T) {
 // метке типа.
 func TestSummaryTitle(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
-	cs := &Case{Kind: "bug"}
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "заявка 4821"}}
 
 	const brief = "Заявка не сохраняется после нажатия «Готово», данные теряются."
 	if err := i.checkSummary(cs, summaryOut{Title: "Заявка не сохраняется", Brief: brief}); err != nil {
@@ -315,7 +435,7 @@ func TestSummaryTitle(t *testing.T) {
 // останавливает тикет, краткое достраивается из первого раздела саммари.
 func TestSummaryBrief(t *testing.T) {
 	i := newTestInterview(t, nil, 3)
-	cs := &Case{Kind: "bug"}
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "заявка 4821"}}
 	title := "Заявка не сохраняется"
 
 	if err := i.checkSummary(cs, summaryOut{Title: title, Brief: "  "}); err != nil {
@@ -389,12 +509,12 @@ func TestLostKeys(t *testing.T) {
 	}
 }
 
-// TestSummaryWithoutSections: ответ модели без разделов больше не отклоняется.
-// Именно эта проверка уводила работу в повторы и оставляла автора без единого
-// слова на минуты, пока модель не отвечала «как надо».
+// TestSummaryWithoutSections: ответ модели без разделов не отклоняется и не
+// повторяется. Именно эта проверка уводила работу в повторы и оставляла автора
+// без единого слова на минуты, пока модель не отвечала «как надо».
 func TestSummaryWithoutSections(t *testing.T) {
-	i := newTestInterview(t, nil, 3)
-	i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","sections":[]}`)
+	i := newTestInterview(t, nil, 2)
+	i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","brief":"","sections":[]}`)
 	cs := &Case{ID: "case-1", Kind: "bug", Filled: map[string]string{"case": "заказ 4821"}}
 
 	messages := []Message{{Role: "system", Parts: []Part{TextPart("промт")}}}
@@ -407,49 +527,166 @@ func TestSummaryWithoutSections(t *testing.T) {
 	}
 }
 
-// TestSectionsFallBackToContract: содержание пунктов уже собрано интервью, и
-// молчание модели не имеет права остановить тикет. Раньше такой ответ уходил в
-// повторы, а автор ждал в тишине.
+// TestCheckSummary: заголовки разделов пишет модель, а тело issue собирает Go.
+// Чужой markdown в заголовке, занятое имя или раздел про пункт другого типа
+// ломали бы тело тикета молча (Р-6).
+func TestCheckSummary(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "сделка 59767187"}}
+
+	section := func(heading string) Section { return Section{Heading: heading, Text: "текст"} }
+	many := func(n int) []Section {
+		out := make([]Section, n)
+		for k := range out {
+			out[k] = section(fmt.Sprintf("Раздел %d", k+1))
+		}
+		return out
+	}
+
+	tests := []struct {
+		name     string
+		sections []Section
+		ok       bool
+	}{
+		{"без разделов", nil, true},
+		{"шесть разделов", many(6), true},
+		{"раздел пункта ядра", []Section{{Key: "case", Heading: "Сделка", Text: "59767187"}}, true},
+		{"семь разделов", many(7), false},
+		{"заголовок длиннее 60", []Section{section(strings.Repeat("з", 61))}, false},
+		{"пустой заголовок", []Section{section("  ")}, false},
+		{"перевод строки", []Section{section("Шаги\nи ещё")}, false},
+		{"решётка", []Section{section("Шаги # два")}, false},
+		{"угловая скобка", []Section{section("Шаги <b>")}, false},
+		{"занято Кратко", []Section{section("Кратко")}, false},
+		{"занято ссылки", []Section{section(" ссылки ")}, false},
+		{"занято Пересечения", []Section{section("Пересечения")}, false},
+		{"пустой текст", []Section{{Heading: "Шаги", Text: " "}}, false},
+		{"заголовок внутри текста", []Section{{Heading: "Шаги", Text: "раз\n## Ссылки\nдва"}}, false},
+		{"номер тикета в начале строки", []Section{{Heading: "Шаги", Text: "раз\n#57 уже закрыт"}}, true},
+		{"ключ другого типа становится свободным разделом", []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр"}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := i.checkSummary(cs, summaryOut{Title: "Сделка закрыта дублем", Sections: tt.sections})
+			if tt.ok && err != nil {
+				t.Errorf("саммари отклонено: %v", err)
+			}
+			if !tt.ok && err == nil {
+				t.Errorf("саммари с разделами %q принято", tt.sections)
+			}
+		})
+	}
+}
+
+// TestCheckSummaryNeedsBody: без разделов и без ядра тело собрать не из чего,
+// а сырой протокол в него не идёт - он не обезличен моделью.
+func TestCheckSummaryNeedsBody(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	if err := i.checkSummary(&Case{Kind: "bug"}, summaryOut{Title: "Сделка закрыта дублем"}); err == nil {
+		t.Fatal("саммари без разделов и ядра принято")
+	}
+}
+
+// TestCheckSummary_ForeignKeyDropped: тип менялся по ходу интервью
+// (case_kind_changed), и раздел под ключ прежнего типа не должен ронять
+// саммари на пустом месте - ключ снимается, а текст остаётся в теле тикета.
+func TestCheckSummary_ForeignKeyDropped(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	cs := &Case{Kind: "bug"}
+	out := summaryOut{
+		Title:    "Сделка закрыта дублем",
+		Sections: []Section{{Key: "need", Heading: "Что нужно", Text: "фильтр по статусу"}},
+	}
+
+	if err := i.checkSummary(cs, out); err != nil {
+		t.Fatalf("саммари с чужим ключом отклонено: %v", err)
+	}
+	if out.Sections[0].Key != "" {
+		t.Fatalf("ключ %q не снят", out.Sections[0].Key)
+	}
+	if body := i.renderSections(cs, out.Sections); !strings.Contains(body, "фильтр по статусу") {
+		t.Fatalf("текст раздела потерян в теле:\n%s", body)
+	}
+}
+
+// TestSectionsFallBackToContract: содержание ядра уже собрано интервью, и
+// молчание модели не имеет права остановить тикет.
 func TestSectionsFallBackToContract(t *testing.T) {
-	i := newTestInterview(t, nil, 3)
+	i := newTestInterview(t, nil, 2)
 	cs := &Case{
 		Kind:   "bug",
-		Filled: map[string]string{"case": "заказ 4821", "actual": "статус остался «новый»", "expected": "статус «оплачен»"},
-		Gaps:   []string{"expected"},
+		Filled: map[string]string{"case": "сделка 59767187", "wrong": "закрыта «Дублем»"},
 	}
 
 	body := i.renderSections(cs, nil)
 
-	for _, want := range []string{"заказ 4821", "статус остался «новый»"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("закрытый пункт потерян: %q\nтело:\n%s", want, body)
-		}
-	}
-	// Пробел остаётся пробелом: недобранное не выдаётся за собранное.
-	if strings.Contains(body, "статус «оплачен»") {
-		t.Errorf("пробел ушёл в тело саммари:\n%s", body)
+	want := "## Конкретный случай\n\nсделка 59767187\n\n## Что пошло не так\n\nзакрыта «Дублем»"
+	if body != want {
+		t.Errorf("тело саммари:\nполучено:\n%s\nожидалось:\n%s", body, want)
 	}
 }
 
-// TestRenderSections: порядок разделов задают правила, а не ответ модели, и
-// заголовки берутся оттуда же. Одно место задаёт и что спрашиваем, и как это
-// выглядит в тикете.
-func TestRenderSections(t *testing.T) {
-	i := newTestInterview(t, nil, 3)
+// TestSectionsKeepCore: закрытый пункт ядра, который модель не покрыла
+// разделом, дописывается из собранного - ни одна идея не выбрасывается, и
+// держит это Go, а не промт.
+func TestSectionsKeepCore(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	cs := &Case{
+		Kind:   "bug",
+		Filled: map[string]string{"case": "сделка 59767187", "wrong": "закрыта «Дублем»"},
+	}
 
-	body := i.renderSections(&Case{Kind: "bug"}, []section{
-		{Key: "actual", Text: "статус остался «новый»"},
-		{Key: "case", Text: "заказ 4821 от вторника"},
-		{Key: "where", Text: ""},
+	body := i.renderSections(cs, []Section{{Key: "case", Heading: "Сделка", Text: "59767187 от вторника"}})
+
+	if !strings.Contains(body, "## Что пошло не так\n\nзакрыта «Дублем»") {
+		t.Errorf("закрытый пункт потерян:\n%s", body)
+	}
+	if strings.Contains(body, "## Конкретный случай") {
+		t.Errorf("покрытый разделом пункт повторён:\n%s", body)
+	}
+}
+
+// TestRenderSections: разделы идут в порядке модели под её заголовками, раздел
+// про пункт из пробелов остаётся (это слова автора, пробел назовёт строка «Не
+// уточнено»), а заголовок обезличивается так же, как текст.
+func TestRenderSections(t *testing.T) {
+	i := newTestInterview(t, nil, 2)
+	cs := &Case{Kind: "bug", Filled: map[string]string{"case": "сделка 59767187"}, Gaps: []string{"wrong"}}
+
+	body := i.renderSections(cs, []Section{
+		{Heading: "Звонок +7 916 123-45-67", Text: "клиент перезвонил"},
+		{Key: "case", Heading: "Сделка", Text: "59767187"},
+		{Key: "wrong", Heading: "Что не так", Text: "слова автора"},
 	})
 
-	want := "## Конкретный случай\n\nзаказ 4821 от вторника\n\n" +
-		"## Что произошло на самом деле\n\nстатус остался «новый»"
+	want := "## Звонок [телефон]\n\nклиент перезвонил\n\n## Сделка\n\n59767187\n\n" +
+		"## Что не так\n\nслова автора"
 	if body != want {
 		t.Errorf("тело саммари:\nполучено:\n%s\nожидалось:\n%s", body, want)
 	}
 	if strings.Contains(plainText(body), "## ") {
 		t.Error("в сообщении автору остались markdown-заголовки")
+	}
+}
+
+// TestSummaryMessageUnclear: автор видит незакрытое ядро до «Публикую» одной
+// строкой, а при закрытом ядре не видит ни строки, ни обещания пометки (R4).
+func TestSummaryMessageUnclear(t *testing.T) {
+	rules := testRules(t)
+
+	open := summaryMessage("Заголовок", "", "## Случай\n\nтекст",
+		rules.Unclear("bug", map[string]string{"case": "сделка 1"}), "")
+	if !strings.Contains(open, "Не уточнено: что пошло не так. Тикет уйдёт с пометкой о неполноте.") {
+		t.Errorf("строки пробела нет:\n%s", open)
+	}
+	if strings.Contains(open, "Остались пробелы") {
+		t.Errorf("старый список пробелов:\n%s", open)
+	}
+
+	closed := summaryMessage("Заголовок", "", "## Случай\n\nтекст",
+		rules.Unclear("bug", map[string]string{"case": "сделка 1", "wrong": "дубль"}), "")
+	if strings.Contains(closed, "Не уточнено") || strings.Contains(closed, "неполноте") {
+		t.Errorf("пробел при закрытом ядре:\n%s", closed)
 	}
 }
 
@@ -495,8 +732,8 @@ func TestAcceptRound(t *testing.T) {
 
 	questions := []Question{
 		{Key: "case", Text: "какой заказ?", Suggested: "заказ 4821"},
-		{Key: "expected", Text: "что ожидали?", Suggested: "статус меняется на «оплачен»"},
-		{Key: "actual", Text: "что вышло?", Suggested: "статус остался «новый»"},
+		{Key: "wrong", Text: "что пошло не так?", Suggested: "статус не сменился на «оплачен»"},
+		{Key: detailKey, Text: "где смотрели?", Suggested: "в карточке заказа"},
 	}
 	err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{"round": 1, "questions": questions})
 	if err != nil {
@@ -550,7 +787,7 @@ func TestAcceptRoundSkipsStub(t *testing.T) {
 
 	questions := []Question{
 		{Key: "case", Text: "какой заказ?", Suggested: "заказ 4821"},
-		{Key: "actual", Text: "что вышло?", Suggested: "Не указано"},
+		{Key: "wrong", Text: "что вышло?", Suggested: "Не указано"},
 	}
 	err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{"round": 1, "questions": questions})
 	if err != nil {
@@ -583,8 +820,8 @@ func TestExhaustedQuestionGoesToSummary(t *testing.T) {
 	cs := startInterview(t, cases, 6011, 1)
 
 	turn := `{"kind":"bug","filled":[{"key":"case","value":"заказ 4821"}],` +
-		`"gaps":["expected","actual"],"ready":false,` +
-		`"questions":[{"key":"expected","text":"что ожидали?","suggested":"статус «оплачен»"}]}`
+		`"gaps":["wrong"],"ready":false,` +
+		`"questions":[{"key":"wrong","text":"что ожидали?","suggested":"статус «оплачен»"}]}`
 	i := newTestInterview(t, cases, 3)
 	i.llm = fakeLLM(t, turn)
 
@@ -592,7 +829,7 @@ func TestExhaustedQuestionGoesToSummary(t *testing.T) {
 	// должно, даже если модель его предлагает.
 	for n := 1; n <= maxAsks; n++ {
 		err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
-			"round": n, "questions": []Question{{Key: "expected", Text: "что ожидали?"}},
+			"round": n, "questions": []Question{{Key: "wrong", Text: "что ожидали?"}},
 		})
 		if err != nil {
 			t.Fatalf("add round: %v", err)
@@ -610,7 +847,7 @@ func TestExhaustedQuestionGoesToSummary(t *testing.T) {
 	if n := countJobs(t, pool, JobNotify, cs.ID); n != 0 {
 		t.Errorf("исчерпанный пункт ушёл автору третьим вопросом: уведомлений %d", n)
 	}
-	if got := reload(t, cases, cs.ID).Gaps; len(got) != 2 {
+	if got := reload(t, cases, cs.ID).Gaps; len(got) != 1 {
 		t.Errorf("пробелы не сохранены: %v", got)
 	}
 }
@@ -626,8 +863,8 @@ func TestRoundWithoutSuggestionHasNoButton(t *testing.T) {
 	cs := startInterview(t, cases, 6021, 1)
 
 	turn := `{"kind":"bug","filled":[{"key":"case","value":"заказ 4821"}],` +
-		`"gaps":["expected","actual"],"ready":false,` +
-		`"questions":[{"key":"expected","text":"что ожидали?","suggested":""}]}`
+		`"gaps":["wrong"],"ready":false,` +
+		`"questions":[{"key":"wrong","text":"что ожидали?","suggested":""}]}`
 	i := newTestInterview(t, cases, 3)
 	i.llm = fakeLLM(t, turn)
 
@@ -694,8 +931,8 @@ func TestAskedKeys(t *testing.T) {
 	cs := startInterview(t, cases, 6009, 1)
 
 	rounds := [][]Question{
-		{{Key: "case", Text: "какой заказ?"}, {Key: "expected", Text: "что ожидали?"}},
-		{{Key: "expected", Text: "а всё-таки, что должно было выйти?"}},
+		{{Key: "case", Text: "какой заказ?"}, {Key: "wrong", Text: "что ожидали?"}},
+		{{Key: "wrong", Text: "а всё-таки, что должно было выйти?"}},
 	}
 	for n, questions := range rounds {
 		err := addEvent(ctx, pool, cs.ID, "round_asked", map[string]any{
@@ -710,8 +947,8 @@ func TestAskedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("asked keys: %v", err)
 	}
-	if asked["expected"] < maxAsks {
-		t.Errorf("пункт expected спрошен %d раз, ожидалось не меньше %d", asked["expected"], maxAsks)
+	if asked["wrong"] < maxAsks {
+		t.Errorf("пункт wrong спрошен %d раз, ожидалось не меньше %d", asked["wrong"], maxAsks)
 	}
 	if asked["case"] >= maxAsks {
 		t.Errorf("пункт case исчерпан после одного вопроса: %d", asked["case"])
@@ -908,10 +1145,10 @@ func TestStaleTurnIsDropped(t *testing.T) {
 	turn := interviewTurn{
 		Kind:      "bug",
 		Filled:    []keyValue{{Key: "case", Value: "заказ 4821"}},
-		Gaps:      []string{"expected", "actual"},
-		Questions: []Question{{Key: "expected", Text: "что ожидали?"}},
+		Gaps:      []string{"wrong"},
+		Questions: []Question{{Key: "wrong", Text: "что ожидали?"}},
 	}
-	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 2, false, version)
+	saved, _, _, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 2, false, version)
 	if err != nil {
 		t.Fatalf("save turn: %v", err)
 	}
@@ -940,12 +1177,12 @@ func TestRoundLimitGoesToSummary(t *testing.T) {
 	turn := interviewTurn{
 		Kind:      "bug",
 		Filled:    []keyValue{{Key: "case", Value: "заказ 4821"}},
-		Gaps:      []string{"expected", "actual"},
-		Questions: []Question{{Key: "expected", Text: "что ожидали?"}},
+		Gaps:      []string{"wrong"},
+		Questions: []Question{{Key: "wrong", Text: "что ожидали?"}},
 	}
 	// Предел исчерпан (round=3 при пределе 3), поэтому ход идёт в саммари, а не
 	// задаёт четвёртый раунд.
-	saved, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 3, true, version)
+	saved, _, _, err := i.saveTurn(ctx, cs, turn, map[string]string{"case": "заказ 4821"}, 3, true, version)
 	if err != nil {
 		t.Fatalf("save turn: %v", err)
 	}
@@ -959,7 +1196,7 @@ func TestRoundLimitGoesToSummary(t *testing.T) {
 	if n := countJobs(t, pool, JobNotify, cs.ID); n != 0 {
 		t.Errorf("на пределе раундов автору ушли вопросы: уведомлений %d", n)
 	}
-	if got := reload(t, cases, cs.ID); len(got.Gaps) != 2 {
+	if got := reload(t, cases, cs.ID); len(got.Gaps) != 1 {
 		t.Errorf("пробелы не сохранены: %v", got.Gaps)
 	}
 }
@@ -1065,5 +1302,134 @@ func TestPrefixStable(t *testing.T) {
 	}
 	if first[0].Parts[0].text != second[0].Parts[0].text {
 		t.Error("системный префикс изменился между ходами")
+	}
+}
+
+// TestDetailOnlyGoesToSummary: уточнение во втором раунде Go снимает (R6), и
+// если спросить больше нечего, ход идёт в саммари, а не шлёт автору пустой
+// раунд.
+func TestDetailOnlyGoesToSummary(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6031, 1)
+
+	turn := `{"kind":"bug","filled":[{"key":"case","value":"сделка 59767187"},` +
+		`{"key":"wrong","value":"закрыта дублем"}],"gaps":[],"ready":false,` +
+		`"questions":[{"key":"detail","text":"где смотрели?","suggested":"в карточке сделки"}]}`
+	i := newTestInterview(t, cases, 2)
+	i.llm = fakeLLM(t, turn)
+
+	job := Job{ID: 1, Kind: JobInterview, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := i.Run(ctx, job); err != nil {
+		t.Fatalf("run interview: %v", err)
+	}
+
+	if n := countJobs(t, pool, JobSummarize, cs.ID); n != 1 {
+		t.Errorf("работ саммари: %d, ожидалась 1", n)
+	}
+	if n := countJobs(t, pool, JobNotify, cs.ID); n != 0 {
+		t.Errorf("уточнение второго раунда ушло автору: уведомлений %d", n)
+	}
+}
+
+// TestFixKeepsOneDetail: правка саммари, пришедшего без раундов, может
+// открыть первый раунд, и предел уточнений держится и там: одно, а не два.
+func TestFixKeepsOneDetail(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+	cs := startInterview(t, cases, 6032, 0)
+
+	if err := addEvent(ctx, pool, cs.ID, "summary_ready", map[string]any{"incomplete": false}); err != nil {
+		t.Fatalf("add summary event: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE cases SET status = 'summary' WHERE id = $1`, cs.ID); err != nil {
+		t.Fatalf("move to summary: %v", err)
+	}
+	if err := cases.AddAnswer(ctx, reload(t, cases, cs.ID), "сделка не та"); err != nil {
+		t.Fatalf("add answer: %v", err)
+	}
+
+	turn := `{"kind":"bug","filled":[{"key":"case","value":"сделка 59767187"},` +
+		`{"key":"wrong","value":"закрыта дублем"}],"gaps":[],"ready":false,"questions":[` +
+		`{"key":"detail","text":"первое","suggested":"а"},{"key":"detail","text":"второе","suggested":"б"}]}`
+	i := newTestInterview(t, cases, 2)
+	i.llm = fakeLLM(t, turn)
+
+	job := Job{ID: 1, Kind: JobInterview, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := i.Run(ctx, job); err != nil {
+		t.Fatalf("run interview: %v", err)
+	}
+
+	questions, err := cases.lastQuestions(ctx, cs.ID)
+	if err != nil {
+		t.Fatalf("last questions: %v", err)
+	}
+	if len(questions) != 1 || questions[0].Text != "первое" {
+		t.Errorf("вопросы раунда: %+v, ожидалось одно первое уточнение", questions)
+	}
+}
+
+// TestSummarizeUnclear: метку неполноты и строку «Не уточнено» автору считает
+// Go по ядру, и они совпадают. Модель без разделов при пустом ядре тикет не
+// останавливает: тело собирается из протокола сырья.
+func TestSummarizeUnclear(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	tests := []struct {
+		name       string
+		kind       string
+		contract   string
+		gaps       string
+		incomplete bool
+		unclear    string
+		inBody     string
+	}{
+		{"ядро закрыто", "bug", `{"case": "заказ 4821", "wrong": "статус не сменился"}`, `[]`,
+			false, "", "заказ 4821"},
+		{"ядро открыто", "bug", `{"case": "заказ 4821"}`, `["wrong"]`,
+			true, "Не уточнено: что пошло не так.", "заказ 4821"},
+		{"вопрос без ядра", "question", `{}`, `["question"]`,
+			true, "Не уточнено: вопрос.", "форма не сохраняется"},
+	}
+	for n, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := startInterview(t, cases, int64(6040+n), 1)
+			_, err := pool.Exec(ctx, `UPDATE cases SET kind = $2, contract = $3, gaps = $4 WHERE id = $1`,
+				cs.ID, tt.kind, tt.contract, tt.gaps)
+			if err != nil {
+				t.Fatalf("set contract: %v", err)
+			}
+			i := newTestInterview(t, cases, 2)
+			i.llm = fakeLLM(t, `{"title":"Форма не сохраняется","brief":"","sections":[{"key":"","heading":"Суть","text":"форма не сохраняется"}]}`)
+
+			job := Job{ID: int64(100 + n), Kind: JobSummarize, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+			if err := i.Summarize(ctx, job); err != nil {
+				t.Fatalf("summarize: %v", err)
+			}
+
+			got := reload(t, cases, cs.ID)
+			if got.Status != statusSummary || got.Incomplete != tt.incomplete {
+				t.Errorf("статус %s, incomplete %v; ожидалось summary, %v", got.Status, got.Incomplete, tt.incomplete)
+			}
+			if !strings.Contains(got.Summary, tt.inBody) {
+				t.Errorf("тело без %q:\n%s", tt.inBody, got.Summary)
+			}
+			var text string
+			err = pool.QueryRow(ctx, `SELECT payload->>'text' FROM jobs
+				WHERE kind = $1 AND payload->>'case_id' = $2`, JobNotify, cs.ID).Scan(&text)
+			if err != nil {
+				t.Fatalf("notify job: %v", err)
+			}
+			if tt.unclear == "" && strings.Contains(text, "Не уточнено") {
+				t.Errorf("строка пробела при закрытом ядре:\n%s", text)
+			}
+			if tt.unclear != "" && !strings.Contains(text, tt.unclear) {
+				t.Errorf("нет строки %q:\n%s", tt.unclear, text)
+			}
+		})
 	}
 }

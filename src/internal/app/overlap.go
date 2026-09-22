@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -130,7 +129,7 @@ func (o *Overlap) Check(ctx context.Context, caseID string, p Project, title, br
 
 	// Документы впереди тикетов: они меняются на релизе, а лента тикетов - от
 	// каждой публикации, и общий префикс запроса иначе обесценивался бы чаще.
-	volatile := docsMessage(loaded, "Выдержки из документов проекта:") +
+	volatile := docsMessage(loaded, modelExcerptsHeading) +
 		"\n\n" + issuesMessage(issues)
 	draft := []Message{{Role: "user", Parts: []Part{TextPart(draftMessage(title, brief, body))}}}
 
@@ -221,60 +220,6 @@ func keepFound(items []overlapItem, issues []Issue, loaded []docText) ([]overlap
 	return kept, dropped
 }
 
-// overlapList - готовый список пунктов. Ссылку берёт Go: у документа собирает по
-// ветке из ответа GitHub, у тикета берёт адрес из того же ответа - модель адресов
-// не пишет, тот же довод, что у ответа по документации.
-func overlapList(items []overlapItem, issues []Issue, p Project, ref string) string {
-	found := make(map[int]Issue, len(issues))
-	for _, issue := range issues {
-		found[issue.Number] = issue
-	}
-
-	var b strings.Builder
-	for _, item := range items {
-		if item.Issue != 0 {
-			issue := found[item.Issue]
-			state := ""
-			if issue.State == "closed" {
-				state = ", закрыт"
-			}
-			fmt.Fprintf(&b, "- [Тикет #%d %s](%s)%s: %s\n",
-				item.Issue, linkText(issue.Title), issue.HTMLURL, state, item.Note)
-			continue
-		}
-		links := sourceLinks(p, ref, []string{item.Path})
-		fmt.Fprintf(&b, "- [%s](%s): %s\n", item.Path, links[0], item.Note)
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-// linkText готовит чужой текст к подстановке в markdown-ссылку. Заголовок тикета
-// пишет посторонний человек: скобки внутри него увели бы ссылку мимо собранной
-// Go, а адрес в тексте увёл бы туда же самого автора.
-func linkText(text string) string {
-	text = linkRe.ReplaceAllString(oneLine(text), "[ссылка]")
-	text = strings.NewReplacer("[", "", "]", "", "(", "", ")", "").Replace(text)
-	return cutRunes(text, overlapTitleChars)
-}
-
-// issuesMessage - волатильная часть: тикеты репозитория. Тело не идёт вовсе -
-// сотня описаний не влезет в окно, а для совпадения по сути хватает заголовка,
-// состояния и меток.
-func issuesMessage(issues []Issue) string {
-	if len(issues) == 0 {
-		return "Тикетов в репозитории нет."
-	}
-
-	var b strings.Builder
-	b.WriteString("Последние тикеты репозитория (номер, состояние, метки, заголовок). " +
-		"Список - окно последних, старые тикеты в него не попали:\n")
-	for _, issue := range issues {
-		fmt.Fprintf(&b, "#%d [%s] %s %s\n", issue.Number, issue.State,
-			strings.Join(keepLabels(issue.LabelNames()), ","), linkText(issue.Title))
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
 // keepLabels отсеивает метки, которые сверке ничего не говорят. Метка автора
 // несёт ФИО сотрудника, и в модель она не уходит.
 func keepLabels(labels []string) []string {
@@ -292,12 +237,3 @@ func keepLabels(labels []string) []string {
 
 // draftMessage - черновик тикета последним сообщением: он меняется от обращения к
 // обращению чаще всего и потому стоит в самом хвосте запроса.
-func draftMessage(title, brief, body string) string {
-	var b strings.Builder
-	b.WriteString("Черновик тикета:\n\n" + title + "\n\n")
-	if brief != "" {
-		b.WriteString(brief + "\n\n")
-	}
-	b.WriteString(body)
-	return b.String()
-}

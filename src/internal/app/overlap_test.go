@@ -145,7 +145,7 @@ func TestOverlapEmptyWithoutItems(t *testing.T) {
 	if list := overlapList(kept, nil, Project{}, "main"); list != "" {
 		t.Errorf("пустой список пересечений дал текст: %q", list)
 	}
-	if strings.Contains(summaryMessage("Заголовок", "", "## Случай\n\nтекст", nil, false, ""),
+	if strings.Contains(summaryMessage("Заголовок", "", "## Случай\n\nтекст", "", ""),
 		"уже есть") {
 		t.Error("карточка саммари обещает пересечения, которых нет")
 	}
@@ -154,13 +154,13 @@ func TestOverlapEmptyWithoutItems(t *testing.T) {
 // TestIssueBodyKeepsOverlap: список пересечений уходит в тело тикета отдельным
 // разделом - ради него срез и делается: берущий тикет видит найденный контекст,
 // не восстанавливая его с нуля. Место раздела фиксировано: после ссылок автора и
-// до пробелов контракта.
+// до строки «Не уточнено».
 func TestIssueBodyKeepsOverlap(t *testing.T) {
 	publisher := NewPublisher(nil, nil, testRules(t), testLog(t), 0)
 	cs := &Case{
 		Kind: "feature", Summary: "## Случай\n\nНужно логировать отказы",
 		Overlap: "- [Тикет #57 Автологирование](https://github.com/acme/proj/issues/57), закрыт: та же механика",
-		Gaps:    []string{"steps"},
+		Filled:  map[string]string{"need": "логировать отказы"},
 	}
 
 	body := publisher.body(cs, User{First: "Иван"}, []string{"https://crm/lead/1"}, "<!-- marker -->")
@@ -172,8 +172,8 @@ func TestIssueBodyKeepsOverlap(t *testing.T) {
 	if links := strings.Index(body, "## Ссылки"); links > overlap {
 		t.Errorf("пересечения идут раньше ссылок автора:\n%s", body)
 	}
-	if gaps := strings.Index(body, "## Не разобрано"); gaps < overlap {
-		t.Errorf("пересечения идут после пробелов контракта:\n%s", body)
+	if gaps := strings.Index(body, "Не уточнено"); gaps < overlap {
+		t.Errorf("пересечения идут после строки «Не уточнено»:\n%s", body)
 	}
 
 	cs.Overlap = ""
@@ -188,7 +188,7 @@ func TestIssueBodyKeepsOverlap(t *testing.T) {
 func TestSummaryShowsOverlapPlain(t *testing.T) {
 	overlap := "- [Тикет #57 Автологирование](https://github.com/acme/proj/issues/57): та же механика"
 
-	card := summaryMessage("Заголовок", "", "## Случай\n\nтекст", nil, false, overlap)
+	card := summaryMessage("Заголовок", "", "## Случай\n\nтекст", "", overlap)
 
 	if !strings.Contains(card, "Тикет #57 Автологирование (https://github.com/acme/proj/issues/57)") {
 		t.Errorf("ссылка в карточке осталась разметкой:\n%s", card)

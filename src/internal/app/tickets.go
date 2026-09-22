@@ -238,14 +238,16 @@ func (t *Tickets) MarkSeen(ctx context.Context, caseID string, userID int64) err
 	return nil
 }
 
-// Cancel ставит работу отмены. Через replaceJob: повторная отмена после
-// исчерпанных повторов первой снова уходит в очередь, а не упирается в ключ
-// погашенной работы. Первое значение - обращение тикета: его исход придёт
-// очередью, и бот правит им тот экран, с которого отмену запустили.
-func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64) (string, error) {
+// Cancel ставит работу отмены и запоминает карточку, с которой она запущена
+// (Р-8): msgID - message_id нажатой «Отменить тикет», 0 - без записи. Через
+// replaceJob: повторная отмена после исчерпанных повторов первой снова уходит
+// в очередь, а не упирается в ключ погашенной работы. Первое значение -
+// обращение тикета: его исход придёт очередью и правит записанный экран.
+func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userID int64, msgID int) (string, error) {
 	var caseID string
-	// Чтение и постановка одной транзакцией: между ними обращение может уйти в
-	// отмену вторым нажатием, и работа встала бы поверх уже закрытого тикета.
+	// Чтение, запись экрана и постановка одной транзакцией: между ними
+	// обращение может уйти в отмену вторым нажатием, и работа встала бы поверх
+	// уже закрытого тикета.
 	err := t.cases.inTx(ctx, func(tx pgx.Tx) error {
 		var owner int64
 		row := tx.QueryRow(ctx,
@@ -259,6 +261,12 @@ func (t *Tickets) Cancel(ctx context.Context, project Project, number int, userI
 		}
 		if owner != userID {
 			return ErrNotAuthor
+		}
+		if msgID != 0 {
+			if _, err := tx.Exec(ctx, `UPDATE cases SET screen_msg = $2 WHERE id = $1`,
+				caseID, msgID); err != nil {
+				return fmt.Errorf("set kill screen of case %s: %w", caseID, err)
+			}
 		}
 		return replaceJob(ctx, tx, JobCancelIssue, caseID,
 			cancelPayload{CaseID: caseID, UserID: userID})
@@ -311,7 +319,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 			// issue читалось бы как зависший бот.
 			return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 				return putNotifyKey(ctx, tx, cs.ID, "cancel-gone",
-					fmt.Sprintf("Тикета #%d уже нет в GitHub, отменять нечего.", cs.IssueNumber), keysCancel)
+					msgCancelIssueGone(cs.IssueNumber), keysCancel)
 			})
 		}
 		return err
@@ -325,8 +333,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 	if status, ok := t.statuses.Pick(withoutLabel(names, labelCancelled)); ok && status.Final {
 		return t.cases.inTx(ctx, func(tx pgx.Tx) error {
 			return putNotifyKey(ctx, tx, cs.ID, "cancel-late",
-				fmt.Sprintf("Тикет #%d уже закрыт со статусом «%s», отменять нечего.",
-					cs.IssueNumber, status.Title), keysCancel)
+				msgCancelAlreadyClosed(cs.IssueNumber, status.Title), keysCancel)
 		})
 	}
 
@@ -365,7 +372,7 @@ func (t *Tickets) RunCancel(ctx context.Context, job Job) error {
 		}
 		recorded = true
 		if err := putNotifyKey(ctx, tx, cs.ID, "cancelled",
-			fmt.Sprintf("Тикет #%d отменён и закрыт.", cs.IssueNumber), keysCancel); err != nil {
+			msgCancelled(cs.IssueNumber), keysCancel); err != nil {
 			return err
 		}
 		if t.alertChat == 0 {

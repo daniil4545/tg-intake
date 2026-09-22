@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -211,5 +213,145 @@ func TestLookupFailedTextSeparatesDenial(t *testing.T) {
 	temporary := lookupFailedText(errors.New("read body: context deadline exceeded"))
 	if !strings.Contains(temporary, "Спросите ещё раз") {
 		t.Errorf("временный сбой должен звать спросить ещё раз: %s", temporary)
+	}
+}
+
+// TestIssueBodyUnclear: незакрытое ядро уходит в тикет одной строкой «Не
+// уточнено» перед маркером, а не списком «Не разобрано»; при закрытом ядре
+// строки нет вовсе (R4).
+func TestIssueBodyUnclear(t *testing.T) {
+	publisher := NewPublisher(nil, nil, testRules(t), testLog(t), 0)
+	const marker = "<!-- marker -->"
+
+	tests := []struct {
+		name   string
+		kind   string
+		filled map[string]string
+		want   string
+	}{
+		{"баг без случая", "bug", map[string]string{"wrong": "дубль"},
+			"\n\n---\nНе уточнено: конкретный случай.\n\n" + marker},
+		{"смесь без случая и нужного", "mixed", map[string]string{"wrong": "дубль", "why": "руками долго"},
+			"\n\n---\nНе уточнено: конкретный случай, что нужно.\n\n" + marker},
+		{"ядро закрыто", "bug", map[string]string{"case": "сделка 1", "wrong": "дубль"},
+			"## Случай\n\nтекст\n\n" + marker},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := &Case{Kind: tt.kind, Filled: tt.filled, Summary: "## Случай\n\nтекст"}
+			body := publisher.body(cs, User{First: "Иван"}, nil, marker)
+			if !strings.HasSuffix(body, tt.want) {
+				t.Errorf("хвост тела:\n%q\nожидался:\n%q", body, tt.want)
+			}
+			if strings.Contains(body, "Не разобрано") {
+				t.Errorf("в теле старый список пробелов:\n%s", body)
+			}
+		})
+	}
+}
+
+// TestPublishMixedLabels: смесь уходит одним тикетом с метками обоих типов
+// (Р-2), а меток несуществующего type:mixed GitHub не получает. Проверка - по
+// телу запроса, который принял GitHub. cases.incomplete здесь ложен нарочно:
+// метку ставит тот же счёт по ядру, что и строку «Не уточнено».
+func TestPublishMixedLabels(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 7201, First: "Тест"}, "tg-intake", modeTicket)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		UPDATE cases SET status = 'publishing', kind = 'mixed', title = 'Напоминание',
+		                 summary = '## Склонение', incomplete = false,
+		                 contract = '{"wrong": "имя в неверном падеже", "need": "за час", "why": "за день поздно"}',
+		                 gaps = '["case"]'
+		WHERE id = $1`, cs.ID)
+	if err != nil {
+		t.Fatalf("mark publishing: %v", err)
+	}
+
+	var issue struct {
+		Body   string   `json:"body"`
+		Labels []string `json:"labels"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/daniil4545/tg-intake/issues" {
+			if err := json.NewDecoder(r.Body).Decode(&issue); err != nil {
+				t.Errorf("decode issue: %v", err)
+			}
+			fmt.Fprint(w, `{"number": 78, "html_url": "https://github.com/daniil4545/tg-intake/issues/78"}`)
+			return
+		}
+		fmt.Fprint(w, "[]")
+	}))
+	t.Cleanup(server.Close)
+
+	publisher := NewPublisher(cases, NewGitHub("token", server.URL, nil, testLog(t)), testRules(t), testLog(t), 0)
+	job := Job{ID: 1, Kind: JobPublish, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := publisher.Run(ctx, job); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	for _, want := range []string{"type:bug", "type:feature", "incomplete"} {
+		if !slices.Contains(issue.Labels, want) {
+			t.Errorf("метки тикета %v без %q", issue.Labels, want)
+		}
+	}
+	if slices.Contains(issue.Labels, "type:mixed") {
+		t.Errorf("метка type:mixed ушла в GitHub: %v", issue.Labels)
+	}
+	if !strings.Contains(issue.Body, "Не уточнено: конкретный случай.") {
+		t.Errorf("строки пробела нет в теле:\n%s", issue.Body)
+	}
+}
+
+// TestPublishFindsIssueOnFirstAttempt: «Публикую» после исчерпанных повторов
+// ставит новую работу с первой попыткой, а issue прошлой уже мог создаться -
+// маркер ищется и тогда, второго тикета нет.
+func TestPublishFindsIssueOnFirstAttempt(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	cases := newTestCases(t, pool, t.TempDir())
+
+	cs, _, err := cases.StartCase(ctx, User{ID: 7202, First: "Тест"}, "tg-intake", modeTicket)
+	if err != nil {
+		t.Fatalf("start case: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		UPDATE cases SET status = 'publishing', kind = 'bug', title = 'Статус не сменился',
+		                 summary = '## Сделка', contract = '{"case": "заказ 4821", "wrong": "статус"}'
+		WHERE id = $1`, cs.ID)
+	if err != nil {
+		t.Fatalf("mark publishing: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/daniil4545/tg-intake/issues" {
+			t.Error("создан второй issue")
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/daniil4545/tg-intake/issues" {
+			found := []Issue{{Number: 77, HTMLURL: "https://github.com/daniil4545/tg-intake/issues/77",
+				Body: "тело\n" + caseMarker(cs.ID)}}
+			if err := json.NewEncoder(w).Encode(found); err != nil {
+				t.Errorf("encode issues: %v", err)
+			}
+			return
+		}
+		fmt.Fprint(w, "[]")
+	}))
+	t.Cleanup(server.Close)
+
+	publisher := NewPublisher(cases, NewGitHub("token", server.URL, nil, testLog(t)), testRules(t), testLog(t), 0)
+	job := Job{ID: 1, Kind: JobPublish, Attempts: 1, Payload: []byte(`{"case_id":"` + cs.ID + `"}`)}
+	if err := publisher.Run(ctx, job); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got := reload(t, cases, cs.ID); got.IssueNumber != 77 {
+		t.Errorf("обращение не привязано к найденному issue 77: %v", got.IssueNumber)
 	}
 }

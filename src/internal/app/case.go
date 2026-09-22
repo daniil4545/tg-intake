@@ -107,6 +107,10 @@ type Case struct {
 	// состоялась: для потока автора это одно и то же.
 	Overlap     string
 	IssueNumber int
+	// Screen - id последнего сообщения шага, кнопки которого ещё действуют
+	// («живой экран»), 0 - экрана нет. ScreenRound - раунд, к которому оно
+	// относится, 0 - экран не раунд ответа (счётчик сбора, саммари).
+	Screen, ScreenRound int
 }
 
 // Item - элемент сырья. Forwarded помечает пересылку: модель должна знать, что
@@ -148,7 +152,7 @@ type txRunner interface {
 
 const caseColumns = `id, user_id, project_id, status, mode, protocol, COALESCE(kind, ''),
 	contract, gaps, round, COALESCE(title, ''), COALESCE(summary, ''), COALESCE(brief, ''),
-	incomplete, overlap, COALESCE(issue_number, 0)`
+	incomplete, overlap, COALESCE(issue_number, 0), screen_msg, screen_round`
 
 // Load читает обращение по идентификатору: шаги нормализации получают из
 // payload только id.
@@ -172,7 +176,7 @@ func scanCase(row pgx.Row) (*Case, error) {
 	var filled, gaps []byte
 	err := row.Scan(&cs.ID, &cs.UserID, &cs.ProjectID, &cs.Status, &cs.Mode, &cs.Protocol, &cs.Kind,
 		&filled, &gaps, &cs.Round, &cs.Title, &cs.Summary, &cs.Brief, &cs.Incomplete,
-		&cs.Overlap, &cs.IssueNumber)
+		&cs.Overlap, &cs.IssueNumber, &cs.Screen, &cs.ScreenRound)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -276,6 +280,31 @@ func (c *Cases) SetProject(ctx context.Context, cs *Case, projectSlug string) er
 
 	cs.ProjectID = &id
 	c.log.Info("project_set", "user_id", cs.UserID, "case_id", cs.ID, "project", projectSlug)
+	return nil
+}
+
+// SetScreen фиксирует новый живой экран обращения: id только что отправленного
+// сообщения шага и раунд, к которому оно относится. Пишет только свои колонки -
+// updated_at не трогает, иначе на нём споткнулись бы SweepDrafts и RemindDrafts.
+func (c *Cases) SetScreen(ctx context.Context, caseID string, msgID, round int) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE cases SET screen_msg = $2, screen_round = $3 WHERE id = $1`, caseID, msgID, round)
+	if err != nil {
+		return fmt.Errorf("set screen of case %s: %w", caseID, err)
+	}
+	return nil
+}
+
+// ResetScreen снимает живой экран, только если он всё ещё тот, что назвал
+// вызывающий: параллельный шаг мог успеть записать новый экран, и его нельзя
+// затирать чужим снятием.
+func (c *Cases) ResetScreen(ctx context.Context, caseID string, msgID int) error {
+	_, err := c.pool.Exec(ctx, `
+		UPDATE cases SET screen_msg = 0, screen_round = 0
+		WHERE id = $1 AND screen_msg = $2`, caseID, msgID)
+	if err != nil {
+		return fmt.Errorf("reset screen of case %s: %w", caseID, err)
+	}
 	return nil
 }
 
@@ -385,7 +414,7 @@ func (c *Cases) download(ctx context.Context, bot *tele.Bot, cs *Case, itemID in
 	path, err := c.media.Download(bot, cs.ID, strconv.FormatInt(itemID, 10), file)
 	if err != nil {
 		c.log.Warn("item_rejected", "user_id", cs.UserID, "case_id", cs.ID, "reason", "download_failed", "error", err)
-		if failErr := failItem(ctx, c.pool, itemID, "файл не скачался"); failErr != nil {
+		if failErr := failItem(ctx, c.pool, itemID, modelErrDownloadFailed); failErr != nil {
 			c.log.Error("item_fail_failed", "case_id", cs.ID, "item_id", itemID, "error", failErr)
 		}
 		return fmt.Errorf("download item %d: %w", itemID, err)
@@ -803,7 +832,7 @@ func switchToTicket(ctx context.Context, db txRunner, caseID string) error {
 	// кнопке, и по реплике, распознанной ходом lookup: в разборе «Готово» с этой
 	// панели ушло бы ответом автора, а не командой.
 	if err := putNotifyKey(ctx, db, caseID, "to-ticket",
-		"Что бы вы хотели изменить?", keysHome); err != nil {
+		msgWhatToChange, keysHome); err != nil {
 		return err
 	}
 	if next == statusNormalizing {
@@ -831,50 +860,6 @@ func BuildProtocol(items []Item) string {
 		fmt.Fprintf(&b, "%d. %s\n", n, line)
 	}
 	return strings.TrimRight(b.String(), "\n")
-}
-
-var itemLabel = map[string]string{
-	"text":  "текст",
-	"link":  "ссылка",
-	"voice": "голосовое",
-	"photo": "скриншот",
-}
-
-func itemLine(it Item) string {
-	label := itemLabel[it.Kind]
-	if label == "" {
-		label = it.Kind
-	}
-	if it.Forwarded {
-		label += ", переслано (не слова автора)"
-	}
-
-	if it.Status == "failed" {
-		reason := strings.TrimSpace(it.Error)
-		if reason == "" {
-			reason = "причина неизвестна"
-		}
-		// Провал виден строкой, а не пропуском: модель должна видеть пробел, а
-		// не достраивать его сама.
-		return label + ": не удалось разобрать: " + oneLine(reason)
-	}
-
-	body := strings.TrimSpace(it.Normalized)
-	caption := strings.TrimSpace(it.SourceText)
-	if body == "" {
-		body = caption
-		caption = ""
-	}
-	if body == "" {
-		return ""
-	}
-	// Подпись под пересланным медиа автор набирает сам, поэтому она идёт
-	// отдельной строкой и как его слова: пометка «не слова автора» относится к
-	// содержимому элемента, а не к тому, что автор написал под ним.
-	if caption != "" {
-		return label + ": " + body + "\n   слова автора: " + caption
-	}
-	return label + ": " + body
 }
 
 // linkRe - адрес в тексте сообщения. Скобки и угловые исключены нарочно: ссылка
@@ -1057,15 +1042,6 @@ func (c *Cases) RemindDrafts(ctx context.Context) error {
 	return nil
 }
 
-func remindText(status string) string {
-	if status == statusCollecting {
-		return "Обращение ждёт вас сутки. Пришлите остальное и нажмите «Готово» " +
-			"либо нажмите «Сброс». Вложения уже удалены, текст на месте."
-	}
-	return "Обращение ждёт вашего ответа сутки. Ответьте, и я доведу его до тикета, " +
-		"либо нажмите «Сброс». Вложения уже удалены, разбор на месте."
-}
-
 type casePayload struct {
 	CaseID string `json:"case_id"`
 }
@@ -1080,17 +1056,21 @@ type itemPayload struct {
 // текущий раунд.
 // Непустой ChatID означает уведомление владельцу: адресат назван явно, кнопок и
 // экранов у него нет.
+// Round - номер раунда, к которому относится сообщение keysRound/keysAsk:
+// запоздавшая доставка (round меньше текущего cs.Round) не должна стать новым
+// живым экраном поверх раунда, который автор уже прошёл.
 type notifyPayload struct {
 	CaseID  string `json:"case_id"`
 	Text    string `json:"text"`
 	Buttons string `json:"buttons,omitempty"`
 	ChatID  int64  `json:"chat_id,omitempty"`
+	Round   int    `json:"round,omitempty"`
 }
 
 // Наборы кнопок под сообщением из очереди.
 const (
-	keysRound   = "round"   // «Всё так» на раунд вопросов
-	keysAsk     = "ask"     // раунд без догадок: подтверждать нечего, кнопки нет
+	keysRound   = "round"   // «Всё так» и «Отправить как есть» на раунд вопросов
+	keysAsk     = "ask"     // раунд без догадок: только «Отправить как есть», подтверждать нечего
 	keysSummary = "summary" // «Публикую», «Поправить»
 	keysHome    = "home"    // панель «Меню | Сброс»: обращение доиграно
 	keysCancel  = "cancel"  // исход отмены тикета: правит экран, а не шлёт новое
@@ -1138,8 +1118,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			}
 			// Автору говорим только здесь: провал одного голосового виден ему
 			// строкой протокола, а вот вставшую цепочку заметить нечем.
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог обработать обращение. Пришлите материал иначе и нажмите «Готово» ещё раз."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, msgProcessFailed); err != nil {
 				return err
 			}
 		case JobLookup:
@@ -1161,8 +1140,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 		case JobInterview, JobSummarize:
 			// Обращение остаётся живым: следующий ответ автора поставит новую
 			// работу, и разговор продолжится с того же места.
-			if err := putNotify(ctx, tx, p.CaseID, job.ID,
-				"Не смог разобрать обращение. Напишите ещё раз своими словами - или нажмите «Сброс»."); err != nil {
+			if err := putNotify(ctx, tx, p.CaseID, job.ID, msgParseFailed); err != nil {
 				return err
 			}
 		case JobPublish:
@@ -1200,7 +1178,7 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 			// тем же ключом, что и успех: он правит экран отмены, а не копится
 			// в памяти бота непрочитанным.
 			if err := putNotifyKey(ctx, tx, p.CaseID, strconv.FormatInt(job.ID, 10),
-				"Отменить тикет не получилось. Откройте его в списке и попробуйте ещё раз.",
+				msgCancelFailed,
 				keysCancel); err != nil {
 				return err
 			}
@@ -1226,12 +1204,6 @@ func (c *Cases) HandleFailedJob(ctx context.Context, job Job, cause error) {
 	}
 }
 
-// lostNotifyText - шапка алерта о недоставленном сообщении. Текст потери идёт
-// целиком: владелец должен видеть, что именно не дошло до автора.
-func lostNotifyText(caseID, text string) string {
-	return "Сообщение автору не доставлено, обращение " + caseID + ":\n\n" + text
-}
-
 // reopenCase возвращает обращение в сбор. Два пути возврата - «разобрать не
 // удалось ничего» и провал работы normalize_images - это один переход.
 func reopenCase(ctx context.Context, db Runner, caseID string) (bool, error) {
@@ -1250,11 +1222,19 @@ func putNotify(ctx context.Context, db Runner, caseID string, jobID int64, text 
 	return putNotifyKey(ctx, db, caseID, strconv.FormatInt(jobID, 10), text, "")
 }
 
-// putNotifyKey - то же с явным суффиксом ключа: у напоминания и у раунда
-// вопросов нет породившей работы, но повторяться они не должны.
+// putNotifyKey - то же с явным суффиксом ключа: у напоминания, например, нет
+// породившей работы, но повторяться оно не должно.
 func putNotifyKey(ctx context.Context, db Runner, caseID, suffix, text, buttons string) error {
 	key := fmt.Sprintf("%s:%s:%s", JobNotify, caseID, suffix)
 	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons})
+}
+
+// putNotifyRound - сообщение раунда вопросов (keysRound/keysAsk), несёт номер
+// раунда: запоздавшая доставка после следующего раунда не должна стать новым
+// живым экраном, Notify это проверяет по Round из payload.
+func putNotifyRound(ctx context.Context, db Runner, caseID string, round int, text, buttons string) error {
+	key := fmt.Sprintf("%s:%s:round-%d", JobNotify, caseID, round)
+	return PutJob(ctx, db, JobNotify, key, notifyPayload{CaseID: caseID, Text: text, Buttons: buttons, Round: round})
 }
 
 // putAlert ставит уведомление владельцу. Работа того же вида, что и сообщение

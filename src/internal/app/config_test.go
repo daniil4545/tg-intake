@@ -67,7 +67,7 @@ func TestLoadConfigParsesAllowedIDs(t *testing.T) {
 	if cfg.ModelDialog != "deepseek/deepseek-v4-flash-0731" {
 		t.Errorf("model dialog fallback: got %q", cfg.ModelDialog)
 	}
-	if cfg.InterviewRounds != 3 {
+	if cfg.InterviewRounds != 2 {
 		t.Errorf("interview rounds fallback: got %d", cfg.InterviewRounds)
 	}
 	if cfg.ReasoningDialog != "low" {

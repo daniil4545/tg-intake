@@ -232,17 +232,3 @@ func (w *Watch) comment(ctx context.Context, p Project, t watched, c Comment) er
 		"issue", t.number, "comment", c.ID)
 	return nil
 }
-
-// Тексты новостей короткие намеренно: сообщение несёт факт и кнопку перехода, а
-// содержание автор читает в карточке. Иначе десяток активных тикетов превращает
-// чат в ленту, которую перестают читать.
-func statusNews(p Project, number int, s Status) string {
-	return fmt.Sprintf("Тикет #%d (%s): статус «%s».\n%s", number, p.Title, s.Title, newsTail)
-}
-
-func commentNews(p Project, number int) string {
-	return fmt.Sprintf("По тикету #%d (%s) появился комментарий разработчика.\n%s",
-		number, p.Title, newsTail)
-}
-
-const newsTail = "Открыть - кнопкой ниже или в «Мои тикеты»."

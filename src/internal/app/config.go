@@ -116,7 +116,7 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.MaxItems = maxItems
 
-	rounds, err := parsePositive("INTERVIEW_ROUNDS", valueOr(os.Getenv("INTERVIEW_ROUNDS"), "3"))
+	rounds, err := parsePositive("INTERVIEW_ROUNDS", valueOr(os.Getenv("INTERVIEW_ROUNDS"), "2"))
 	if err != nil {
 		problems = append(problems, err.Error())
 	}

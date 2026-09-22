@@ -250,20 +250,33 @@ func (w *worker) run(ctx context.Context, job Job) {
 }
 
 func (w *worker) fail(ctx context.Context, job Job, cause error) {
+	caseID := jobCaseID(job.Payload)
 	if !job.Exhausted() {
 		if _, err := FailJob(ctx, w.pool, job, cause); err != nil {
 			w.log.Error("job_fail_failed", "kind", job.Kind, "error", err)
 			return
 		}
-		w.log.Warn("job_failed", "kind", job.Kind, "attempts", job.Attempts, "error", cause)
+		w.log.Warn("job_failed", "kind", job.Kind, "case_id", caseID, "attempts", job.Attempts, "error", cause)
 		return
 	}
 
-	w.log.Error("job_failed", "kind", job.Kind, "attempts", job.Attempts, "error", cause)
+	w.log.Error("job_failed", "kind", job.Kind, "case_id", caseID, "attempts", job.Attempts, "error", cause)
 	// Работу гасит onFail, одной транзакцией с исходом провала: коммит порознь
 	// оставил бы обращение в normalizing навсегда, а погашенную работу уборщик
 	// локов уже не поднимет.
 	w.onFail(ctx, job, cause)
+}
+
+// jobCaseID - case_id из payload работы для лога, если он там есть. Все
+// текущие виды работ несут его под одним именем поля, а воркер по-прежнему не
+// разбирает payload для своей логики (это дело обработчика) - только для
+// диагностики упавшей работы в логе.
+func jobCaseID(payload json.RawMessage) string {
+	var p struct {
+		CaseID string `json:"case_id"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.CaseID
 }
 
 func (w *worker) unlockLoop(ctx context.Context) {

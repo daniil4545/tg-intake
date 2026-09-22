@@ -69,7 +69,7 @@ func (p *Projects) Add(ctx context.Context, userID int64, args string) (ProjectC
 		ref.Owner, ref.Repo = owner, name
 	}
 
-	source := "автор"
+	source := projectSourceAuthor
 	title, context := ref.Title, ref.Context
 	if title == "" || context == "" {
 		title, context, source = p.describe(ctx, ref, repo, title, context)
@@ -150,7 +150,7 @@ func (p *Projects) slugFor(ctx context.Context, ref projectRef) (string, error) 
 	case err != nil:
 		return "", fmt.Errorf("look up slug %s: %w", slug, err)
 	}
-	return "", fmt.Errorf("%w: %s занят репозиторием %s/%s", ErrSlugTaken, slug, owner, repo)
+	return "", errSlugTaken(slug, owner, repo)
 }
 
 // describe собирает недостающие название и контекст. Отказ модели не роняет
@@ -165,9 +165,9 @@ func (p *Projects) describe(ctx context.Context, ref projectRef, repo Repo, titl
 	guess, err := p.ask(ctx, repo, readme)
 	if err != nil {
 		p.log.Warn("project_describe_failed", "repo", ref.Owner+"/"+ref.Repo, "error", err)
-		return valueOr(title, repo.Name), valueOr(context, valueOr(repo.Description, repo.Name)), "репозиторий"
+		return valueOr(title, repo.Name), valueOr(context, valueOr(repo.Description, repo.Name)), projectSourceRepo
 	}
-	return valueOr(title, guess.Title), valueOr(context, guess.Context), "модель"
+	return valueOr(title, guess.Title), valueOr(context, guess.Context), projectSourceModel
 }
 
 type projectGuess struct {
@@ -194,9 +194,9 @@ func (p *Projects) ask(ctx context.Context, repo Repo, readme string) (projectGu
 	}
 
 	var material strings.Builder
-	material.WriteString("Репозиторий: " + repo.FullName + "\n")
+	material.WriteString(modelRepoLabel + repo.FullName + "\n")
 	if repo.Description != "" {
-		material.WriteString("Описание: " + repo.Description + "\n")
+		material.WriteString(modelDescriptionLabel + repo.Description + "\n")
 	}
 	if readme != "" {
 		material.WriteString("\nREADME:\n" + readme)
