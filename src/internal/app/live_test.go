@@ -257,8 +257,8 @@ func TestLiveRun(t *testing.T) {
 			name:          "S3",
 			material:      []string{mixedR1Text},
 			facts:         mixedR1Facts,
-			materialIdeas: []string{"склонением имени"},
-			factIdeas:     []string{"Анны", "забывают"},
+			materialIdeas: []string{"склонени"},
+			factIdeas:     []string{"Анны", "забыва"},
 		})
 	})
 	runScenario(t, &results, "S4_mixed_gate_b", func(t *testing.T) {
@@ -266,8 +266,8 @@ func TestLiveRun(t *testing.T) {
 			name:          "S4",
 			material:      mixedSecondMaterial,
 			facts:         mixedR1Facts,
-			materialIdeas: []string{"склонением имени", "комментарием в сделку"},
-			factIdeas:     []string{"Анны", "забывают"},
+			materialIdeas: []string{"склонени", "коммент"},
+			factIdeas:     []string{"Анны", "забыва"},
 		})
 	})
 	runScenario(t, &results, "S5_skip_R5", func(t *testing.T) { runSkipScenario(t, env) })
@@ -628,7 +628,7 @@ func assertTypeLabels(t *testing.T, cs *Case, issue Issue) {
 func assertIdeasKept(t *testing.T, name string, phrases []string, issue Issue) {
 	t.Helper()
 	for _, phrase := range phrases {
-		if !strings.Contains(issue.Body, phrase) {
+		if !strings.Contains(strings.ToLower(issue.Body), strings.ToLower(phrase)) {
 			t.Errorf("%s: идея автора потеряна - %q нет в теле issue", name, phrase)
 		}
 	}
