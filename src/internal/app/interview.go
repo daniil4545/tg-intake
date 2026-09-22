@@ -248,13 +248,22 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
+	// Раньше askTurn: checkTurn сверяет по нему, спрашивать ли ещё можно
+	// (allExhausted), а не только фильтрует готовый ход после него.
+	var asked map[string]int
+	if !fix {
+		asked, err = i.cases.askedKeys(ctx, cs.ID)
+		if err != nil {
+			return err
+		}
+	}
 
 	messages, _, err := i.dialog(ctx, cs, i.askPrefix)
 	if err != nil {
 		return err
 	}
 
-	turn, err := i.askTurn(ctx, cs, messages)
+	turn, err := i.askTurn(ctx, cs, messages, fix, asked)
 	if err != nil {
 		return err
 	}
@@ -264,10 +273,6 @@ func (i *Interview) Run(ctx context.Context, job Job) error {
 	// предела не знает, как и предела раундов: автор пришёл уточнять именно
 	// этот пункт, и молчание в ответ обесценило бы правку.
 	if !fix {
-		asked, err := i.cases.askedKeys(ctx, cs.ID)
-		if err != nil {
-			return err
-		}
 		kept := slices.DeleteFunc(turn.Questions, func(q Question) bool { return asked[q.Key] >= maxAsks })
 		if len(kept) < len(turn.Questions) {
 			i.log.Info("questions_exhausted", "case_id", cs.ID, "dropped", len(turn.Questions)-len(kept))
@@ -423,7 +428,7 @@ func (i *Interview) saveTurn(ctx context.Context, cs *Case, turn interviewTurn, 
 // askTurn спрашивает модель и проверяет её ответ. Невалидный ответ - один
 // повтор: модель промахивается разово, второй такой же промах означает, что
 // дело не в случайности, и работа уходит в повтор очередью.
-func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (interviewTurn, error) {
+func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message, fix bool, asked map[string]int) (interviewTurn, error) {
 	req := Request{
 		Step:       stepInterview,
 		Model:      i.model.Name,
@@ -449,7 +454,7 @@ func (i *Interview) askTurn(ctx context.Context, cs *Case, messages []Message) (
 		var turn interviewTurn
 		if err := json.Unmarshal(raw, &turn); err != nil {
 			lastErr = fmt.Errorf("decode turn: %w", err)
-		} else if err := i.checkTurn(cs.Filled, turn); err != nil {
+		} else if err := i.checkTurn(cs.Filled, turn, !fix && (cs.Round >= i.rounds || allExhausted(turn.Gaps, asked))); err != nil {
 			lastErr = err
 		} else if attempt == 0 && len(turn.Questions) > 0 && !hasSuggestion(turn.Questions) {
 			i.log.Warn("turn_without_suggestion", "step", stepInterview, "case_id", cs.ID,
