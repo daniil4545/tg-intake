@@ -40,7 +40,12 @@
 | G6 | 07:55 МСК, `job-errors` только августовские, `cases` без живых обращений |
 | G7 | тег `v0.2.2` на коммите мерджа |
 
-## G8. Приёмка
+## G8. Приёмка - PASS, 27.09 09:04 МСК
 
-Функциональная проверка: `docker restart` контейнера `app`, после него права
-`/tmp/intake` 1777 и статус `healthy`. Результат - в комментарии коммита релиза и отчёте.
+1. `app_revision` = `a6885b83ca51766c5d8d321b9cf41caa4eb1766a`, образ подтверждён
+   `docker manifest inspect`.
+2. `app` и `postgres` healthy, `migrate` Exited (0); в контейнере tmpfs `Mode: 1023`.
+3. Логи старта: `bot_started`, ошибок конфигурации нет.
+4. Функциональная проверка: `docker restart` `app` - healthy, `RestartCount=0`, второй
+   `bot_started`, `media_failed` нет. Единственная ошибка - `poll_failed: context
+   canceled` в момент остановки, штатная.
