@@ -126,3 +126,42 @@ func TestParseProjects(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadConfigAlertThreadID: тема группы для уведомлений - настройка канала,
+// пустая переменная не должна ломать старт и должна давать прежнее поведение
+// (без темы).
+func TestLoadConfigAlertThreadID(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want int
+		ok   bool
+	}{
+		{"пусто - без темы", "", 0, true},
+		{"валидная тема", "5", 5, true},
+		{"не число", "abc", 0, false},
+		{"ноль", "0", 0, false},
+		{"отрицательная", "-3", 0, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseThreadID(c.raw)
+			if c.ok && err != nil {
+				t.Fatalf("want no error, got: %v", err)
+			}
+			if !c.ok {
+				if err == nil {
+					t.Fatal("want error, got nil")
+				}
+				if !strings.Contains(err.Error(), "ALERT_THREAD_ID") {
+					t.Errorf("error must name ALERT_THREAD_ID, got: %v", err)
+				}
+				return
+			}
+			if got != c.want {
+				t.Errorf("got %d, want %d", got, c.want)
+			}
+		})
+	}
+}

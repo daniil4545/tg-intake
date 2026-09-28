@@ -50,6 +50,9 @@ services:
       # выключает уведомления, пустой токен отдаёт отправку боту сервиса.
       ALERT_CHAT_ID: ${ALERT_CHAT_ID:-}
       ALERT_BOT_TOKEN: ${ALERT_BOT_TOKEN:-}
+      # Тема группы уведомлений (message_thread_id). Пусто - без темы, как
+      # раньше: общий чат, не тема 5 «Galera Alerts».
+      ALERT_THREAD_ID: ${ALERT_THREAD_ID:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set}
       # Пусто - идём напрямую: с узла A OpenRouter отвечает без прокси. Адрес
       # прокси, если понадобится, - секрет контура, в репозиторий не попадает.

@@ -78,8 +78,9 @@ Telegram-бот, который связывает тех, кто ставит �
 
 Обязательные переменные: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`,
 `TELEGRAM_ALLOWED_IDS`, `OPENROUTER_API_KEY`, `GITHUB_TOKEN`; проекты контура -
-`PROJECTS`, алерты владельцу - `ALERT_CHAT_ID` и `ALERT_BOT_TOKEN`. Полный
-список с дефолтами - `src/.env.example`.
+`PROJECTS`, алерты владельцу - `ALERT_CHAT_ID` и `ALERT_BOT_TOKEN`, тема группы
+алертов - `ALERT_THREAD_ID` (пусто - без темы). Полный список с дефолтами -
+`src/.env.example`.
 
 Диагностика контура - только через `deploy/safe-ssh.sh` из корня, без аргументов
 печатает список действий; все read-only, произвольный ssh не используем. `cases`
