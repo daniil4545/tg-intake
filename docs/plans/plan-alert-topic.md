@@ -42,7 +42,7 @@ qualifier 7), `docs/contracts.md` (уведомления), Bot API `sendMessage
 |---|---|---|
 | Happy path | чат и тема 5 заданы, работа с `ChatID` = чату | `sendMessage` с `message_thread_id=5` |
 | Без темы | `ALERT_THREAD_ID` пуста | вызов без `message_thread_id`, как до среза |
-| Работа в прежний чат | в очереди работа с другим `ChatID` | отправка без темы |
+| Работа в прежний чат | в очереди работа с другим `ChatID` | без темы; новый бот без диалога с владельцем - `403`, провал в `job-errors` (окно - очередь на миг выката) |
 | Повтор | работа повторяется очередью | та же тема; дубль исключает ключ работы, как сейчас |
 | Тема удалена | Telegram `400` | ошибка `send alert`, повторы и провал по политике очереди, `job-errors` |
 
@@ -55,7 +55,7 @@ qualifier 7), `docs/contracts.md` (уведомления), Bot API `sendMessage
 
 ## 3b. Сценарии проверки
 
-Пишет `test-designer` до `spec-review`; минимум - тесты секций 3a и 6.
+Пишет `test-designer`; минимум - тесты 3a и 6.
 
 ## 4. Данные и состояния
 
@@ -70,13 +70,13 @@ func parseThreadID(raw string) (int, error) // "" - 0; иначе parsePositive(
 ```
 
 `NewBot`: `b.alertChat = cfg.AlertChatID`, `b.alertThread = cfg.AlertThreadID`; лог
-`alerts_enabled` получает поле `thread_id` (проверка после выката без чтения env).
+`alerts_enabled` после присваивания получает `thread_id` из `b.alertThread`, не из `cfg`.
 `Notify`, ветка `p.ChatID != 0`: `opts := &tele.SendOptions{}`; при
 `p.ChatID == b.alertChat` - `opts.ThreadID = b.alertThread`; `b.alert.Send(chat, p.Text, opts)`.
 
 ## 5a. Карта среза
 
-Сверено `grep -n` в ветке `slice/alert-topic` (be428f0). Пути от `src/`, кроме `deploy/`.
+Сверено `grep -n` в ветке `slice/alert-topic` (963f75d). Пути от `src/`, кроме `deploy/`.
 
 | Файл | Строка | Символ | Что делает срез | Этап |
 |---|---|---|---|---|
@@ -118,22 +118,24 @@ func parseThreadID(raw string) (int, error) // "" - 0; иначе parsePositive(
 
 ## Выкат
 
-Исполняет оркестратор и владелец, не worker. Все `coolify-deploy.sh` - из
-`galera-dev-knowledge/infra/scripts/`, runbook `runbooks/coolify-service-api.md`.
+Исполняют оркестратор и владелец, не worker. `coolify-deploy.sh` - из
+`galera-dev-knowledge/infra/scripts/`, runbook `runbooks/coolify-service-api.md`. PATCH
+несуществующей переменной даёт `404`: `ALERT_THREAD_ID` заводит Coolify из Compose.
 
-1. Владелец: в `/etc/galera/secrets/galera/intake-dev.env` `ALERT_BOT_TOKEN` = значение
-   Keychain `galera/platform/alert-bot` (уровень 3, агенту закрыт).
-2. `coolify-deploy.sh intake set-env ALERT_CHAT_ID <id из galera-infra/.env>`,
-   `set-env ALERT_THREAD_ID 5`.
-3. `coolify-deploy.sh intake sync-env` (sudo, подтверждение на вызов).
-4. Релиз тегом `v*` с кодом среза и workflow `Deploy` по команде владельца; PATCH
-   переменных без деплоя не применяется. Порядок 1-3 до релиза безопасен: старый код
-   шлёт в General группы, не теряет.
+1. Владелец: `ALERT_BOT_TOKEN` в `/etc/galera/secrets/galera/intake-dev.env` = Keychain
+   `galera/platform/alert-bot`; `coolify-deploy.sh intake sync-env`; `set -a;
+   . galera-infra/.env; set +a; coolify-deploy.sh intake set-env ALERT_CHAT_ID
+   "$ALERT_CHAT_ID"` (агенту `.env` закрыт). Старый код шлёт в General группы, не теряет.
+2. Релиз тегом `v*` с кодом среза, workflow `Deploy` по команде владельца: он
+   синхронизирует Compose, переменная заводится пустой, старт с `thread_id=0`.
+3. `coolify-deploy.sh intake list-env | grep ALERT_THREAD_ID` - переменная есть.
+4. `coolify-deploy.sh intake set-env ALERT_THREAD_ID 5`, затем отдельный
+   `coolify-deploy.sh intake deploy` (PATCH без деплоя не применяется).
 5. `deploy/safe-ssh.sh app-logs 200`: `alerts_enabled on=true own_bot=true thread_id=5`.
-6. Тест темы: `withkey galera/platform -- sh -c 'curl -s ".../sendMessage?chat_id=
-   $ALERT_CHAT_ID&message_thread_id=5&text=intake: проверка темы"'` (сценарий
-   `plan-alert-channel.md:93-101`), `"ok":true`, чтение `tg_read` MCP `galera-mcp-tg`,
-   `deleteMessage` в окне 48 часов. Первое боевое уведомление - сверка там же.
+6. Путь кода: владелец задаёт вопрос кнопкой «Спросить», уведомление о вопросе читается
+   `tg_read` MCP `galera-mcp-tg` в теме 5. Нет его - тестовое `sendMessage` в тему по
+   `plan-alert-channel.md:93-101` отделяет тему от кода; тестовое удаляется
+   `deleteMessage` в окне 48 часов.
 
 ## 8. Обязательный хвост среза
 
