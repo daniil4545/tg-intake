@@ -37,6 +37,9 @@ type Config struct {
 	// выключает уведомления целиком, пустой токен отдаёт отправку боту сервиса.
 	AlertBotToken string
 	AlertChatID   int64
+	// Тема группы уведомлений (message_thread_id Bot API). 0 - без темы:
+	// сообщение в общий чат, как до среза.
+	AlertThreadID int
 }
 
 // ProjectConfig - проект из переменной окружения. Список живёт в конфиге
@@ -128,6 +131,12 @@ func LoadConfig() (Config, error) {
 	}
 	cfg.AlertChatID = chat
 
+	thread, err := parseThreadID(os.Getenv("ALERT_THREAD_ID"))
+	if err != nil {
+		problems = append(problems, err.Error())
+	}
+	cfg.AlertThreadID = thread
+
 	projects, err := ParseProjects(os.Getenv("PROJECTS"))
 	if err != nil {
 		problems = append(problems, err.Error())
@@ -204,6 +213,15 @@ func parseChatID(raw string) (int64, error) {
 		return 0, fmt.Errorf("ALERT_CHAT_ID is not a number: %q", raw)
 	}
 	return id, nil
+}
+
+// parseThreadID разбирает тему группы уведомлений. Пусто - без темы, это не
+// ошибка: тема - настройка канала, а не обязательный параметр.
+func parseThreadID(raw string) (int, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	return parsePositive("ALERT_THREAD_ID", raw)
 }
 
 // projectSlug повторяет CHECK из схемы: slug уезжает в callback_data, где всего
