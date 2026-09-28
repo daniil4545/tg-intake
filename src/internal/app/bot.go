@@ -102,6 +102,11 @@ type Bot struct {
 	// алертов. nil - уведомления выключены конфигом либо отправитель не собрался;
 	// что именно, говорит лог старта.
 	alert *tele.Bot
+	// Чат и тема уведомлений владельца из конфига. Тема ставится только
+	// работе, адресованной этому чату - alertChat, а не в payload: работа,
+	// поставленная в прежний чат до выката темы, чужую тему не получает.
+	alertChat   int64
+	alertThread int
 	// Когда автору в последний раз отвечали меню на свободное сообщение.
 	// Хендлеры идут последовательно (Synchronous), мьютекс не нужен; потеря
 	// при рестарте безвредна - автор получит меню лишний раз.
@@ -123,6 +128,7 @@ type Bot struct {
 func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, tickets *Tickets, projects *Projects, log *slog.Logger) (*Bot, error) {
 	b := &Bot{pool: pool, cases: cases, tickets: tickets, projects: projects, log: log,
 		allowed: cfg.AllowedIDs, maxItems: cfg.MaxItems,
+		alertChat: cfg.AlertChatID, alertThread: cfg.AlertThreadID,
 		menuAt: map[int64]time.Time{}, awaitLink: map[int64]time.Time{},
 		waited: map[int64]string{}}
 
@@ -174,7 +180,8 @@ func NewBot(ctx context.Context, cfg Config, pool *pgxpool.Pool, cases *Cases, t
 		log.Error("alert_bot_failed", "error", err)
 	}
 	b.alert = alert
-	log.Info("alerts_enabled", "on", alert != nil, "own_bot", cfg.AlertBotToken != "")
+	log.Info("alerts_enabled", "on", alert != nil, "own_bot", cfg.AlertBotToken != "",
+		"thread_id", b.alertThread)
 
 	return b, nil
 }
@@ -408,7 +415,14 @@ func (b *Bot) Notify(ctx context.Context, job Job) error {
 			b.log.Warn("alert_skipped", "case_id", p.CaseID, "chat_id", p.ChatID)
 			return nil
 		}
-		if _, err := b.alert.Send(&tele.Chat{ID: p.ChatID}, p.Text); err != nil {
+		opts := &tele.SendOptions{}
+		// Тема - настройка чата, не работы: работа, поставленная в прежний
+		// чат до выката темы, чужую тему не получает (400 message thread not
+		// found у бота без диалога с владельцем в ней).
+		if p.ChatID == b.alertChat {
+			opts.ThreadID = b.alertThread
+		}
+		if _, err := b.alert.Send(&tele.Chat{ID: p.ChatID}, p.Text, opts); err != nil {
 			return fmt.Errorf("send alert: %w", err)
 		}
 		return nil
